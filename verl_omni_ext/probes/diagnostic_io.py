@@ -1,7 +1,8 @@
 """Bounded, opt-in diagnostic records; never copy device tensor contents.
 
-This module deliberately has no ML/runtime imports. JSONL files are separated by
-host and PID so Ray workers cannot overwrite one another's evidence.
+This module deliberately has no ML/runtime imports. All workers append to one
+JSONL file on a shared filesystem, under an OS file lock. Budgets are global to
+that file, not multiplied by the number of workers. Host/PID remain in records.
 """
 
 import hashlib
@@ -9,39 +10,31 @@ import json
 import os
 import socket
 import sys
-import tempfile
 import threading
 import time
 from collections import Counter
 from collections.abc import Mapping
+from contextlib import contextmanager
 from pathlib import Path
 
 _lock = threading.RLock()
 _counts = Counter()
 _warned = False
+_full_paths = set()
+LOG_NAME = "rollout_diagnostics.jsonl"
+_MAX_RECORD_BYTES = 16384
+_LIMIT_RESERVE = 1024
 
 
 def _write_failure(exc):
-    """Report sink failures to a separate file, never to Ray's console stream."""
+    """Keep failure state in memory; never create per-worker fallback logs.
+
+    The launcher checks shared-directory access before training and checks the
+    output afterwards. An unwritable destination cannot reliably log its own
+    failure; diagnostics must still never interrupt model execution.
+    """
     global _warned
-    if _warned:
-        return
     _warned = True
-    try:
-        directory = Path(tempfile.gettempdir()) / "verl_omni_ext_rollout_diag_errors"
-        directory.mkdir(parents=True, exist_ok=True)
-        host = "".join(c if c.isalnum() or c in "-_." else "_" for c in socket.gethostname())
-        with (directory / f"error-{host}-{os.getpid()}.jsonl").open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps({
-                "event": "diagnostic_sink_error", "pid": os.getpid(), "host": host,
-                "time_ns": time.time_ns(), "error_type": type(exc).__name__,
-                "error": str(exc)[:2048],
-                "requested_directory": os.environ.get("MINICPMO_ROLLOUT_DIAG_DIR", ""),
-            }, ensure_ascii=True) + "\n")
-    except Exception:
-        # Never redirect diagnostic text into the main training log, even if
-        # both destinations are unavailable. The absence of traces is not success.
-        pass
 
 
 def enabled():
@@ -60,7 +53,7 @@ def limited(event, limit=None):
     if not enabled():
         return False
     if limit is None:
-        limit = _limit("MINICPMO_ROLLOUT_DIAG_MAX_EVENTS", 16, 10000)
+        limit = _limit("MINICPMO_ROLLOUT_DIAG_MAX_EVENTS", 4, 10000)
     with _lock:
         key = (os.getpid(), event)
         _counts[key] += 1
@@ -71,7 +64,7 @@ def text_info(value):
     """Retain a bounded excerpt and a hash of the original string."""
     if not isinstance(value, str):
         return {"type": type(value).__name__}
-    limit = _limit("MINICPMO_ROLLOUT_DIAG_TEXT_CHARS", 1024, 32768)
+    limit = _limit("MINICPMO_ROLLOUT_DIAG_TEXT_CHARS", 256, 32768)
     info = {
         "chars": len(value),
         "sha256": hashlib.sha256(value.encode("utf-8", errors="surrogatepass")).hexdigest(),
@@ -122,7 +115,7 @@ def summarize(value, _depth=0):
         if value is None or isinstance(value, (bool, int, float)):
             return value
         if isinstance(value, str):
-            return value if len(value) <= _limit("MINICPMO_ROLLOUT_DIAG_TEXT_CHARS", 1024, 32768) else text_info(value)
+            return value if len(value) <= _limit("MINICPMO_ROLLOUT_DIAG_TEXT_CHARS", 256, 32768) else text_info(value)
         tensor = _tensor_info(value)
         if tensor is not None:
             return tensor
@@ -165,12 +158,118 @@ def module_info(module):
         return {"observation_error": type(exc).__name__}
 
 
-def emit(event, **fields):
-    """Best-effort write; observation failures must not stop model execution.
+@contextmanager
+def _file_lock(stream):
+    """Serialize append + budget check across processes and shared-FS nodes.
 
-    The caller uses limited() for hot paths. A separate global record budget
-    bounds disk usage even when hooks report recurring errors.
+    Bounded lock wait prevents a diagnostic lock from stalling training. POSIX
+    locks are released by the OS when a worker exits, including after a crash.
     """
+    if os.name == "nt":
+        import msvcrt
+
+        def acquire():
+            stream.seek(0)
+            msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+
+        def release():
+            stream.seek(0)
+            msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        def acquire():
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+        def release():
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+    deadline = time.monotonic() + 0.25
+    while True:
+        try:
+            acquire()
+            break
+        except (BlockingIOError, PermissionError):
+            if time.monotonic() >= deadline:
+                raise TimeoutError("diagnostic file lock timed out") from None
+            time.sleep(0.005)
+    try:
+        yield
+    finally:
+        release()
+
+
+def _encode_record(record):
+    data = json.dumps(record, ensure_ascii=False, allow_nan=False).encode("utf-8") + b"\n"
+    if len(data) > _MAX_RECORD_BYTES:
+        # Keep a valid JSON line and the event identity even for huge metadata.
+        original = json.dumps(record["fields"], ensure_ascii=False, allow_nan=False)
+        record["fields"] = {
+            "record_truncated": True, "chars": len(original),
+            "sha256": hashlib.sha256(original.encode("utf-8")).hexdigest(),
+            "head": original[:512], "tail": original[-512:],
+        }
+        data = json.dumps(record, ensure_ascii=False, allow_nan=False).encode("utf-8") + b"\n"
+    return data
+
+
+def _last_record(stream):
+    """Read only the bounded tail; repair an interrupted final append."""
+    size = stream.seek(0, os.SEEK_END)
+    if not size:
+        return 0, None
+    start = max(0, size - _MAX_RECORD_BYTES * 2)
+    stream.seek(start)
+    tail = stream.read()
+    if not tail.endswith(b"\n"):
+        end = tail.rfind(b"\n") + 1
+        if not end and start:
+            raise ValueError("diagnostic tail is not recoverable")
+        stream.truncate(start + end)
+        tail = tail[:end]
+        size = start + end
+    if not tail:
+        return size, None
+    return size, json.loads(tail.splitlines()[-1])
+
+
+def _append_record(path, record):
+    if str(path) in _full_paths:
+        return
+    max_records = _limit("MINICPMO_ROLLOUT_DIAG_MAX_RECORDS", 2000, 100000)
+    max_bytes = max(_LIMIT_RESERVE, _limit("MINICPMO_ROLLOUT_DIAG_MAX_BYTES", 4 * 1024 * 1024,
+                                         64 * 1024 * 1024))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+b", buffering=0) as stream, _file_lock(stream):
+        size, last = _last_record(stream)
+        if last and last.get("event") == "diagnostic_limit_reached":
+            _full_paths.add(str(path))
+            return
+        count = last["record_index"] if last else 0
+        record["record_index"] = count + 1
+        data = _encode_record(record)
+        reason = "record_limit" if count >= max_records else "file_size_limit"
+        if count >= max_records or size + len(data) + _LIMIT_RESERVE > max_bytes:
+            record = {"event": "diagnostic_limit_reached", "record_index": count + 1,
+                      "time_ns": time.time_ns(), "host": socket.gethostname(), "pid": os.getpid(),
+                      "fields": {"reason": reason, "max_records": max_records, "max_bytes": max_bytes,
+                                 "message": "Further diagnostic records are suppressed; training continues."}}
+            data = _encode_record(record)
+            _full_paths.add(str(path))
+            if size + len(data) > max_bytes:
+                return
+        # All cooperating writers hold the lock for the complete line.
+        stream.seek(0, os.SEEK_END)
+        remaining = memoryview(data)
+        while remaining:
+            written = stream.write(remaining)
+            if not written:
+                raise OSError("diagnostic append made no progress")
+            remaining = remaining[written:]
+
+
+def emit(event, **fields):
+    """Best-effort append to one bounded file; never affect model execution."""
     if not enabled():
         return
     try:
@@ -178,20 +277,11 @@ def emit(event, **fields):
         if not directory:
             raise ValueError("MINICPMO_ROLLOUT_DIAG_DIR is required when diagnostics are enabled")
         with _lock:
-            key = (os.getpid(), "__total_records__")
-            maximum = _limit("MINICPMO_ROLLOUT_DIAG_MAX_RECORDS", 2000, 100000)
-            if _counts[key] >= maximum:
-                return
-            _counts[key] += 1
             host = socket.gethostname()
             record = {"event": event, "time_ns": time.time_ns(), "monotonic_ns": time.monotonic_ns(),
                       "host": host, "pid": os.getpid(), "thread": threading.get_ident(),
                       "fields": summarize(fields)}
-            path = Path(directory)
-            path.mkdir(parents=True, exist_ok=True)
-            safe_host = "".join(c if c.isalnum() or c in "-_." else "_" for c in host)
-            with (path / f"trace-{safe_host}-{os.getpid()}.jsonl").open("a", encoding="utf-8") as stream:
-                stream.write(json.dumps(record, ensure_ascii=True, allow_nan=False) + "\n")
+            _append_record(Path(directory) / LOG_NAME, record)
     except Exception as exc:
         _write_failure(exc)
 

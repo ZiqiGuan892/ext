@@ -13,7 +13,9 @@ usage() {
 Usage: bash run_qwen36_whisper_rollout_diagnostics.sh [--dry-run] [-- HYDRA_OVERRIDE ...]
 
 Default: Qwen3.6-whisper + converted OC-RL 4B data, two training steps,
-Actor response length 4096, independent JSONL diagnostic files.
+Actor response length 4096, one rollout_diagnostics.jsonl diagnostic file.
+The directory must be shared by all Ray nodes. Default global limits:
+2000 records plus one limit notice, 4 MiB total, 256 characters per text.
 
 Overrides through environment:
   CODE_ROOT                       gzq checkout root
@@ -77,6 +79,10 @@ run_env=(
     "MINICPMO_DIAG_NUMERICS=1"
     "MINICPMO_DIAG_GDN_NATIVE=0"
     "MINICPMO_DIAG_STRICT_MM=0"
+    "MINICPMO_ROLLOUT_DIAG_MAX_EVENTS=4"
+    "MINICPMO_ROLLOUT_DIAG_MAX_RECORDS=2000"
+    "MINICPMO_ROLLOUT_DIAG_MAX_BYTES=4194304"
+    "MINICPMO_ROLLOUT_DIAG_TEXT_CHARS=256"
     "TRAIN_FILE=$DIAG_TRAIN_FILE"
     "VAL_FILE=$DIAG_VAL_FILE"
     "MODEL_PATH=$DIAG_MODEL_PATH"
@@ -190,10 +196,66 @@ mkdir -p "$(dirname "$DIAG_DIR")" "$(dirname "$DIAG_RUN_DIR")"
 mkdir "$DIAG_DIR"
 mkdir "$DIAG_RUN_DIR"
 mkdir "$DIAG_RUN_DIR/genrm_dump" "$DIAG_RUN_DIR/hang_dump"
+# Same pathname on different local disks is not a single shared log. Check
+# every live Ray node before spending time loading models. No Ray lifecycle
+# operations or NPU allocation occur here; these are short CPU-free probes.
+python3 - "$DIAG_DIR" <<'PY'
+from pathlib import Path
+import fcntl
+import sys
+import uuid
+
+import ray
+from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+directory = Path(sys.argv[1])
+token = uuid.uuid4().hex
+marker = directory / (".shared-probe-" + token)
+marker.write_text(token, encoding="utf-8")
+lock_stream = marker.open("r+b")
+fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+try:
+    ray.init(address="auto", log_to_driver=False)
+
+    @ray.remote(num_cpus=0, max_retries=0)
+    def check_shared(path, expected):
+        from pathlib import Path
+        import fcntl
+        import socket
+        try:
+            valid = Path(path).read_text(encoding="utf-8") == expected
+            if not valid:
+                return socket.gethostname(), False, "directory is not shared"
+            with open(path, "r+b") as stream:
+                try:
+                    fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return socket.gethostname(), True, "shared lock verified"
+                else:
+                    fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+                    return socket.gethostname(), False, "file locks are not shared across nodes"
+        except Exception as exc:
+            return socket.gethostname(), False, str(exc)
+
+    nodes = [node for node in ray.nodes() if node["Alive"]]
+    if not nodes:
+        raise RuntimeError("No live Ray nodes")
+    tasks = [check_shared.options(scheduling_strategy=NodeAffinitySchedulingStrategy(
+        node_id=node["NodeID"], soft=False)).remote(str(marker), token) for node in nodes]
+    results = ray.get(tasks, timeout=30)
+    failed = [result for result in results if not result[1]]
+    if failed:
+        raise RuntimeError(f"DIAG_DIR must be the same shared filesystem on all nodes: {failed}")
+    print(f"[diagnostics] Shared directory and file locking verified on {len(results)} Ray nodes.")
+finally:
+    lock_stream.close()
+    marker.unlink(missing_ok=True)
+    ray.shutdown()  # Disconnect this probe driver; do not stop the Ray cluster.
+PY
 print_command > "$DIAG_RUN_DIR/command.sh.txt"
 printf 'Training log: %s\n' "$DIAG_RUN_DIR/run_qwen36_whisper_gspo_npu.log"
 printf 'Launcher output: %s\n' "$DIAG_RUN_DIR/launcher.stdout.log"
-printf 'Separate diagnostics: %s/trace-<hostname>-<pid>.jsonl\n' "$DIAG_DIR"
+printf 'Single diagnostic file (at most 4 MiB): %s/rollout_diagnostics.jsonl\n' "$DIAG_DIR"
 
 set +e
 (
@@ -203,11 +265,11 @@ set +e
 result=$?
 set -e
 
-shopt -s nullglob
-traces=("$DIAG_DIR"/trace-*.jsonl)
-shopt -u nullglob
-printf 'Training exit code: %s; local diagnostic files: %s\n' "$result" "${#traces[@]}"
-if (( ${#traces[@]} == 0 )); then
-    printf '%s\n' 'No local JSONL found. Check worker environment propagation and remote-node directories; absence of traces is not diagnostic success.' >&2
+printf 'Training exit code: %s\n' "$result"
+if [[ -s "$DIAG_DIR/rollout_diagnostics.jsonl" ]]; then
+    printf 'Send this diagnostic file: %s/rollout_diagnostics.jsonl\n' "$DIAG_DIR"
+    wc -l -c "$DIAG_DIR/rollout_diagnostics.jsonl"
+else
+    printf '%s\n' 'Diagnostic file is missing or empty. Check worker environment propagation and write permissions; absence of records is not diagnostic success.' >&2
 fi
 exit "$result"
