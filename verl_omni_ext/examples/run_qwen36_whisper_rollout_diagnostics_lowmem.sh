@@ -36,6 +36,10 @@ export ROLLOUT_PROMPT_LENGTH=3104
 export ROLLOUT_MAX_MODEL_LEN=8192
 export MAX_TOKEN_LEN_PER_GPU=8192
 export VAL_BEFORE_TRAIN=false
+# 反向传播也由 FSDP2 卸载参数/分片梯度，优化器随 CPU 参数在 CPU 上更新。
+# 沿用插件的非锁页内存补丁，避免 Ascend 的 pinned-memory D2H 问题。
+export ACTOR_OFFLOAD_POLICY=true
+export MINICPMO_FSDP2_PIN_MEMORY=0
 export PROJECT_NAME=oc_rl_4b_gzq
 export EXPERIMENT_NAME=actor_precision_lowmem_001
 export DEFAULT_LOCAL_DIR=/opt/huawei/dataset/ccb_data/code/hufenyu/verl_omni_qwen36_gzq/runs/actor_precision_lowmem_001/checkpoints
@@ -46,7 +50,9 @@ export MINICPMO_HANG_DUMP_DIR=/opt/huawei/dataset/ccb_data/code/hufenyu/verl_omn
 # 降低 Actor/RM 推理并发和引擎显存预算及 entropy 分块。
 # 权重同步 bucket 保留 1024 MiB：BF16 embed_tokens [248320, 2048] 单张量占 970 MiB，
 # 当前共享内存传输要求单张量能完整放入 bucket，不能降到 256 MiB。
-# 关闭参数预取，启用手动 optimizer offload；offload_policy=false 避免覆盖手动卸载。
+# MoE backward OOM：手动阶段间卸载不足，启用 FSDP2 原生 CPUOffloadPolicy。
+# param_offload/optimizer_offload=false 仅关闭 verl 的手动搬运，CPU 卸载由原生策略负责。
+# 保留单 rank 一条序列、关闭参数预取，避免增加反向传播期间的驻留张量。
 # activation offload 沿用原入口的 false，避免重新引入已有的锁页内存问题。
 # 覆盖放在命令末尾，确保不会被 OmniMix 入口的固定值覆盖；额外 Hydra 参数仍可追加。
 bash /opt/huawei/dataset/ccb_data/code/hufenyu/verl_omni_qwen36_gzq/examples/qwen3_6_whisper/run_qwen36_whisper_gspo_npu_omni_mix_genrm.sh \
@@ -66,8 +72,9 @@ bash /opt/huawei/dataset/ccb_data/code/hufenyu/verl_omni_qwen36_gzq/examples/qwe
   actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=1024 \
   actor_rollout_ref.actor.fsdp_config.forward_prefetch=false \
   actor_rollout_ref.ref.fsdp_config.forward_prefetch=false \
-  actor_rollout_ref.actor.fsdp_config.offload_policy=false \
-  actor_rollout_ref.actor.fsdp_config.optimizer_offload=true \
+  actor_rollout_ref.actor.fsdp_config.offload_policy=true \
+  actor_rollout_ref.actor.fsdp_config.param_offload=false \
+  actor_rollout_ref.actor.fsdp_config.optimizer_offload=false \
   actor_rollout_ref.actor.entropy_from_logits_chunk_size=128 \
   actor_rollout_ref.actor.fsdp_config.entropy_from_logits_chunk_size=128 \
   actor_rollout_ref.actor.entropy_checkpointing=true \
