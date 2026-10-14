@@ -20,8 +20,8 @@ export MODEL_PATH=/opt/huawei/dataset/downloaded_models/Qwen3.6-35B-A3B-whisper-
 export RM_MODEL_PATH=/opt/huawei/dataset/downloaded_models/Qwen3.5-35B-A3B
 export TRAIN_FILE=/opt/huawei/dataset/infra_data/data/dataset/train.parquet
 export VAL_FILE=/opt/huawei/dataset/infra_data/data/dataset/validation.parquet
-# 若实际 cache 不在默认位置，请运行前自行 export 正确路径；不要指向 media 图片目录。
-export MINICPMO_EMBED_CACHE_DIR=${MINICPMO_EMBED_CACHE_DIR:-/opt/huawei/dataset/ccb_data/code/hufenyu/verl_omni_qwen36_gzq/embed_cache_4b_qwen36}
+# 已确认的 Qwen36 embedding cache 根目录，不是 media 图片目录。
+export MINICPMO_EMBED_CACHE_DIR=/opt/huawei/dataset/infra_data/data/embed_cache_qwen36
 
 # DEBUG_MODE=1 会把 response 改回 512；用末尾的 total_training_steps 控制短诊断。
 export DEBUG_MODE=0
