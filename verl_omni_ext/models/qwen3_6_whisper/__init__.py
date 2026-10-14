@@ -27,6 +27,7 @@ import os
 import torch
 
 from verl_omni_ext.probes import diagnostic_io as _diag
+from verl_omni_ext.probes import gdn_trace as _gdn_trace
 
 from verl_omni_ext.models.qwen3_6_whisper.fsdp_cpu_offload_pin import apply_fsdp2_cpu_offload_pin_memory_patch
 from verl_omni_ext.models.qwen3_6_whisper.patches import (
@@ -59,52 +60,6 @@ def _diag_gdn_schema(raw_op):
     except Exception as exc:
         return {"observation_error": type(exc).__name__}
 
-
-def _diag_gdn_state_sample(before, after):
-    """Optional bounded cast-error sample, never a whole-state copy or kernel-error claim.
-
-    Device-to-CPU copies synchronize the device. Only ordinary contiguous dense
-    tensors are sampled; DTensor/subclasses are skipped to avoid implicit gathers.
-    """
-    if not _diag.enabled() or os.environ.get("MINICPMO_DIAG_NUMERICS") != "1":
-        return None
-    if not _diag.limited("qwen36_gdn_state_numeric_sample", 4):
-        return None
-    try:
-        for value in (before, after):
-            if type(value) not in (torch.Tensor, torch.nn.Parameter):
-                return {"status": "skipped", "reason": "missing state keyword or unsupported tensor subclass"}
-            if value.layout != torch.strided or not value.is_contiguous():
-                return {"status": "skipped", "reason": "state is not contiguous dense; no materialization attempted"}
-            if not value.is_floating_point():
-                return {"status": "skipped", "reason": "state is not floating point"}
-        if before.shape != after.shape:
-            return {"status": "skipped", "reason": "state shapes differ"}
-        count = min(64, before.numel())
-        # Slice the view BEFORE the transfer. No contiguous()/reshape() over full state.
-        original = before.detach().view(-1)[:count].to(device="cpu").to(dtype=torch.float64)
-        converted = after.detach().view(-1)[:count].to(device="cpu").to(dtype=torch.float64)
-        finite_original = torch.isfinite(original)
-        finite_converted = torch.isfinite(converted)
-        jointly_finite = finite_original & finite_converted
-        difference = converted[jointly_finite] - original[jointly_finite]
-        reference_norm = original[jointly_finite].norm().item()
-        difference_norm = difference.norm().item()
-        relative_l2 = difference_norm / reference_norm if reference_norm else (0.0 if not difference_norm else None)
-        return {
-            "status": "sampled", "sample_count": count, "sample_limit": 64,
-            "sample_position": "first contiguous elements", "total_elements": before.numel(),
-            "dtype_before": str(before.dtype), "dtype_after": str(after.dtype),
-            "finite_before": int(finite_original.sum().item()),
-            "finite_after": int(finite_converted.sum().item()),
-            "max_abs_before": original[finite_original].abs().max().item() if finite_original.any() else None,
-            "max_abs_after": converted[finite_converted].abs().max().item() if finite_converted.any() else None,
-            "rounding_max_abs_diff": difference.abs().max().item() if difference.numel() else None,
-            "rounding_relative_l2": relative_l2 if difference.numel() else None,
-            "comparison_scope": "jointly finite sample only; no kernel output or whole-state error measured",
-        }
-    except Exception as exc:
-        return {"status": "observation_error", "error": _diag.text_info(f"{type(exc).__name__}: {exc}")}
 
 def apply_batch_invariant_sum_patch():
     try:
@@ -163,11 +118,18 @@ def ensure_ascend_gdn_bf16_patched():
                             backend=_diag.module_info(gdn_mod),
                             raw_op_schema=_diag_gdn_schema(self._raw_op),
                             numeric_error_measured=False,
-                            state_numeric_sample=_diag_gdn_state_sample(kwargs.get("state"), kwargs.get("state")),
                         )
                     # AB experiment only: the installed backend may reject these dtypes.
                     # Positional arguments retain their original order and meaning.
-                    return self._raw_op(*args, **kwargs)
+                    trace = _gdn_trace.begin(self._raw_op, args, kwargs, kwargs, native=True)
+                    try:
+                        out = self._raw_op(*args, **kwargs)
+                    except Exception as exc:
+                        _gdn_trace.failed(trace, "kernel", exc)
+                        raise
+                    _gdn_trace.after_kernel(trace, self._raw_op, args, kwargs, out, [])
+                    _gdn_trace.finish(trace, [])
+                    return out
                 cast_back_list = []
 
                 new_args = list(args)
@@ -202,13 +164,22 @@ def ensure_ascend_gdn_bf16_patched():
                         backend=_diag.module_info(gdn_mod),
                         raw_op_schema=_diag_gdn_schema(self._raw_op),
                         numeric_error_measured=False,
-                        state_numeric_sample=_diag_gdn_state_sample(kwargs.get("state"), new_kwargs.get("state")),
                     )
-                out = self._raw_op(*new_args, **new_kwargs)
+                trace = _gdn_trace.begin(self._raw_op, args, kwargs, new_kwargs)
+                try:
+                    out = self._raw_op(*new_args, **new_kwargs)
+                except Exception as exc:
+                    _gdn_trace.failed(trace, "kernel", exc)
+                    raise
+                _gdn_trace.after_kernel(trace, self._raw_op, new_args, new_kwargs, out, cast_back_list)
 
-                for bf16_t, orig_fp32_t in cast_back_list:
-                    orig_fp32_t.copy_(bf16_t)
-
+                try:
+                    for bf16_t, orig_fp32_t in cast_back_list:
+                        orig_fp32_t.copy_(bf16_t)
+                except Exception as exc:
+                    _gdn_trace.failed(trace, "copyback", exc)
+                    raise
+                _gdn_trace.finish(trace, cast_back_list)
                 return out
 
             def __getattr__(self, name):
