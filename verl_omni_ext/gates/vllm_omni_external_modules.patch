@@ -1,0 +1,29 @@
+diff --git a/vllm_omni/model_executor/models/registry.py b/vllm_omni/model_executor/models/registry.py
+--- a/vllm_omni/model_executor/models/registry.py
++++ b/vllm_omni/model_executor/models/registry.py
+@@ -475,6 +475,24 @@
+     ),
+ }
+ 
+ 
++# === gate patch GP-004: VLLM_OMNI_EXTERNAL_MODULES ===
++# Load external pipeline/model definitions before _VLLM_OMNI_MODELS merge.
++# External modules can register into _OMNI_MODELS at import time:
++#   from vllm_omni.model_executor.models.registry import _OMNI_MODELS
++#   _OMNI_MODELS["MyArchitecture"] = ("my_model", "my_model", "MyClass")
++# Gate: off by default (env var unset = no-op), zero behavior change upstream.
++# Upstream PR plan: propose as a first-class extension point in vllm-omni.
++import os as _os
++import importlib as _importlib
++import logging as _logging
++_ext_logger = _logging.getLogger(__name__)
++for _mod in (m.strip() for m in _os.environ.get("VLLM_OMNI_EXTERNAL_MODULES", "").split(",") if m.strip()):
++    try:
++        _importlib.import_module(_mod)
++        _ext_logger.info("Loaded vllm-omni external module: %s", _mod)
++    except Exception as _e:
++        _ext_logger.warning("vllm-omni external module %r failed (skipped): %s", _mod, _e)
++
+ _VLLM_OMNI_MODELS = {
+     **_VLLM_MODELS,
+     **_OMNI_MODELS,
