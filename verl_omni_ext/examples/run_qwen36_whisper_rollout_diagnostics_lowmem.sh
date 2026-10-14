@@ -43,7 +43,9 @@ export TENSORBOARD_DIR=/opt/huawei/dataset/ccb_data/code/hufenyu/verl_omni_qwen3
 export GENRM_DUMP_DIR=/opt/huawei/dataset/ccb_data/code/hufenyu/verl_omni_qwen36_gzq/runs/actor_precision_lowmem_001/genrm_dump
 export MINICPMO_HANG_DUMP_DIR=/opt/huawei/dataset/ccb_data/code/hufenyu/verl_omni_qwen36_gzq/runs/actor_precision_lowmem_001/hang_dump
 
-# 降低 Actor/RM 推理并发和引擎显存预算、权重同步缓冲及 entropy 分块。
+# 降低 Actor/RM 推理并发和引擎显存预算及 entropy 分块。
+# 权重同步 bucket 保留 1024 MiB：BF16 embed_tokens [248320, 2048] 单张量占 970 MiB，
+# 当前共享内存传输要求单张量能完整放入 bucket，不能降到 256 MiB。
 # 关闭参数预取，启用手动 optimizer offload；offload_policy=false 避免覆盖手动卸载。
 # activation offload 沿用原入口的 false，避免重新引入已有的锁页内存问题。
 # 覆盖放在命令末尾，确保不会被 OmniMix 入口的固定值覆盖；额外 Hydra 参数仍可追加。
@@ -61,7 +63,7 @@ bash /opt/huawei/dataset/ccb_data/code/hufenyu/verl_omni_qwen36_gzq/examples/qwe
   actor_rollout_ref.rollout.gpu_memory_utilization=0.4 \
   reward.reward_model.rollout.max_num_seqs=4 \
   reward.reward_model.rollout.gpu_memory_utilization=0.4 \
-  actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=256 \
+  actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=1024 \
   actor_rollout_ref.actor.fsdp_config.forward_prefetch=false \
   actor_rollout_ref.ref.fsdp_config.forward_prefetch=false \
   actor_rollout_ref.actor.fsdp_config.offload_policy=false \
