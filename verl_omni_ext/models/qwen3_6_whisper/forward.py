@@ -100,6 +100,69 @@ def _dist_rank():
     return -1
 
 
+def _diag_forward_phase(module):
+    """Mode evidence, not an inference about actor/ref ownership or optimizer work."""
+    return ("train" if module.training else "eval") + ("_grad" if torch.is_grad_enabled() else "_nograd")
+
+
+def _diag_forward_inputs(module, inputs, event, boundary):
+    """Bounded metadata only; no device reads or claim that an encoder/cache ran."""
+    try:
+        phase = _diag_forward_phase(module)
+        # Logprob/ref calls must not exhaust observations of later grad forwards.
+        if not _diag.limited(f"{event}:{phase}", 1):
+            return
+        config = getattr(module, "config", None)
+        config_ids = {}
+        for label, candidate in (("config", config), ("text_config", getattr(config, "text_config", None))):
+            for name in ("image_token_id", "video_token_id", "audio_token_id"):
+                value = getattr(candidate, name, None)
+                if isinstance(value, int):
+                    config_ids[f"{label}.{name}"] = value
+        media_keys = ("pixel_values", "image_grid_thw", "tgt_sizes", "position_ids",
+                      "input_features", "audio_features", "inputs_embeds", "vision_hidden_states",
+                      "_precomputed_vision_embeds", "_precomputed_audio_embeds")
+        _diag.emit(
+            event, phase=phase, boundary=boundary, rank=_dist_rank(),
+            module=f"{type(module).__module__}.{type(module).__qualname__}",
+            model_path=getattr(config, "_name_or_path", None),
+            training=bool(module.training), grad_enabled=torch.is_grad_enabled(),
+            input_ids=_diag.token_info(inputs.get("input_ids")),
+            config_token_ids=config_ids, existing_image_token_check=248056,
+            cache_hit_verified=False,
+            **{key: _diag.summarize(inputs.get(key)) for key in media_keys},
+        )
+    except Exception:
+        # Failure to observe must not prevent the original forward.
+        pass
+
+
+def _diag_forward_return(module, args, kwargs, output):
+    """A successful forward return; output/graph references are never retained."""
+    try:
+        phase = _diag_forward_phase(module)
+        if not _diag.limited(f"qwen36_training_forward_return:{phase}", 1):
+            return
+        logits = output.get("logits") if isinstance(output, dict) else getattr(output, "logits", None)
+        if logits is None and isinstance(output, torch.Tensor):
+            logits = output
+        if logits is None and isinstance(output, (tuple, list)) and output and isinstance(output[0], torch.Tensor):
+            logits = output[0]
+        _diag.emit(
+            "qwen36_training_forward_return", phase=phase, rank=_dist_rank(),
+            module=f"{type(module).__module__}.{type(module).__qualname__}",
+            training=bool(module.training), grad_enabled=torch.is_grad_enabled(),
+            returned_type=f"{type(output).__module__}.{type(output).__qualname__}",
+            logits=_diag.summarize(logits),
+            logits_requires_grad=bool(logits.requires_grad) if isinstance(logits, torch.Tensor) else None,
+            numerical_equivalence_checked=False,
+            note="Return metadata only; grad-enabled forward does not prove backward or optimizer completion",
+        )
+    except Exception:
+        pass
+    # Returning None preserves torch's original output object.
+
+
 def _resolve_submodule(module, candidate_paths):
     """Resolve a nested submodule by trying each candidate path tuple.
 
@@ -303,23 +366,7 @@ def build_qwen36_forward_adapter(module):
         data = kwargs.get("data") or (args[0] if args else None)
         target = data if isinstance(data, dict) else kwargs
 
-        if _diag.limited("qwen36_training_forward"):
-            config = getattr(mod, "config", None)
-            config_ids = {}
-            for label, candidate in (("config", config), ("text_config", getattr(config, "text_config", None))):
-                for name in ("image_token_id", "video_token_id", "audio_token_id"):
-                    value = getattr(candidate, name, None)
-                    if isinstance(value, int):
-                        config_ids[f"{label}.{name}"] = value
-            _diag.emit(
-                "qwen36_training_forward", rank=_dist_rank(), module=type(mod).__name__,
-                training=bool(getattr(mod, "training", False)), grad_enabled=torch.is_grad_enabled(),
-                input_ids=_diag.token_info(target.get("input_ids")),
-                pixel_values=target.get("pixel_values"), image_grid_thw=target.get("image_grid_thw"),
-                tgt_sizes=target.get("tgt_sizes"), position_ids=target.get("position_ids"),
-                input_features=target.get("input_features"), audio_features=target.get("audio_features"),
-                config_token_ids=config_ids, existing_image_token_check=248056,
-            )
+        _diag_forward_inputs(mod, target, "qwen36_training_forward", "before ext input normalization")
 
         pv = target.get("pixel_values")
         if isinstance(pv, list):
@@ -417,7 +464,11 @@ def build_qwen36_forward_adapter(module):
                 if "image_grid_thw" in kwargs:
                     del kwargs["image_grid_thw"]
                 _diag.console_or_file("qwen36_forward_message", f"[verl-omni] _normalize_pixel_values_hook: no image token in input_ids, cleared pixel_values+grid_thw (compute_log_prob path)", flush=True)
+        _diag_forward_inputs(mod, target, "qwen36_training_inputs_ready",
+                             "after ext input normalization; before model forward")
     module.register_forward_pre_hook(_normalize_pixel_values_hook, with_kwargs=True)
+    if _diag.enabled():
+        module.register_forward_hook(_diag_forward_return, with_kwargs=True)
 
     # 2. Precomputed embedding injection (optional)
     _precompute_cache_dir = os.environ.get("MINICPMO_EMBED_CACHE_DIR", "")

@@ -2,6 +2,7 @@
 # 请先自行准备服务器环境并启动 Ray，再用 bash 执行本脚本。
 # 多节点需共用支持文件锁的诊断目录；同名日志会追加并沿用总限额。
 # 每轮诊断请设置新的 MINICPMO_ROLLOUT_DIAG_DIR；训练日志由原入口写入当前工作目录。
+# 新增观测只写该目录下的 rollout_diagnostics.log，纯文本单文件，不解析旧 JSON 行。
 set -eo pipefail
 
 # 复用已验证训练命令，只增加单文件 rollout 诊断与独立输出目录。

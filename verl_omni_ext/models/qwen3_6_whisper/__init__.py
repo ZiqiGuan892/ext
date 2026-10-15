@@ -105,6 +105,8 @@ def ensure_ascend_gdn_bf16_patched():
             def __init__(self, raw_op):
                 self._raw_op = raw_op
                 self._is_bf16_patched = True
+                # A loaded-code marker, unlike a hash of files replaced on disk.
+                self._gdn_probe_revision = _gdn_trace.PROBE_REVISION
 
             def __call__(self, *args, **kwargs):
                 native = _diag.enabled() and os.environ.get("MINICPMO_DIAG_GDN_NATIVE") == "1"
@@ -117,6 +119,7 @@ def ensure_ascend_gdn_bf16_patched():
                             state_cast_back=False, state_fp32_to_bf16=False,
                             backend=_diag.module_info(gdn_mod),
                             raw_op_schema=_diag_gdn_schema(self._raw_op),
+                            probe_revision=self._gdn_probe_revision,
                             numeric_error_measured=False,
                         )
                     # AB experiment only: the installed backend may reject these dtypes.
@@ -163,6 +166,7 @@ def ensure_ascend_gdn_bf16_patched():
                         state_fp32_to_bf16=any(original.dtype == torch.float32 for _, original in cast_back_list),
                         backend=_diag.module_info(gdn_mod),
                         raw_op_schema=_diag_gdn_schema(self._raw_op),
+                        probe_revision=self._gdn_probe_revision,
                         numeric_error_measured=False,
                     )
                 trace = _gdn_trace.begin(self._raw_op, args, kwargs, new_kwargs)
@@ -203,6 +207,7 @@ def ensure_ascend_gdn_bf16_patched():
         if _diag.limited("qwen36_gdn_patch_install", 1):
             _diag.emit(
                 "qwen36_gdn_patch_install", backend=_diag.module_info(gdn_mod),
+                probe_revision=wrapped_op._gdn_probe_revision,
                 packet_hooked=getattr(c_ascend.npu_recurrent_gated_delta_rule, "_is_bf16_patched", False),
                 default_hooked=getattr(getattr(target_op, "default", None), "_is_bf16_patched", False),
             )

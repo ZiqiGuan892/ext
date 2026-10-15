@@ -1,12 +1,11 @@
 """Bounded, opt-in diagnostic records; never copy device tensor contents.
 
 This module deliberately has no ML/runtime imports. All workers append to one
-JSONL file on a shared filesystem, under an OS file lock. Budgets are global to
+plain-text log on a shared filesystem, under an OS file lock. Budgets are global to
 that file, not multiplied by the number of workers. Host/PID remain in records.
 """
 
 import hashlib
-import json
 import os
 import socket
 import sys
@@ -15,26 +14,38 @@ import time
 from collections import Counter
 from collections.abc import Mapping
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 _lock = threading.RLock()
 _counts = Counter()
 _warned = False
+# Retained for older in-process test/reset callers; no path is permanently
+# suppressed here, so replacing a capped file can start a fresh diagnostic run.
 _full_paths = set()
-LOG_NAME = "rollout_diagnostics.jsonl"
+_scan_cache = {}
+_write_failures = {"count": 0, "last_type": None, "first_time_ns": None}
+LOG_NAME = "rollout_diagnostics.log"
+DIAGNOSTICS_REVISION = "2026-10-15-log-v2"
 _MAX_RECORD_BYTES = 16384
 _LIMIT_RESERVE = 1024
+_LIMIT_PREFIX = b"DIAG event='diagnostic_limit_reached' "
 
 
 def _write_failure(exc):
     """Keep failure state in memory; never create per-worker fallback logs.
 
-    The launcher checks shared-directory access before training and checks the
-    output afterwards. An unwritable destination cannot reliably log its own
-    failure; diagnostics must still never interrupt model execution.
+    Retry on the next event. Once writing succeeds, a recovery notice in the same
+    file reports the suppressed attempts. No device objects or exception traces
+    are retained, and failures never spill into the training console.
     """
     global _warned
     _warned = True
+    with _lock:
+        if not _write_failures["count"]:
+            _write_failures["first_time_ns"] = time.time_ns()
+        _write_failures["count"] = min(_write_failures["count"] + 1, 2**31 - 1)
+        _write_failures["last_type"] = type(exc).__name__[:128]
 
 
 def enabled():
@@ -200,72 +211,111 @@ def _file_lock(stream):
 
 
 def _encode_record(record):
-    data = json.dumps(record, ensure_ascii=False, allow_nan=False).encode("utf-8") + b"\n"
+    """One physical text line; repr escapes newlines without a JSON dependency.
+
+    Fields have already passed through summarize(), so no device tensor is
+    formatted. The fixed prefix is used only to recognize our terminal budget
+    notice; ordinary old lines are never parsed or required to have a schema.
+    """
+    record = dict(record)
+    event = str(record.pop("event", "unknown"))[:128]
+    time_ns = record.get("time_ns")
+    if isinstance(time_ns, int):
+        record["time_utc"] = datetime.fromtimestamp(time_ns / 1e9, timezone.utc).isoformat(timespec="milliseconds")
+
+    def encode():
+        parts = [f"DIAG event={event!r}"]
+        parts.extend(f"{key}={value!r}" for key, value in record.items() if key != "fields")
+        parts.append(f"fields={record.get('fields', {})!r}")
+        return (" ".join(parts) + "\n").encode("utf-8", errors="backslashreplace")
+
+    data = encode()
     if len(data) > _MAX_RECORD_BYTES:
-        # Keep a valid JSON line and the event identity even for huge metadata.
-        original = json.dumps(record["fields"], ensure_ascii=False, allow_nan=False)
+        original = repr(record.get("fields", {}))
         record["fields"] = {
             "record_truncated": True, "chars": len(original),
-            "sha256": hashlib.sha256(original.encode("utf-8")).hexdigest(),
+            "sha256": hashlib.sha256(original.encode("utf-8", errors="backslashreplace")).hexdigest(),
             "head": original[:512], "tail": original[-512:],
         }
-        data = json.dumps(record, ensure_ascii=False, allow_nan=False).encode("utf-8") + b"\n"
+        data = encode()
+    if len(data) > _MAX_RECORD_BYTES:
+        # Top-level metadata is internal, but keep the bound even for a malformed
+        # caller. A shortened line remains useful without needing to parse it.
+        data = data[:_MAX_RECORD_BYTES - 32].decode("utf-8", errors="ignore").encode("utf-8") + b" ... record_truncated=True\n"
     return data
 
 
-def _last_record(stream):
-    """Read only the bounded tail; repair an interrupted final append."""
-    size = stream.seek(0, os.SEEK_END)
-    if not size:
-        return 0, None
-    start = max(0, size - _MAX_RECORD_BYTES * 2)
-    stream.seek(start)
-    tail = stream.read()
-    if not tail.endswith(b"\n"):
-        end = tail.rfind(b"\n") + 1
-        if not end and start:
-            raise ValueError("diagnostic tail is not recoverable")
-        stream.truncate(start + end)
-        tail = tail[:end]
-        size = start + end
-    if not tail:
-        return size, None
-    return size, json.loads(tail.splitlines()[-1])
+def _scan_log(stream, path):
+    """Count physical lines incrementally; preserve every existing byte.
+
+    Under the file lock, cached inode/offset state is safe for cooperating append
+    writers. A rotated or truncated file starts a fresh scan. Only a bounded
+    prefix of the unfinished last line is retained, never its whole contents.
+    """
+    stat = os.fstat(stream.fileno())
+    identity = (stat.st_dev, stat.st_ino)
+    key = str(path)
+    state = _scan_cache.get(key)
+    if state is None or state["identity"] != identity or stat.st_size < state["offset"]:
+        state = {"identity": identity, "offset": 0, "newlines": 0, "prefix": b"", "limited": False}
+    else:
+        state = dict(state)
+    stream.seek(state["offset"])
+    while True:
+        block = stream.read(65536)
+        if not block:
+            break
+        parts = block.split(b"\n")
+        for part in parts[:-1]:
+            prefix = (state["prefix"] + part)[:len(_LIMIT_PREFIX)]
+            state["limited"] |= prefix == _LIMIT_PREFIX
+            state["newlines"] += 1
+            state["prefix"] = b""
+        state["prefix"] = (state["prefix"] + parts[-1])[:len(_LIMIT_PREFIX)]
+        state["offset"] += len(block)
+    state["limited"] |= state["prefix"] == _LIMIT_PREFIX
+    if key not in _scan_cache and len(_scan_cache) >= 16:
+        _scan_cache.pop(next(iter(_scan_cache)))
+    _scan_cache[key] = state
+    return state["offset"], state["newlines"] + bool(state["prefix"]), bool(state["prefix"]), state["limited"]
 
 
 def _append_record(path, record):
-    if str(path) in _full_paths:
-        return
     max_records = _limit("MINICPMO_ROLLOUT_DIAG_MAX_RECORDS", 2000, 100000)
     max_bytes = max(_LIMIT_RESERVE, _limit("MINICPMO_ROLLOUT_DIAG_MAX_BYTES", 4 * 1024 * 1024,
                                          64 * 1024 * 1024))
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+b", buffering=0) as stream, _file_lock(stream):
-        size, last = _last_record(stream)
-        if last and last.get("event") == "diagnostic_limit_reached":
-            _full_paths.add(str(path))
-            return
-        count = last["record_index"] if last else 0
+        if os.fstat(stream.fileno()).st_size >= max_bytes:
+            return False
+        size, count, incomplete_tail, capped = _scan_log(stream, path)
+        if capped:
+            return False
+        # An interrupted append is evidence. Separate it from this record instead
+        # of deleting it or attempting to decode its contents.
+        separator = b"\n" if incomplete_tail else b""
         record["record_index"] = count + 1
         data = _encode_record(record)
         reason = "record_limit" if count >= max_records else "file_size_limit"
-        if count >= max_records or size + len(data) + _LIMIT_RESERVE > max_bytes:
+        normal_record = True
+        if count >= max_records or size + len(separator) + len(data) + _LIMIT_RESERVE > max_bytes:
             record = {"event": "diagnostic_limit_reached", "record_index": count + 1,
                       "time_ns": time.time_ns(), "host": socket.gethostname(), "pid": os.getpid(),
                       "fields": {"reason": reason, "max_records": max_records, "max_bytes": max_bytes,
                                  "message": "Further diagnostic records are suppressed; training continues."}}
             data = _encode_record(record)
-            _full_paths.add(str(path))
-            if size + len(data) > max_bytes:
-                return
+            normal_record = False
+            if size + len(separator) + len(data) > max_bytes:
+                return False
         # All cooperating writers hold the lock for the complete line.
         stream.seek(0, os.SEEK_END)
-        remaining = memoryview(data)
+        remaining = memoryview(separator + data)
         while remaining:
             written = stream.write(remaining)
             if not written:
                 raise OSError("diagnostic append made no progress")
             remaining = remaining[written:]
+        return normal_record
 
 
 def emit(event, **fields):
@@ -278,16 +328,22 @@ def emit(event, **fields):
             raise ValueError("MINICPMO_ROLLOUT_DIAG_DIR is required when diagnostics are enabled")
         with _lock:
             host = socket.gethostname()
+            path = Path(directory) / LOG_NAME
+            if _write_failures["count"]:
+                recovery = {"event": "diagnostic_write_recovered", "time_ns": time.time_ns(),
+                            "host": host, "pid": os.getpid(), "fields": dict(_write_failures)}
+                if _append_record(path, recovery):
+                    _write_failures.update(count=0, last_type=None, first_time_ns=None)
             record = {"event": event, "time_ns": time.time_ns(), "monotonic_ns": time.monotonic_ns(),
                       "host": host, "pid": os.getpid(), "thread": threading.get_ident(),
                       "fields": summarize(fields)}
-            _append_record(Path(directory) / LOG_NAME, record)
+            _append_record(path, record)
     except Exception as exc:
         _write_failure(exc)
 
 
 def console_or_file(event, message, *, flush=True):
-    """Move existing diagnostic prints to JSONL while preserving disabled behavior."""
+    """Move existing diagnostic prints to the log while preserving disabled behavior."""
     if enabled():
         if limited(event):
             emit(event, message=text_info(message))
@@ -302,8 +358,29 @@ def startup():
                  "verl_omni_ext.models.qwen3_6_whisper",
                  "verl_omni_ext.models.qwen3_6_whisper.forward",
                  "verl_omni_ext.models.qwen3_6_whisper.mm_inputs",
-                 "verl_omni_ext.reward.genrm_verifier")
-        emit("process_start", executable=sys.executable, cwd=os.getcwd(),
+                 "verl_omni_ext.reward.genrm_verifier",
+                 "verl_omni_ext.probes.diagnostic_io",
+                 "verl_omni_ext.probes.rollout_trace", "verl_omni_ext.probes.gdn_trace")
+        probe_sources = {}
+        for name in ("diagnostic_io", "rollout_trace", "gdn_trace"):
+            module_name = "verl_omni_ext.probes." + name
+            module = sys.modules.get(module_name)
+            if module is not None:
+                probe_sources[name] = {"loaded": True, **module_info(module)}
+                continue
+            # Some hooks are imported later. Hash the adjacent source without
+            # importing it, and explicitly distinguish disk presence from use.
+            source = Path(__file__).with_name(name + ".py")
+            info = {"loaded": False, "file": str(source)}
+            try:
+                info["source_exists"] = source.is_file()
+                if source.is_file() and source.stat().st_size <= 2_000_000:
+                    info["source_sha256"] = hashlib.sha256(source.read_bytes()).hexdigest()
+            except Exception as exc:
+                info["observation_error"] = type(exc).__name__
+            probe_sources[name] = info
+        emit("process_start", diagnostics_revision=DIAGNOSTICS_REVISION, executable=sys.executable, cwd=os.getcwd(),
+             probe_sources=probe_sources,
              modules={name: module_info(sys.modules[name]) for name in names if name in sys.modules},
              switches={key: value for key, value in os.environ.items()
                        if key.startswith(("MINICPMO_DIAG_", "MINICPMO_ROLLOUT_DIAG"))})

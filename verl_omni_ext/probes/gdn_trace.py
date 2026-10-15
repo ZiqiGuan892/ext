@@ -16,6 +16,7 @@ import torch
 from . import diagnostic_io as diag
 
 
+PROBE_REVISION = "gdn_runtime_coverage_20261015"
 SAMPLE_CALLS = (1, 2, 16, 128, 1024, 8192, 32768, 131072)
 _calls = {}
 _lock = threading.Lock()
@@ -171,6 +172,7 @@ def begin(raw_op, args, before_kwargs, after_kwargs, native=False):
         controls = {k: (_number(v) if isinstance(v, float) else v) for k, v in converted.items()
                     if v is None or isinstance(v, (bool, int, float))}
         diag.emit("qwen36_gdn_numeric_begin", call=call, native=native, binding=binding,
+                  probe_revision=PROBE_REVISION,
                   raw_schema=str(getattr(raw_op, "_schema", None)), scope=trace["scope"],
                   reference_verified=False, sample_calls=SAMPLE_CALLS,
                   controls=controls, schema_writable_arguments=writes,
@@ -238,6 +240,7 @@ def finish(trace, cast_back_list):
                              "original_vs_actual": _compare(original, actual),
                              "kernel_unchanged_but_writeback_changed": cast_only_changes})
         diag.emit("qwen36_gdn_numeric_result", call=trace["call"], native=trace["native"],
+                  probe_revision=PROBE_REVISION,
                   scope=trace["scope"], reference_verified=False,
                   kernel_state={k: _public(v) for k, v in trace.get("kernel_state", {}).items()},
                   state_update=trace.get("state_update"), readonly_changes=trace.get("readonly_changes"),
