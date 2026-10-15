@@ -20,8 +20,19 @@ from . import diagnostic_io as diag
 _request = ContextVar("ext_rollout_diag_request", default=None)
 _MARKER = "_ext_rollout_trace_wrapped"
 _calls = count(1)
-PROBE_REVISION = "2026-10-15-engine-stream-v2"
+PROBE_REVISION = "2026-10-15-engine-stream-v3"
 _engine_attempts = set()
+
+
+def _request_context():
+    """Resolve worker-local state at call time, never capture it in Ray closures.
+
+    Ray/cloudpickle serializes nested method wrappers by value. Directly using
+    the module's ContextVar in start/end would include that unpicklable object
+    in their globals, even when exporting an unrelated method such as sleep.
+    This accessor only references an importable module and its name.
+    """
+    return importlib.import_module(__name__)._request
 
 
 def _record(event, **fields):
@@ -316,15 +327,15 @@ def _wrap(original, kind, target):
         try:
             bound = signature.bind_partial(*args, **kwargs).arguments
             if kind == "request":
-                context = _request.set(bound.get("request_id"))
+                context = _request_context().set(bound.get("request_id"))
                 _observe(_discover_engine, bound.get("self"))
             sampled = _active(target)
             if sampled:
                 call_id = next(_calls)
                 fields = _observe(_inputs, kind, bound)
-                fields.setdefault("request_id", _request.get())
+                fields.setdefault("request_id", _request_context().get())
                 _record(f"{kind}_begin", target=target, call_id=call_id, **fields)
-            return sampled, context, time.monotonic(), bound.get("request_id", _request.get()), call_id
+            return sampled, context, time.monotonic(), bound.get("request_id", _request_context().get()), call_id
         except Exception:
             return False, context, 0.0, None, call_id
 
@@ -345,7 +356,7 @@ def _wrap(original, kind, target):
         finally:
             if context is not None:
                 try:
-                    _request.reset(context)
+                    _request_context().reset(context)
                 except Exception:
                     pass
 
