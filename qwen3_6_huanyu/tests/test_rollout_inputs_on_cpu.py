@@ -1,6 +1,8 @@
 """Huanyu rollout item/chunk contracts, without Ray, vLLM or model weights."""
 
+import asyncio
 import importlib.util
+import inspect
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
@@ -132,6 +134,190 @@ class RolloutInputsTest(unittest.TestCase):
 
         with self.assertRaises(RuntimeError):
             rollout._install_on_server_class(Server)
+
+    def test_async_generate_contracts_long_audio_and_image_without_mutating_inputs(self):
+        class Server:
+            async def generate(self, prompt_ids, sampling_params, request_id,
+                               image_data=None, video_data=None, audio_data=None, *, priority=0):
+                await asyncio.sleep(0)
+                self.model_config.processor.dedup_pad_tokens(prompt_ids)
+                return prompt_ids, sampling_params, request_id, image_data, video_data, audio_data, priority
+
+        original_generate = Server.generate
+        rollout._install_on_server_class(Server)
+        installed = Server.generate
+        self.assertEqual(installed.__module__, rollout.__name__)
+        self.assertIn("<locals>", installed.__qualname__)
+        self.assertEqual(inspect.signature(installed), inspect.signature(original_generate))
+        rollout._install_on_server_class(Server)
+        self.assertIs(Server.generate, installed)
+        server = Server()
+        server.model_config = SimpleNamespace(processor=Processor())
+        server._ar_mode = True
+        ids = [7, 10, 12, 12, 11] + audio_span(375) + audio_span(12) + [8]
+        before = list(ids)
+        params = {"max_tokens": 19}
+        images = [object()]
+        audio = [Waveform(31 * 16000)]
+        request_id = object()
+        result = asyncio.run(server.generate(
+            ids, params, request_id, image_data=images, audio_data=audio, priority=3
+        ))
+        self.assertEqual(result[0], [7, 100, 101, 200, 201, 8])
+        self.assertEqual(ids, before)
+        self.assertIsNot(result[0], ids)
+        self.assertIs(result[1], params)
+        self.assertIs(result[2], request_id)
+        self.assertIs(result[3], images)
+        self.assertIsNone(result[4])
+        self.assertIs(result[5], audio)
+        self.assertEqual(result[6], 3)
+        self.assertEqual(params, {"max_tokens": 19})
+        self.assertEqual(len(audio[0]), 31 * 16000)
+
+    def test_async_generate_without_video_parameter_handles_text_only(self):
+        class Server:
+            async def generate(self, prompt_ids, sampling_params, *, image_data=None, audio_data=None):
+                return prompt_ids, sampling_params, image_data, audio_data
+
+        rollout._install_on_server_class(Server)
+        server = Server()
+        server.model_config = SimpleNamespace(processor=Processor())
+        server._ar_mode = True
+        ids = [7, 22, 8]
+        params = object()
+        result = asyncio.run(server.generate(prompt_ids=ids, sampling_params=params))
+        self.assertEqual(result[0], ids)
+        self.assertIs(result[1], params)
+        self.assertIsNone(result[2])
+        self.assertIsNone(result[3])
+
+    def test_async_generate_non_huanyu_rm_is_delegated_unchanged(self):
+        class Server:
+            async def generate(self, prompt_ids, sampling_params, image_data=None, audio_data=None):
+                return prompt_ids, sampling_params, image_data, audio_data
+
+        rollout._install_on_server_class(Server)
+        server = Server()
+        server.model_config = SimpleNamespace(processor=object())
+        server._ar_mode = False  # Other models must not run the Huanyu mode/metadata guards.
+        ids, params, images, audios = (object() for _ in range(4))
+        result = asyncio.run(server.generate(ids, params, images, audios))
+        for actual, expected in zip(result, (ids, params, images, audios)):
+            self.assertIs(actual, expected)
+
+    def test_async_generate_requires_ar_mode_and_rejects_bad_media_before_call(self):
+        calls = []
+
+        class Server:
+            async def generate(self, prompt_ids, image_data=None, audio_data=None, video_data=None):
+                calls.append(prompt_ids)
+
+        rollout._install_on_server_class(Server)
+        server = Server()
+        server.model_config = SimpleNamespace(processor=Processor())
+        server._ar_mode = False
+        with self.assertRaisesRegex(RuntimeError, "autoregressive"):
+            asyncio.run(server.generate([7]))
+        server._ar_mode = True
+        with self.assertRaises(ValueError):
+            asyncio.run(server.generate(audio_span(11), audio_data=[Waveform(16000)]))
+        with self.assertRaises(ValueError):
+            asyncio.run(server.generate([7], video_data=[object()]))
+        self.assertEqual(calls, [])
+
+    def test_async_generate_preserves_original_exception(self):
+        original_error = RuntimeError("native generation failed")
+
+        class Server:
+            async def generate(self, prompt_ids, image_data=None, audio_data=None):
+                await asyncio.sleep(0)
+                raise original_error
+
+        rollout._install_on_server_class(Server)
+        server = Server()
+        server.model_config = SimpleNamespace(processor=Processor())
+        server._ar_mode = True
+        with self.assertRaises(RuntimeError) as caught:
+            asyncio.run(server.generate([7]))
+        self.assertIs(caught.exception, original_error)
+
+    def test_ray_actor_wrapper_patches_only_modified_class(self):
+        class ModifiedServer:
+            async def generate(self, prompt_ids, image_data=None, audio_data=None):
+                return prompt_ids
+
+        wrapper_generate = object()
+        actor_export = SimpleNamespace(
+            __ray_metadata__=SimpleNamespace(modified_class=ModifiedServer),
+            generate=wrapper_generate,
+        )
+        original_generate = ModifiedServer.generate
+        rollout._install_on_server_class(actor_export)
+        installed = ModifiedServer.generate
+        self.assertIsNot(installed, original_generate)
+        self.assertIs(actor_export.generate, wrapper_generate)
+        rollout._install_on_server_class(actor_export)
+        self.assertIs(ModifiedServer.generate, installed)
+        server = ModifiedServer()
+        server.model_config = SimpleNamespace(processor=Processor())
+        server._ar_mode = True
+        self.assertEqual(asyncio.run(server.generate(
+            [10, 12, 11], image_data=[object()]
+        )), [100, 101])
+
+    def test_preprocess_is_preferred_over_generate_to_avoid_double_contraction(self):
+        class Server:
+            def _preprocess_input(self, prompt_ids, multi_modal_data):
+                return self.model_config.processor.dedup_pad_tokens(prompt_ids)
+
+            async def generate(self, prompt_ids, image_data=None, audio_data=None):
+                return self._preprocess_input(prompt_ids, {"image": image_data, "audio": audio_data})
+
+        original_generate = Server.generate
+        rollout._install_on_server_class(Server)
+        self.assertIs(Server.generate, original_generate)
+        server = Server()
+        server.model_config = SimpleNamespace(processor=Processor())
+        server._ar_mode = True
+        result = asyncio.run(server.generate(
+            audio_span(375) + audio_span(12), audio_data=[Waveform(31 * 16000)]
+        ))
+        self.assertEqual(result, [200, 201])
+
+    def test_unsupported_server_api_is_rejected_explicitly(self):
+        class NoEntry:
+            pass
+
+        class SyncGenerate:
+            def generate(self, prompt_ids, image_data=None, audio_data=None):
+                return prompt_ids
+
+        class MissingAudio:
+            async def generate(self, prompt_ids, image_data=None):
+                return prompt_ids
+
+        class AsyncPreprocess:
+            async def _preprocess_input(self, prompt_ids, multi_modal_data):
+                return prompt_ids
+
+        class InvalidPreprocessWithValidGenerate:
+            def _preprocess_input(self, unrelated):
+                return unrelated
+
+            async def generate(self, prompt_ids, image_data=None, audio_data=None):
+                return prompt_ids
+
+        class OpaqueGenerate:
+            async def generate(self, *args, **kwargs):
+                return args
+
+        candidates = (NoEntry, SyncGenerate, MissingAudio, AsyncPreprocess,
+                      InvalidPreprocessWithValidGenerate, OpaqueGenerate,
+                      SimpleNamespace(__ray_metadata__=SimpleNamespace(modified_class=object())))
+        for candidate in candidates:
+            with self.subTest(server=candidate), self.assertRaises(RuntimeError):
+                rollout._install_on_server_class(candidate)
 
 
 if __name__ == "__main__":

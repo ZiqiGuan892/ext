@@ -32,7 +32,7 @@
 | processor.py | 40 维 fbank、Qwen 图像处理、媒体 token 展开、原生 HF mRoPE、AgentLoop 输入桥接 |
 | dataset.py | 读取原始图片、音频、视频帧；不读取 Whisper cache |
 | forward.py | 保留 HF 图像/文本前向，在经过验证的音频 token 位置注入 embedding |
-| rollout_inputs.py | 按媒体元数据，把训练侧展开 token 收缩回推理侧媒体标记 |
+| rollout_inputs.py | 按媒体元数据收缩推理占位符，兼容独立预处理方法及内联预处理的 async generate 接口 |
 | rollout_adapter.py | 独立注册 qwen3_6_huanyu，复用现有单 llm stage 拓扑 |
 | run_32card.sh | 调用原 32 卡入口，追加 Huanyu 配置、关闭长度预筛，显式传递 Ray 导入路径 |
 | check_runtime.py | 不加载模型权重的真实依赖/processor/mRoPE CPU 接口检查 |
@@ -152,6 +152,31 @@ vllm_omni.model_executor.models.minicpmo_5_0.huanyu_audio
 
 本地未提供服务器 V1 的 `verl.trainer.main_ppo.run_ppo` 及额外 `worker_env.py`，无法本地证明服务器是否再次覆盖 Ray 环境。最终以新任务打印的配置和 worker 导入结果验收；本地没有执行 NPU 训练。
 
+## 2026-10-19：安装 rollout hook 时没有 _preprocess_input
+
+新日志已越过原生 Huanyu 导入和 `build_huanyu_processor()`，随后在 `configure_processor()` 安装推理输入 hook 时失败：
+
+```text
+TaskRunnerV1 pid=1390206 ip=172.16.3.226
+rollout_inputs.py → _install_on_server_class(vLLMOmniHttpServer)
+AttributeError: type object 'vLLMOmniHttpServer' has no attribute '_preprocess_input'
+```
+
+问题在本插件对 server 接口的假设。旧实现直接读取 `_preprocess_input`，只兼容本地所见版本；新日志中的实际导入对象没有该属性。错误发生在 trainer 初始化阶段，尚未产生 rollout，不能解释为 Huanyu encoder 权重或音频特征出错。
+
+本次只修改 Huanyu 目录里的 hook、测试和本说明：
+
+- 若导出对象是 Ray ActorClass，先取其 `__ray_metadata__.modified_class`，对实际 Python 类安装 hook。
+- 有同步 `_preprocess_input(self, prompt_ids, ..., multi_modal_data, ...)` 时沿用此入口。
+- 没有独立预处理方法时，支持带 `prompt_ids/image_data/audio_data` 的异步 `generate` 入口：从该请求的媒体参数构造元数据，收缩 prompt 后 `await` 原方法。请求 ID、采样参数、媒体对象和其他参数继续传给原方法；不重写引擎生成逻辑。
+- 只选择一个入口，重复安装不会二次包裹；其他模型仍调用原方法。音频条目与 30 秒 chunk 的校验继续保留，不通过跳过 hook 或删除媒体检查绕过报错。
+- 方法缺失或签名不匹配时明确报出不支持的接口，不能把“安装函数返回了”当作适配成功。
+- 包装器保留 Huanyu 模块内的局部函数身份，不复制原 server 方法的 `__module__/__qualname__`，避免序列化时只记录服务器原方法路径、远端恢复成未安装 hook 的方法；签名与原方法调用关系仍保留。
+
+安装成功的日志包含 `Huanyu rollout input hook installed`、实际方法名（`_preprocess_input` 或 `generate`）和源码路径。服务器尚需核实真实方法实现并重跑验证，不能仅凭 AttributeError 判断一定是 Ray 包装导致。
+
+同步更新后的 `rollout_inputs.py` 到所有节点的 `verl_omni_ext/models/qwen3_6_huanyu/`，继续使用同一个 `run_32card.sh`。无需修改训练参数、重算 cache 或重建 parquet。
+
 ## 验证与边界
 
 ```bash
@@ -160,7 +185,9 @@ python3 -B -m unittest discover \
 bash -n verl_omni_ext/models/qwen3_6_huanyu/run_32card.sh
 ```
 
-本次本地验证：78 项 CPU 测试全部通过，Bash 语法检查通过。其中 11 项新增测试验证原生模块缺失、内部依赖缺失、错误包来源、文件存在但搜索路径错误以及接口缺失，确认异常保留根因且不替换已导入模块。原有测试覆盖严格权重加载、FP32 Actor 主参数不被 BF16 临时视图修改、真实长度与占位符、混合 batch/左 padding、文本梯度、长音频推理条目数、独立注册和其他模型的 hook 分流。真实模型依赖使用测试替身，不能据此证明 NPU 上数值一致。
+本次本地验证：86 项 CPU 测试全部通过，启动脚本此前的 Bash 语法检查通过且本轮未改动。8 项新增回归测试覆盖异步 generate 的真实执行、31 秒音频与图像、纯文本、RM 透传、异常传播、Ray 类解包、入口优先级与不支持接口的拒绝；同时检查包装器保留局部身份与原签名。另有 11 项测试验证原生模块缺失、内部依赖缺失、错误包来源、文件存在但搜索路径错误以及接口缺失。原有测试覆盖严格权重加载、FP32 Actor 主参数不被 BF16 临时视图修改、真实长度与占位符、混合 batch/左 padding、文本梯度、长音频推理条目数、独立注册和其他模型的 hook 分流。真实模型依赖使用测试替身，不能据此证明 NPU 上数值一致。
+
+Windows 本地沙箱中的 asyncio 测试初始化曾阻塞，允许本地 IPC 后全部 86 项测试完成；这不是服务器训练测试。未在本地安装 Ray/cloudpickle，真实 Ray 远端序列化与服务器接口仍需服务器验收。
 
 当前只支持冻结 audio encoder/projector，采用 padded [B,S] 前向（use_remove_padding=false），可能比 packed 路径占用更多显存。音频计算保持原生 VGG FP32、Conformer BF16；参数仍未解分片或音频模块被独立 FSDP 包装时明确报错，不能在不同 rank 上临时发起不对称 collective 来绕过。
 

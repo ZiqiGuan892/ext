@@ -142,34 +142,90 @@ def contract_rollout_prompt(processor, prompt_ids, multi_modal_data):
 
 
 def _install_on_server_class(server_class):
-    original = server_class._preprocess_input
+    # Some versions export a Ray ActorClass rather than the Python class.
+    # Methods must be patched on the class Ray actually instantiates.
+    modified = getattr(getattr(server_class, "__ray_metadata__", None), "modified_class", None)
+    target = modified if modified is not None else server_class
+    if not inspect.isclass(target):
+        raise RuntimeError("Huanyu rollout hook requires a Python server class or Ray modified_class")
+
+    method_name = "_preprocess_input"
+    original = getattr(target, method_name, None)
+    if not callable(original):
+        # Some servers keep preprocessing inline in their async generate().
+        method_name = "generate"
+        original = getattr(target, method_name, None)
+    if not callable(original):
+        raise RuntimeError(
+            f"Unsupported Huanyu rollout server {target.__module__}.{target.__name__}: "
+            "neither _preprocess_input nor generate is available"
+        )
     if getattr(original, _HOOK_FLAG, False):
         return
     signature = inspect.signature(original)
-    if not {"self", "prompt_ids", "multi_modal_data"}.issubset(signature.parameters):
-        raise RuntimeError(f"Unsupported vLLM-Omni server _preprocess_input signature: {signature}")
+    required = {"self", "prompt_ids"}
+    if method_name == "_preprocess_input":
+        required.add("multi_modal_data")
+        async_method = False
+        supported_kind = not inspect.iscoroutinefunction(original) and not inspect.isasyncgenfunction(original)
+    else:
+        required.update(("image_data", "audio_data"))
+        async_method = True
+        supported_kind = inspect.iscoroutinefunction(original) or inspect.iscoroutinefunction(inspect.unwrap(original))
+    if not required.issubset(signature.parameters) or not supported_kind:
+        raise RuntimeError(f"Unsupported vLLM-Omni server {method_name} signature/kind: {signature}")
 
-    @wraps(original)
-    def preprocess(self, *args, **kwargs):
+    def contract_arguments(self, args, kwargs):
         processor = getattr(getattr(self, "model_config", None), "processor", None)
         if not getattr(processor, "_huanyu_training_processor", False):
-            return original(self, *args, **kwargs)
+            return None
         if not getattr(self, "_ar_mode", False):
             raise RuntimeError("Huanyu rollout requires the autoregressive server mode")
         bound = signature.bind(self, *args, **kwargs)
         bound.apply_defaults()
-        if "prompt_ids" not in bound.arguments or "multi_modal_data" not in bound.arguments:
-            raise RuntimeError("Huanyu rollout server did not expose prompt IDs and media metadata")
+        if method_name == "_preprocess_input":
+            media = bound.arguments["multi_modal_data"]
+        else:
+            media = {
+                kind: bound.arguments[key]
+                for kind, key in (("image", "image_data"), ("audio", "audio_data"), ("video", "video_data"))
+                if bound.arguments.get(key) is not None
+            }
         original_ids = bound.arguments["prompt_ids"]
-        contracted = contract_rollout_prompt(processor, original_ids, bound.arguments["multi_modal_data"])
+        contracted = contract_rollout_prompt(processor, original_ids, media)
         bound.arguments["prompt_ids"] = contracted
         if not getattr(self, "_huanyu_contraction_reported", False):
             logger.info("Huanyu metadata-aware rollout prompt contraction: %d -> %d tokens", len(original_ids), len(contracted))
             self._huanyu_contraction_reported = True
-        return original(*bound.args, **bound.kwargs)
+        return bound
+
+    if async_method:
+        # Keep our local qualname/module: Ray must serialize the wrapper, not
+        # resolve the unpatched server method by its original module path.
+        @wraps(original, assigned=("__name__", "__doc__", "__annotations__"))
+        async def preprocess(self, *args, **kwargs):
+            bound = contract_arguments(self, args, kwargs)
+            if bound is None:
+                return await original(self, *args, **kwargs)
+            return await original(*bound.args, **bound.kwargs)
+    else:
+        @wraps(original, assigned=("__name__", "__doc__", "__annotations__"))
+        def preprocess(self, *args, **kwargs):
+            bound = contract_arguments(self, args, kwargs)
+            if bound is None:
+                return original(self, *args, **kwargs)
+            return original(*bound.args, **bound.kwargs)
 
     setattr(preprocess, _HOOK_FLAG, True)
-    server_class._preprocess_input = preprocess
+    setattr(target, method_name, preprocess)
+    try:
+        source = inspect.getsourcefile(target)
+    except (TypeError, OSError):
+        source = "<dynamic class>"
+    logger.info(
+        "Huanyu rollout input hook installed: %s.%s method=%s source=%s",
+        target.__module__, target.__name__, method_name, source,
+    )
 
 
 def install_huanyu_rollout_inputs():
