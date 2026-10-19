@@ -9,6 +9,7 @@ import argparse
 import importlib
 import json
 from pathlib import Path
+import signal
 import sys
 import time
 from types import ModuleType, SimpleNamespace
@@ -30,6 +31,44 @@ from .vision_attention import QUERY_CHUNK_SIZE, chunked_vision_attention
 
 def _field(value, name, default=None):
     return value.get(name, default) if isinstance(value, dict) else getattr(value, name, default)
+
+
+def select_device(device):
+    """Select the worker device before processor/native plugin imports."""
+    if str(device).startswith("npu"):
+        import torch_npu  # noqa: F401
+    device = torch.device(device)
+    if device.type == "npu":
+        torch.npu.set_device(device)
+    elif device.type == "cuda":
+        torch.cuda.set_device(device)
+    elif device.type != "cpu":
+        raise ValueError(f"Unsupported precompute device: {device}")
+    return device
+
+
+def shard_row_count(total_rows, num_shards, shard_index):
+    if num_shards < 1 or not 0 <= shard_index < num_shards or total_rows < 0:
+        raise ValueError("Require num_shards > 0, 0 <= shard_index < num_shards and total_rows >= 0")
+    return max(0, (total_rows - 1 - shard_index) // num_shards + 1)
+
+
+def iter_shard_rows(parquet, batch_size, *, file_offset=0, num_shards=1, shard_index=0):
+    """Select Arrow rows before Python/media decoding; retain original file indices.
+
+    Every worker reads the small Parquet input, but only decodes/encodes its
+    global-row-index modulo shard. file_offset continues across train/validation.
+    """
+    shard_row_count(0, num_shards, shard_index)
+    row_offset = 0
+    for batch in parquet.iter_batches(batch_size=batch_size):
+        first = (shard_index - file_offset - row_offset) % num_shards
+        indices = list(range(first, batch.num_rows, num_shards))
+        if indices:
+            selected = batch if len(indices) == batch.num_rows else batch.take(indices)
+            for index, row in zip(indices, selected.to_pylist(), strict=True):
+                yield row_offset + index, row
+        row_offset += batch.num_rows
 
 
 def load_vision_weights(model_path):
@@ -96,13 +135,7 @@ class FrozenEncoders:
     def __init__(self, model_path, processor, device):
         self.model_path = model_path
         self.processor = processor
-        if str(device).startswith("npu"):
-            import torch_npu  # noqa: F401
-        self.device = torch.device(device)
-        if self.device.type == "npu":
-            torch.npu.set_device(self.device)
-        if self.device.type not in ("npu", "cuda", "cpu"):
-            raise ValueError(f"Unsupported precompute device: {self.device}")
+        self.device = select_device(device)
         self.audio_model = None
         self.vision_model = None
         self.vision_hf = None
@@ -216,10 +249,17 @@ def main(argv=None):
     parser.add_argument("--device", default="npu:0")
     parser.add_argument("--read-batch-size", type=int, default=16)
     parser.add_argument("--log-interval", type=float, default=10.0)
+    parser.add_argument("--num-shards", type=int, default=1)
+    parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument("--verify-only", action="store_true", help="Verify all row embeddings; never run an encoder")
     args = parser.parse_args(argv)
     if args.read_batch_size < 1 or args.log_interval <= 0 or args.sampling_rate != 16000:
         parser.error("Use a positive read batch/log interval and sampling_rate=16000")
+    if args.num_shards < 1 or not 0 <= args.shard_index < args.num_shards:
+        parser.error("Require num-shards > 0 and 0 <= shard-index < num-shards")
+
+    if not args.verify_only:
+        select_device(args.device)
 
     import pyarrow.parquet as pq
     from .processor import build_huanyu_processor
@@ -232,38 +272,52 @@ def main(argv=None):
     encoders = None if args.verify_only else FrozenEncoders(args.model_path, processor, args.device)
     started = last_log = time.monotonic()
     totals = {"rows": 0, "audio": 0, "vision": 0, "created": 0, "reused": 0}
-    total_rows = sum(pq.ParquetFile(path).metadata.num_rows for path in inputs)
+    input_rows = sum(pq.ParquetFile(path).metadata.num_rows for path in inputs)
+    total_rows = shard_row_count(input_rows, args.num_shards, args.shard_index)
     print(f"[huanyu-precompute] mode={'verify' if args.verify_only else 'populate'} rows={total_rows} "
+          f"input_rows={input_rows} shard={args.shard_index}/{args.num_shards} "
           f"device={args.device} cache={cache.root} contract={cache.contract_digest}", flush=True)
+    file_offset = 0
     for path in inputs:
         row_index = 0
         parquet = pq.ParquetFile(path)
         print(f"[huanyu-precompute] start {path} rows={parquet.metadata.num_rows}", flush=True)
         try:
-            for batch in parquet.iter_batches(batch_size=args.read_batch_size):
-                for row in batch.to_pylist():
-                    counts = process_row(row, processor, cache, encoders, verify_only=args.verify_only,
-                                         sampling_rate=args.sampling_rate)
-                    row_index += 1
-                    totals["rows"] += 1
-                    for key, value in counts.items():
-                        totals[key] += value
-                    now = time.monotonic()
-                    if now - last_log >= args.log_interval:
-                        elapsed = now - started
-                        rate = totals["rows"] / max(elapsed, 1e-9)
-                        eta = (total_rows - totals["rows"]) / max(rate, 1e-9)
-                        print(f"[huanyu-precompute] {totals['rows']}/{total_rows} rows "
-                              f"audio_chunks={totals['audio']} images={totals['vision']} "
-                              f"created={totals['created']} reused={totals['reused']} "
-                              f"elapsed={elapsed:.0f}s rate={rate:.2f}rows/s eta={eta:.0f}s", flush=True)
-                        last_log = now
+            for row_index, row in iter_shard_rows(
+                parquet, args.read_batch_size, file_offset=file_offset,
+                num_shards=args.num_shards, shard_index=args.shard_index,
+            ):
+                counts = process_row(row, processor, cache, encoders, verify_only=args.verify_only,
+                                     sampling_rate=args.sampling_rate)
+                totals["rows"] += 1
+                for key, value in counts.items():
+                    totals[key] += value
+                now = time.monotonic()
+                if now - last_log >= args.log_interval:
+                    elapsed = now - started
+                    rate = totals["rows"] / max(elapsed, 1e-9)
+                    eta = (total_rows - totals["rows"]) / max(rate, 1e-9)
+                    print(f"[huanyu-precompute] {totals['rows']}/{total_rows} rows "
+                          f"audio_chunks={totals['audio']} images={totals['vision']} "
+                          f"created={totals['created']} reused={totals['reused']} "
+                          f"elapsed={elapsed:.0f}s rate={rate:.2f}rows/s eta={eta:.0f}s", flush=True)
+                    last_log = now
         except Exception as exc:
             raise RuntimeError(f"Huanyu precompute failed at {path}, row {row_index} (zero-based): {exc}. "
                                "Validated complete entries remain reusable; rerun the same command to resume.") from exc
-    print(f"[huanyu-precompute] COMPLETE {json.dumps(totals, sort_keys=True)} "
+        file_offset += parquet.metadata.num_rows
+    if totals["rows"] != total_rows:
+        raise RuntimeError(f"Shard row coverage mismatch: processed={totals['rows']} expected={total_rows}")
+    result = {**totals, "shard_index": args.shard_index, "num_shards": args.num_shards,
+              "assigned_rows": total_rows, "input_rows": input_rows}
+    print(f"[huanyu-precompute] COMPLETE {json.dumps(result, sort_keys=True)} "
           f"elapsed={time.monotonic() - started:.1f}s", flush=True)
 
 
 if __name__ == "__main__":
+    def _terminate(signum, frame):
+        # Let cache publication finally blocks release this process's own lock.
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGTERM, _terminate)
     main()

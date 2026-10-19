@@ -156,6 +156,36 @@ python3 -u /opt/huawei/dataset/ccb_data/code/hufenyu/verl_omni_qwen36_gzq/verl_o
 
 若仅要复核完整性，给上述 python 命令添加 `--verify-only`（可去掉日志管道）。它重新扫描两个 parquet 并检查每个需要的条目，不启动 encoder、不写入 cache。这是覆盖和完整性检查，不是 NPU 数值验收。
 
+### 使用多张 NPU 并行预计算
+
+`precompute_parallel.py` 在当前节点上为每张指定的卡启动一个独立进程，不使用 Ray、DDP 或 HCCL。每张卡独立加载冻结的 audio/vision encoder，按跨 train/validation 连续的全局行号 `% 卡数` 分配样本，所有进程写入同一个 `_q128` cache。只改变样本调度，既有缓存 contract、query=128 分块方式、媒体 token 数和权重保持一致，已经生成的完整 `_q128` 条目可以直接复用。
+
+先将本目录更新到服务器。若原单卡预计算仍在运行，先用 Ctrl-C 结束该任务，再启动下方命令，避免它与并行进程争用同一卡。例子使用当前节点可见的 0–7 共 8 张空闲 NPU；需要 16 张时，将 `--devices` 列表扩展到 `npu:15`。编号是当前进程可见的逻辑编号，启动器不会修改设备可见性环境变量，也不启停 Ray。
+
+```bash
+python3 -u /opt/huawei/dataset/ccb_data/code/hufenyu/verl_omni_qwen36_gzq/verl_omni_ext/models/qwen3_6_huanyu/precompute_parallel.py \
+  --devices npu:0 npu:1 npu:2 npu:3 npu:4 npu:5 npu:6 npu:7 \
+  --log-dir /opt/huawei/dataset/ccb_data/code/hufenyu/verl_omni_qwen36_gzq/logs/huanyu_precompute_parallel \
+  --parquet \
+    /opt/huawei/dataset/ccb_data/data/omni/omni_mix_f8_genrm_sampleall/train.parquet \
+    /opt/huawei/dataset/ccb_data/data/omni/omni_mix_f8_genrm_sampleall/validation.parquet \
+  --model_path /opt/huawei/dataset/downloaded_models/Qwen3.6-35B-A3B-huanyu06b-iter2000-omni4b-hf-huanyu7tokens \
+  --cache_dir /opt/huawei/dataset/ccb_data/data/omni/embed_cache_huanyu_sampleall_q128 \
+  --sampling_rate 16000 \
+  --read-batch-size 16 \
+  --log-interval 10
+```
+
+启动器为每次运行创建新的日志子目录，每张卡的完整输出单独存放，主终端汇总进度。所有 worker 退出码为 0、完成记录中的分片编号和行数通过核对后，才报告总 `COMPLETE`；任一失败会停止本次启动的其余 worker 并返回非零退出码。Ctrl-C/SIGTERM 同样清理本次子进程，不操作其他任务。正常终止会展开缓存写入的 finally；若进程被强杀后遇到残留锁，按前文锁超时说明处理，不自动删除缓存。`--verify-only` 也可通过此入口并行校验，不运行 encoder。
+
+每个 worker 会读取 parquet，但在转换 Python 行对象、读取图片/音频和编码之前先选取自己的样本。加速来自多张卡同时处理不同样本，不是把一张大图分到多张卡；实际速度取决于样本尺寸、CPU 前处理和共享存储带宽，不能保证按卡数线性增长。重复媒体仍可能在不同进程中同时编码，缓存发布锁和哈希校验会保护同一个条目；日志 `created` 表示新编码/写入尝试次数，不代表唯一文件数。增加卡数不需要改变 cache 路径，也无需重算已完成条目。
+
+启动器仅在未设置时为每个 worker 设置 `OMP_NUM_THREADS=2`、`MKL_NUM_THREADS=2`，避免多个进程争抢 CPU；保留用户显式设置。设备绑定在 processor 和原生模型插件导入前完成，避免所有 worker 的早期初始化都落在默认卡上。
+
+底层 `precompute.py` 保留单卡用法，并新增 `--num-shards N --shard-index R`；仅应由一个并行入口完整分配所有 `R=0..N-1`。不要在两台节点上直接各运行一遍上述完整命令，否则会重复相同分片；当前一键入口只调度本机卡。
+
+本次完整 CPU 回归共 180 项通过，包括真实 Arrow 多文件/多 row-group 分片、三个真实 CPU 子进程的非均匀任务分配、日志汇总、失败清理与既有缓存测试；两个预计算入口的 `--help` 均通过。尚未在本地验证多 NPU 吞吐或跨设备数值，服务器运行后以所有 worker 的 `COMPLETE` 和实际耗时为准。
+
 **缓存生成完成后，训练时必须显式启用读取：**
 
 ```bash

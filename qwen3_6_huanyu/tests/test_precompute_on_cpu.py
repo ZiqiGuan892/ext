@@ -51,6 +51,78 @@ class FakeEncoders:
         return torch.full((1, 6), 2.)
 
 
+class FakeBatch:
+    def __init__(self, rows, decoded):
+        self.rows = rows
+        self.num_rows = len(rows)
+        self.decoded = decoded
+
+    def take(self, indices):
+        return FakeBatch([self.rows[index] for index in indices], self.decoded)
+
+    def to_pylist(self):
+        self.decoded.extend(self.rows)
+        return [{"id": value} for value in self.rows]
+
+
+class FakeParquet:
+    def __init__(self, rows, decoded):
+        self.rows = rows
+        self.decoded = decoded
+
+    def iter_batches(self, batch_size):
+        for start in range(0, len(self.rows), batch_size):
+            yield FakeBatch(self.rows[start:start + batch_size], self.decoded)
+
+
+class ShardingTests(unittest.TestCase):
+    def test_all_workers_cover_both_files_once_before_decoding(self):
+        for workers in (1, 3, 16):
+            for batch_size in (1, 2, 4):
+                with self.subTest(workers=workers, batch_size=batch_size):
+                    all_rows = []
+                    for rank in range(workers):
+                        decoded = []
+                        owned = []
+                        offset = 0
+                        for rows in ([0, 1, 2, 3, 4], [5, 6, 7, 8]):
+                            for local_index, row in cli.iter_shard_rows(
+                                FakeParquet(rows, decoded), batch_size, file_offset=offset,
+                                num_shards=workers, shard_index=rank,
+                            ):
+                                self.assertEqual(row["id"], offset + local_index)
+                                owned.append(row["id"])
+                            offset += len(rows)
+                        self.assertEqual(owned, list(range(rank, 9, workers)))
+                        self.assertEqual(decoded, owned)
+                        self.assertEqual(len(owned), cli.shard_row_count(9, workers, rank))
+                        all_rows.extend(owned)
+                    self.assertEqual(sorted(all_rows), list(range(9)))
+
+    def test_unassigned_batches_are_not_converted_to_python(self):
+        decoded = []
+        rows = list(cli.iter_shard_rows(FakeParquet([0, 1, 2], decoded), 2,
+                                       num_shards=8, shard_index=7))
+        self.assertEqual(rows, [])
+        self.assertEqual(decoded, [])
+        self.assertEqual(cli.shard_row_count(3, 8, 7), 0)
+
+    def test_empty_input_has_zero_work_for_every_rank(self):
+        for rank in range(3):
+            self.assertEqual(cli.shard_row_count(0, 3, rank), 0)
+            self.assertEqual(list(cli.iter_shard_rows(FakeParquet([], []), 16,
+                                                      num_shards=3, shard_index=rank)), [])
+
+    def test_invalid_partitions_are_rejected(self):
+        for workers, rank in ((0, 0), (-1, 0), (2, -1), (2, 2)):
+            with self.subTest(workers=workers, rank=rank):
+                with self.assertRaises(ValueError):
+                    cli.shard_row_count(10, workers, rank)
+                with self.assertRaises(ValueError):
+                    list(cli.iter_shard_rows(FakeParquet([0], []), 1,
+                                             num_shards=workers, shard_index=rank))
+
+
 class PrecomputeTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(dir=ROOT)
@@ -62,6 +134,31 @@ class PrecomputeTests(unittest.TestCase):
         self.stub = patch.dict(sys.modules, {fake_dataset.__name__: fake_dataset})
         self.stub.start()
         self.addCleanup(self.stub.stop)
+
+    @unittest.skipUnless(importlib.util.find_spec("pyarrow"), "Optional Parquet integration dependency")
+    def test_real_arrow_batches_partition_multiple_row_groups_and_files(self):
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        inputs = []
+        for name, ids in (("train", list(range(7))), ("validation", list(range(7, 11)))):
+            path = self.root / f"{name}.parquet"
+            pq.write_table(pa.table({"id": ids, "problem": ["sample"] * len(ids)}), path, row_group_size=3)
+            inputs.append(path)
+        collected = []
+        for rank in range(4):
+            offset = 0
+            owned = []
+            for path in inputs:
+                parquet = pq.ParquetFile(path)
+                for index, row in cli.iter_shard_rows(parquet, 2, file_offset=offset,
+                                                      num_shards=4, shard_index=rank):
+                    self.assertEqual(offset + index, row["id"])
+                    owned.append(row["id"])
+                offset += parquet.metadata.num_rows
+            self.assertEqual(owned, list(range(rank, 11, 4)))
+            collected.extend(owned)
+        self.assertEqual(sorted(collected), list(range(11)))
 
     def test_populate_resume_and_verify_use_same_keys_without_reencoding(self):
         encoders = FakeEncoders()
