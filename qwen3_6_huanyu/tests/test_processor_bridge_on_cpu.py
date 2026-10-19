@@ -179,6 +179,92 @@ class HuanyuProcessorTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "feature width"):
                     processor_module.build_huanyu_processor(directory, {})
 
+    def bind_native_rope(self, proc, method):
+        owner = type("Model", (), {"get_rope_index": method})
+        with patch.object(processor_module.importlib, "import_module", return_value=SimpleNamespace(Qwen3_5MoeModel=owner)):
+            processor_module._bind_qwen_rope(proc)
+
+    def test_required_token_types_follow_padded_image_audio_sequence(self):
+        proc = processor()
+        # Two images separated by audio; padding intentionally uses image id.
+        ids = torch.tensor([[13, 1001, 14, 13, 13, 13, 13, 15,
+                             10, 12, 12, 11, 14, 13, 13, 13, 13, 15, 1002, 13]])
+        mask = torch.tensor([[0] + [1] * 18 + [0]])
+        grids = torch.tensor([[1, 4, 4], [1, 4, 4]])
+        before = ids.clone()
+        native_positions = torch.arange(60).reshape(3, 1, 20) + 2053
+        native_deltas = torch.tensor([[-4]])
+
+        def native(owner, input_ids, mm_token_type_ids, image_grid_thw=None, attention_mask=None):
+            self.assertIs(input_ids, ids)
+            self.assertIs(image_grid_thw, grids)
+            self.assertIs(attention_mask, mask)
+            self.assertEqual(mm_token_type_ids.tolist(), [[0, 0, 0, 1, 1, 1, 1, 0,
+                                                         0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0]])
+            self.assertEqual(mm_token_type_ids.dtype, torch.long)
+            self.assertEqual(mm_token_type_ids.device, ids.device)
+            return native_positions, native_deltas
+
+        self.bind_native_rope(proc, native)
+        positions, deltas = proc.get_rope_index(input_ids=ids, image_grid_thw=grids, attention_mask=mask)
+        torch.testing.assert_close(ids, before)
+        torch.testing.assert_close(positions, native_positions)
+        self.assertIs(deltas, native_deltas)
+
+    def test_required_token_types_for_text_and_audio_are_zero(self):
+        proc = processor()
+        for values in ([1001, 1002, 1003, 1004], [10, 12, 12, 11]):
+            with self.subTest(values=values):
+                ids = torch.tensor([values])
+
+                def native(owner, input_ids, mm_token_type_ids, image_grid_thw=None):
+                    self.assertEqual(mm_token_type_ids.tolist(), [[0, 0, 0, 0]])
+                    self.assertIsNone(image_grid_thw)
+                    return torch.arange(4).expand(3, 1, 4), torch.zeros(1, 1, dtype=torch.long)
+
+                self.bind_native_rope(proc, native)
+                positions, _ = proc.get_rope_index(ids)
+                self.assertEqual(positions.shape, (3, 1, 4))
+
+    def test_supplied_token_types_are_preserved_for_positional_and_keyword_calls(self):
+        proc = processor()
+        ids = torch.tensor([[1001, 1002]])
+        supplied = torch.zeros_like(ids, dtype=torch.int32)
+
+        def native(owner, input_ids, mm_token_type_ids, image_grid_thw=None):
+            self.assertIs(mm_token_type_ids, supplied)
+            return torch.zeros(3, 1, 2, dtype=torch.long), torch.zeros(1, 1)
+
+        self.bind_native_rope(proc, native)
+        proc.get_rope_index(ids, supplied)
+        proc.get_rope_index(input_ids=ids, mm_token_type_ids=supplied)
+
+    def test_explicit_none_token_types_are_completed(self):
+        proc = processor()
+        ids = torch.tensor([[14, 13, 15]])
+
+        def native(owner, input_ids, *, mm_token_type_ids, image_grid_thw=None):
+            self.assertEqual(mm_token_type_ids.tolist(), [[0, 1, 0]])
+            return torch.zeros(3, 1, 3, dtype=torch.long), torch.zeros(1, 1)
+
+        self.bind_native_rope(proc, native)
+        proc.get_rope_index(ids, mm_token_type_ids=None, image_grid_thw=torch.tensor([[1, 2, 2]]))
+
+    def test_video_token_types_differ_from_decoded_image_frames(self):
+        proc = processor()
+        proc.config.video_token_id = 16
+        ids = torch.tensor([[14, 13, 15, 14, 16, 15], [13, 14, 13, 15, 1000, 13]])
+        mask = torch.tensor([[1, 1, 1, 1, 1, 1], [0, 1, 1, 1, 1, 0]])
+        types = processor_module._rope_token_types(proc, ids, mask)
+        self.assertEqual(types.tolist(), [[0, 1, 0, 0, 2, 0], [0, 0, 1, 0, 0, 0]])
+
+    def test_token_type_completion_rejects_malformed_input_or_padding_mask(self):
+        proc = processor()
+        with self.assertRaisesRegex(ValueError, "input_ids.*shape"):
+            processor_module._rope_token_types(proc, torch.tensor([1, 2]))
+        with self.assertRaisesRegex(ValueError, "attention_mask must match"):
+            processor_module._rope_token_types(proc, torch.tensor([[1, 2]]), torch.tensor([1, 1]))
+
     def test_agent_loop_hook_leaves_other_models_unchanged(self):
         class Worker:
             def _compute_multi_modal_inputs(self, output, input_ids):

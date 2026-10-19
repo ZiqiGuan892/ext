@@ -223,6 +223,27 @@ class HuanyuProcessor:
         return ids
 
 
+def _rope_token_types(processor, input_ids, attention_mask=None):
+    """Describe the actual padded sequence for the newer Qwen RoPE API.
+
+    Audio slots use ordinary sequential positions (type 0); their embeddings
+    are replaced separately by the Huanyu forward bridge. Video frames decoded
+    by our dataset use image_pad and therefore image grids/type 1.
+    """
+    if not isinstance(input_ids, torch.Tensor) or input_ids.ndim != 2:
+        raise ValueError("Huanyu RoPE requires input_ids with shape [batch, sequence]")
+    token_types = torch.zeros_like(input_ids, dtype=torch.long)
+    token_types.masked_fill_(input_ids == processor.image_token_id, 1)
+    video_token_id = _get(processor.config, "video_token_id")
+    if video_token_id is not None:
+        token_types.masked_fill_(input_ids == int(video_token_id), 2)
+    if attention_mask is not None:
+        if attention_mask.shape != input_ids.shape:
+            raise ValueError("Huanyu RoPE attention_mask must match input_ids [batch, sequence]")
+        token_types.masked_fill_(~attention_mask.to(device=input_ids.device, dtype=torch.bool), 0)
+    return token_types
+
+
 def _bind_qwen_rope(processor):
     """Use the installed HF implementation rather than fabricate text positions."""
     module = importlib.import_module("transformers.models.qwen3_5_moe.modeling_qwen3_5_moe")
@@ -239,11 +260,17 @@ def _bind_qwen_rope(processor):
             bound = method if isinstance(descriptor, (staticmethod, classmethod)) else types.MethodType(method, processor)
             setattr(processor, name, bound)
     native = owner.get_rope_index
-    parameters = inspect.signature(native).parameters
+    signature = inspect.signature(native)
+    parameters = signature.parameters
 
     def get_rope_index(self, *args, **kwargs):
         supported = {key: value for key, value in kwargs.items() if key in parameters}
-        positions, deltas = native(self, *args, **supported)
+        bound = signature.bind_partial(self, *args, **supported)
+        if "mm_token_type_ids" in parameters and bound.arguments.get("mm_token_type_ids") is None:
+            bound.arguments["mm_token_type_ids"] = _rope_token_types(
+                self, bound.arguments.get("input_ids"), bound.arguments.get("attention_mask")
+            )
+        positions, deltas = native(*bound.args, **bound.kwargs)
         return positions.long(), deltas
 
     processor.get_rope_index = types.MethodType(get_rope_index, processor)

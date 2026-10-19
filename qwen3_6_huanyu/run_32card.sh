@@ -32,7 +32,32 @@ export FILTER_OVERLONG=false
 export MINICPMO_USE_PRECOMPUTE=0
 export MINICPMO_TUNE_AUDIO=0
 
+# Budget the EXPANDED multimodal prompt. Length filtering remains disabled.
+# Capture the values here: the inherited DEBUG wrapper resets MAX_PROMPT_LENGTH.
+_huanyu_prompt_length=${MAX_PROMPT_LENGTH:-4096}
+_huanyu_response_length=${MAX_RESPONSE_LENGTH:-2048}
+_huanyu_rollout_prompt_length=${ROLLOUT_PROMPT_LENGTH:-${_huanyu_prompt_length}}
+for _huanyu_length in "$_huanyu_prompt_length" "$_huanyu_response_length" "$_huanyu_rollout_prompt_length"; do
+    [[ "$_huanyu_length" =~ ^[1-9][0-9]*$ ]] || { echo '[huanyu] prompt/response lengths must be positive integers' >&2; exit 2; }
+done
+_huanyu_sequence_length=$(( _huanyu_prompt_length + _huanyu_response_length ))
+_huanyu_model_length=${ROLLOUT_MAX_MODEL_LEN:-$(( _huanyu_sequence_length + 128 ))}
+_huanyu_token_budget=${MAX_TOKEN_LEN_PER_GPU:-${_huanyu_model_length}}
+for _huanyu_length in "$_huanyu_model_length" "$_huanyu_token_budget"; do
+    [[ "$_huanyu_length" =~ ^[1-9][0-9]*$ ]] || { echo '[huanyu] model/token budgets must be positive integers' >&2; exit 2; }
+done
+if (( _huanyu_rollout_prompt_length > _huanyu_prompt_length ||
+      _huanyu_model_length < _huanyu_rollout_prompt_length + _huanyu_response_length ||
+      _huanyu_token_budget < _huanyu_sequence_length )); then
+    echo '[huanyu] require rollout prompt <= data prompt, model length >= rollout prompt + response, and token budget >= data prompt + response' >&2
+    exit 2
+fi
+export MAX_PROMPT_LENGTH=$_huanyu_prompt_length MAX_RESPONSE_LENGTH=$_huanyu_response_length
+export ROLLOUT_PROMPT_LENGTH=$_huanyu_rollout_prompt_length ROLLOUT_MAX_MODEL_LEN=$_huanyu_model_length
+export MAX_TOKEN_LEN_PER_GPU=$_huanyu_token_budget
+
 echo '[huanyu] adapter=Qwen36HuanyuForTraining dataset=Qwen36HuanyuOmniRLHFDataset pipeline=qwen3_6_huanyu; online frozen audio; length filter off'
+echo "[huanyu] expanded prompt=${_huanyu_prompt_length} rollout prompt=${_huanyu_rollout_prompt_length} response=${_huanyu_response_length} model length=${_huanyu_model_length} token budget=${_huanyu_token_budget}"
 
 # Keep HF config.architectures intact. architecture below selects only the
 # verl training adapter; the RM retains its independent Qwen3.5 registration.
@@ -46,6 +71,15 @@ exec bash /opt/huawei/dataset/ccb_data/code/hufenyu/verl_omni_qwen36_gzq/example
     data.custom_cls.path=pkg://verl_omni_ext.models.qwen3_6_huanyu.dataset \
     data.custom_cls.name=Qwen36HuanyuOmniRLHFDataset \
     ++actor_rollout_ref.rollout.engine_kwargs.vllm_omni.pipeline_name=qwen3_6_huanyu \
+    data.max_prompt_length="${_huanyu_prompt_length}" \
+    data.max_response_length="${_huanyu_response_length}" \
+    actor_rollout_ref.rollout.prompt_length="${_huanyu_rollout_prompt_length}" \
+    actor_rollout_ref.rollout.response_length="${_huanyu_response_length}" \
+    actor_rollout_ref.rollout.max_model_len="${_huanyu_model_length}" \
+    actor_rollout_ref.rollout.max_num_batched_tokens="${_huanyu_model_length}" \
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu="${_huanyu_token_budget}" \
+    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu="${_huanyu_token_budget}" \
+    actor_rollout_ref.ref.log_prob_max_token_len_per_gpu="${_huanyu_token_budget}" \
     "++ray_kwargs.ray_init.runtime_env.env_vars.PYTHONPATH=${_huanyu_ray_pythonpath}" \
     "++ray_kwargs.ray_init.runtime_env.env_vars.HUANYU_VLLM_OMNI_ROOT=${HUANYU_VLLM_OMNI_ROOT}" \
     data.filter_overlong_prompts=false

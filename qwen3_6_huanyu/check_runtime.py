@@ -6,17 +6,21 @@ Does not load model weights, generate text, modify checkpoints or start Ray.
 import argparse
 from importlib.util import find_spec
 from pathlib import Path
+import sys
 from types import SimpleNamespace
 
 import numpy as np
 from PIL import Image
 import torch
+import transformers
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-path", required=True)
     args = parser.parse_args()
+    print(f"Python -> {sys.executable} ({sys.version.split()[0]})", flush=True)
+    print(f"Transformers -> {transformers.__file__} ({transformers.__version__})", flush=True)
     for name in ("verl_omni_ext", "verl_omni", "vllm_omni"):
         spec = find_spec(name)
         print(f"{name} -> {spec.origin if spec else '<missing>'}", flush=True)

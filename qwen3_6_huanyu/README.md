@@ -95,7 +95,7 @@ python3 -B verl_omni_ext/models/qwen3_6_huanyu/check_runtime.py \
 bash /opt/huawei/dataset/ccb_data/code/hufenyu/verl_omni_qwen36_gzq/verl_omni_ext/models/qwen3_6_huanyu/run_32card.sh
 ```
 
-入口固定使用上述 Huanyu checkpoint、原 35B OmniMix 的 train/validation parquet、Qwen3.5-35B-A3B RM，调用原 examples/qwen3_6_whisper/run_qwen36_whisper_32card.sh。其余 batch、采样、长度和奖励参数沿用既有后端，可通过原有环境变量/CLI 参数控制。训练日志仍由原后端写入 run_qwen36_whisper_gspo_npu.log。
+入口固定使用上述 Huanyu checkpoint、原 35B OmniMix 的 train/validation parquet、Qwen3.5-35B-A3B RM，调用原 examples/qwen3_6_whisper/run_qwen36_whisper_32card.sh。batch、采样和奖励参数沿用既有后端，可通过原有环境变量/CLI 参数控制。长度预算由本目录入口统一设置，使用下文列出的环境变量调整，避免共享 DEBUG 分支覆盖。训练日志仍由原后端写入 run_qwen36_whisper_gspo_npu.log。
 
 核心覆盖如下，入口已包含：
 
@@ -201,6 +201,58 @@ RuntimeError: Huanyu rollout requires the autoregressive server mode
 
 同步新版 `rollout_inputs.py` 到两节点当前 ext 目录后，启动新的训练任务即可，不修改原训练参数、parquet 或 cache。若仍报错，请保留完整的新错误行：`_ar_mode=False` 表示需要核查实际 server 初始化分支；`<missing>` 配合配置缺失表示该服务器版本的配置保存接口仍需核实。不要再用旧错误推断具体字段值。
 
+## 2026-10-19：AgentLoop 缺少 mm_token_type_ids，以及展开 prompt 超长
+
+本轮日志包含两个独立故障，不能只修其中一个：
+
+1. 18 处 `Qwen3_5MoeModel.get_rope_index() missing 1 required positional argument: 'mm_token_type_ids'`。部分请求已完成 rollout，在 `AgentLoopWorkerTQ._agent_loop_postprocess → _compute_score → _compute_position_ids → HuanyuProcessor.get_rope_index` 失败。该调用栈中的 `_compute_score` 不等于 RM 模型故障，具体失败点是位置编码的接口适配。
+2. 4 处 `Multimodal prompt produced 3107 tokens, exceeding rollout.prompt_length=3104`，发生在其他请求生成前的 `ct_build_initial_tokens`。关闭长度预筛不取消运行时容量限制。
+
+日志中个别请求的 `[mm-merge] ok features=... placeholders=...` 只说明相应请求的数量对齐，不能证明整个训练链路或 encoder 数值已经正确。
+
+### RoPE 参数修复
+
+新 Qwen 接口要求形状为 `[B,S]` 的 `mm_token_type_ids`，文本为 0、图片为 1、视频为 2。旧 Huanyu 适配器只转发 AgentLoop 提供的参数，没有生成这个新增字段。本目录的 `processor.py` 现按已安装原生函数的签名处理：
+
+- 旧版不要求该参数时，继续原调用。
+- 新版缺少该参数或值为 None 时，从实际 `input_ids` 构造同形状、同设备的整数类型标记，兼容 padding；不从 decode 文本或原始 problem 猜位置。
+- `image_pad` 为 1；原生 `video_token_id` 为 2。本目录的视频已拆为图片帧，实际走 image token 和 image grid，因此这些帧为 1。
+- Huanyu 音频 `<unk>` 槽位、文本和媒体边界符为 0，padding 为 0。这里的 0 表示使用顺序位置编码，并不意味着丢弃音频：音频 embedding 仍由 Huanyu forward 在对应槽位注入。
+- 调用方已经明确传入类型 tensor 时原样转发。原生 HF 函数继续负责图像三维位置及 delta；没有把整条多模态序列改成普通 arange，也没有改动 token、图片网格或 attention mask。
+
+用户更正后提供的真实实现来自 `/usr/local/python3.12.13/lib/python3.12/site-packages/transformers/models/qwen3_5_moe/modeling_qwen3_5_moe.py`，与报错环境一致。它除了要求上述模态标记，还会将 `video_grid_thw` 按时间维重复展开，并将每帧时间维置为 1，适配帧间时间戳；本补丁继续调用这份原生函数，保留该处理。先前误贴的 Python 3.11 环境不作为本次修复依据。
+
+更新后的 `check_runtime.py` 会打印实际 Python 和 Transformers 路径/版本，并在训练环境中用图像加 1 秒/31 秒音频调用原生 RoPE。请在训练使用的容器里 source 对应环境后执行本文件前面的接口检查命令，无需为检查重新启动训练或加载模型权重。
+
+### 长度预算修复
+
+只调整本目录 `run_32card.sh`，长度预筛仍关闭；不删除样本、不截断媒体槽位。无环境变量覆盖时的默认值：
+
+| 环境变量 | 默认值 | 最终对应配置 |
+|---|---:|---|
+| MAX_PROMPT_LENGTH | 4096 | data.max_prompt_length |
+| ROLLOUT_PROMPT_LENGTH | 同 MAX_PROMPT_LENGTH | rollout.prompt_length |
+| MAX_RESPONSE_LENGTH | 2048 | data.max_response_length、rollout.response_length |
+| ROLLOUT_MAX_MODEL_LEN | prompt + response + 128，即 6272 | rollout.max_model_len、max_num_batched_tokens |
+| MAX_TOKEN_LEN_PER_GPU | 同 ROLLOUT_MAX_MODEL_LEN | actor 训练及 actor/ref log_prob token 预算 |
+
+入口保存这些值并作为最终 Hydra 覆盖传给后端，防止共享脚本的 DEBUG 分支重新把 prompt 设回 3072；不要再通过该入口的 CLI 参数覆盖上述长度键，应使用表中环境变量。已有 shell 若仍设置旧的 `ROLLOUT_PROMPT_LENGTH=3104`，会保留该显式值，需同时更新。
+
+启动前校验正整数及预算关系：rollout prompt 不大于训练 prompt；model length 至少覆盖 rollout prompt + response；训练 token 预算至少覆盖训练 prompt + response。4096 能容纳本次已知 3107-token 请求，不保证未预筛的全量数据没有更长样本；过长时继续报出真实长度，不能通过截断破坏对齐。更长上下文可能增加显存占用，本轮不调整 batch、TP 或 dtype。
+
+两节点同步本目录后，在已加载环境、Ray 已就绪的主节点运行（显式值避免继承旧 shell 的长度设置）：
+
+```bash
+MAX_PROMPT_LENGTH=4096 \
+ROLLOUT_PROMPT_LENGTH=4096 \
+MAX_RESPONSE_LENGTH=2048 \
+ROLLOUT_MAX_MODEL_LEN=6272 \
+MAX_TOKEN_LEN_PER_GPU=6272 \
+bash /opt/huawei/dataset/ccb_data/code/hufenyu/verl_omni_qwen36_gzq/verl_omni_ext/models/qwen3_6_huanyu/run_32card.sh
+```
+
+如继续使用 4096-token response，将 `MAX_RESPONSE_LENGTH` 改为 4096，同时将 `ROLLOUT_MAX_MODEL_LEN` 和 `MAX_TOKEN_LEN_PER_GPU` 设为 8320。无需重建 parquet 或重算 cache。
+
 ## 验证与边界
 
 ```bash
@@ -209,7 +261,11 @@ python3 -B -m unittest discover \
 bash -n verl_omni_ext/models/qwen3_6_huanyu/run_32card.sh
 ```
 
-本次本地验证：91 项 CPU 测试全部通过，启动脚本此前的 Bash 语法检查通过且本轮未改动。本轮新增 5 项模式检查回归测试，覆盖缺少私有字段时根据 AR 配置处理图像及 31 秒音频、字典/属性混合配置、异步 generate、缺失证据、模式冲突和 RM 透传；同时验证不修改输入、配置或实际模式。此前 8 项接口回归测试覆盖异步 generate 的真实执行、纯文本、异常传播、Ray 类解包、入口优先级与不支持接口的拒绝，并检查包装器保留局部身份与原签名。另有 11 项测试验证原生模块缺失、内部依赖缺失、错误包来源、文件存在但搜索路径错误以及接口缺失。原有测试覆盖严格权重加载、FP32 Actor 主参数不被 BF16 临时视图修改、真实长度与占位符、混合 batch/左 padding、文本梯度、长音频推理条目数、独立注册和其他模型的 hook 分流。真实模型依赖使用测试替身，不能据此证明 NPU 上数值一致。
+本轮 97 项 CPU 测试全部通过，Bash 语法检查通过；用外部命令替身执行启动器的默认、DEBUG、response=4096、prompt=5120、非法模型预算和非法训练预算六组检查均通过，未启动训练。新增 6 项 RoPE 回归测试覆盖必填模态参数、图像/音频混合序列、左右 padding、纯文本、显式参数透传、None 补齐、视频类型及无效 mask；旧接口与原生位置精度检查保留。
+
+另在内存中直接执行用户更正后的服务器 `get_rope_index` 函数，检查图片三轴位置、图像加音频及 padding、2055-token 纯文本、纯音频、带时间戳分隔的两帧视频，共五组均通过。该附件未包含 `get_vision_position_ids`，此项辅助函数使用空间网格测试替身；生产适配器绑定的是安装版本自己的 helper，因此这次检查不等于完成服务器完整 Transformers/NPU 数值验收。
+
+此前 91 项测试覆盖 AR 模式检查、异步 generate、Ray 类解包、原生导入来源、严格权重加载、FP32 Actor 主参数、真实长度与占位符、文本梯度、长音频和其他模型的 hook 分流。真实模型依赖使用测试替身，不能据此证明 NPU 上数值一致。
 
 Windows 本地沙箱中的 asyncio 测试初始化曾阻塞，允许本地 IPC 后全部 86 项测试完成；这不是服务器训练测试。未在本地安装 Ray/cloudpickle，真实 Ray 远端序列化与服务器接口仍需服务器验收。
 
