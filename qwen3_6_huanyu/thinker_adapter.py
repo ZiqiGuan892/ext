@@ -89,6 +89,7 @@ class Qwen36HuanyuThinkerAdapter(OmniModelBase):
     @classmethod
     def configure_model(cls, module, model_config):
         from .audio_runtime import attach_huanyu_audio
+        from .entropy import install_huanyu_entropy_chunking
         from .forward import install_huanyu_forward
 
         validate_huanyu_config(module.config)
@@ -133,6 +134,9 @@ class Qwen36HuanyuThinkerAdapter(OmniModelBase):
             cache_args = dict(use_precompute=True, image_token_id=_value(module.config, "image_token_id"),
                               spatial_merge_size=_value(vision_config, "spatial_merge_size", 2))
         install_huanyu_forward(module, **token_ids, **cache_args)
+        # old_log_prob may call the unchunked verl utility despite the engine
+        # chunk flags. Install here, after Huanyu validation/loading succeeds.
+        install_huanyu_entropy_chunking()
         logger.info("Huanyu training adapter selected: alias=%s, HF architecture=%s, audio=frozen, cache=%s",
                     TRAINING_ARCHITECTURE, module.config.architectures, "strict" if use_cache else "off")
         return module

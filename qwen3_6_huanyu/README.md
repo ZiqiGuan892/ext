@@ -32,6 +32,7 @@
 | processor.py | 40 维 fbank、Qwen 图像处理、媒体 token 展开、原生 HF mRoPE、AgentLoop 输入桥接及可选严格 cache 读取 |
 | dataset.py | 读取原始图片、音频、视频帧；不读取 Whisper cache |
 | forward.py | 保留 HF 图像/文本前向，在经过验证的音频 token 位置注入 embedding |
+| entropy.py | Huanyu worker 内安装逐 token 分块 entropy，覆盖 padded old_log_prob 路径与一阶反向 |
 | rollout_inputs.py | 按媒体元数据收缩推理占位符，兼容独立预处理方法及内联预处理的 async generate 接口 |
 | rollout_adapter.py | 独立注册 qwen3_6_huanyu，复用现有单 llm stage 拓扑 |
 | run_32card.sh | 调用原 32 卡入口，追加 Huanyu 配置、关闭长度预筛，显式传递 Ray 导入路径 |
@@ -363,6 +364,38 @@ bash /opt/huawei/dataset/ccb_data/code/hufenyu/verl_omni_qwen36_gzq/verl_omni_ex
 ```
 
 如继续使用 4096-token response，将 `MAX_RESPONSE_LENGTH` 改为 4096，同时将 `ROLLOUT_MAX_MODEL_LEN` 和 `MAX_TOKEN_LEN_PER_GPU` 设为 8320。无需重建 parquet 或重算 cache。
+
+## 2026-10-19：old_log_prob 的 entropy 临时张量导致 OOM
+
+本次日志已经完成若干步训练，失败链为 `_compute_old_log_prob → actor_rollout_compute_log_prob → infer_batch(forward_only=True) → prepare_model_outputs → verl_F.entropy_from_logits`。NPU 0 已分配 48.37 GiB、保留 48.41 GiB、空闲 9.36 GiB，普通 entropy 运算再申请 9.58 GiB 失败。不是 Huanyu encoder 内部报错，也不是该步 `loss.backward()` 或 RM 生成报错；没有证据需要重新预计算 cache。
+
+启动参数已有 `entropy_coeff=0`、`entropy_from_logits_with_chunking=true` 和 `chunk_size=512`，但实际进入的仍是原始函数。熵正则系数为零不等于关闭 old_log_prob 阶段的熵统计。Whisper 的 `build_qwen36_forward_adapter()` 另装了 entropy 分块补丁；独立 Huanyu adapter 没有调用这个包含 Whisper 音频/cache 行为的 builder，因此此前没有该保护。仅靠本日志不能确定服务器原生 engine 分块开关为何未覆盖这条路径。
+
+修复仅在本目录新增 `entropy.py` 并由 Huanyu `configure_model()` 在模型配置成功后安装。它替换当前 Huanyu 模型 worker 内的 `verl.utils.torch_functional.entropy_from_logits` 函数引用，不修改公共 verl、Whisper 或 RM 源文件，也不在包导入或预计算时安装。无需新增启动参数：默认每块 512 个 token，每个 token 仍使用完整词表。
+
+- 同时支持 `[T,V]` 与 padded `[B,S,V]`，按 batch/sequence 切片；不先把非连续 logits 全量 reshape、复制或转 FP32。
+- FP16/BF16/FP32 分块使用 FP32 计算，FP64 保留；逐行减最大值后使用相同熵公式，降低共同大偏置引起的相减误差。输出形状仍为 `[T]` 或 `[B,S]`，不更改 logits、mask、奖励或 loss 系数。
+- 一阶反向保存原 logits 引用，逐块重算概率并使用 `dH/dz = -p * (z - E_p[z])`；不保存所有块的完整 softmax 中间结果。最终 logits 梯度本身仍需完整大小；不支持二阶求导。
+- 安装幂等，安装失败明确报错。每个进程只打印一次安装日志和一次首次实际调用日志，包含真实 shape/dtype/device/grad 状态。
+
+将更新后的 Huanyu 目录同步到所有训练节点，结束旧任务并启动新的训练任务。继续使用原有 parquet、`embed_cache_huanyu_sampleall_q128` 和原命令；无需删除 cache 或重新生成数据。例如，环境和 Ray 已由用户准备好后：
+
+```bash
+HUANYU_USE_PRECOMPUTE=1 \
+HUANYU_EMBED_CACHE_DIR=/opt/huawei/dataset/ccb_data/data/omni/embed_cache_huanyu_sampleall_q128 \
+bash /opt/huawei/dataset/ccb_data/code/hufenyu/verl_omni_qwen36_gzq/verl_omni_ext/models/qwen3_6_huanyu/run_32card.sh
+```
+
+检查该次训练日志应出现以下两类证据；仅有 installed 不能证明执行过 entropy：
+
+```text
+[huanyu-entropy] installed pid=... chunk_size=512 target=verl.utils.torch_functional.entropy_from_logits
+[huanyu-entropy] active pid=... shape=(...) dtype=... device=... chunk_size=512 grad_enabled=False requires_grad=False
+```
+
+`grad_enabled` 和 `requires_grad` 以实际调用阶段为准。本修复限制 entropy 的概率/算术中间张量，不消除完整 logits、模型参数、梯度或优化器状态，因此不保证所有后续阶段均无 OOM。实际 NPU 峰值与完整训练仍需服务器重跑验证。
+
+本次完整 Huanyu CPU 回归 200 项通过（原 180 项加 20 项）。新增覆盖 FP16/BF16/FP32/FP64 熵值及加权梯度、FP64 gradcheck、真实 padded response 非连续切片、默认 512-token 前反向分块上限、原输入存储不被整块复制、autograd 不保存额外全量概率、空 token、首次调用日志与模型初始化接入。命令为 `python -B -m unittest discover -s verl_omni_ext/models/qwen3_6_huanyu/tests -p 'test_*_on_cpu.py' -q`；本地补齐临时测试依赖 mpmath，未修改服务器依赖。本地无 NPU，不将这些 CPU 结果当作服务器 OOM 已消失的证据。
 
 ## 验证与边界
 

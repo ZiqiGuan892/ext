@@ -61,6 +61,9 @@ class RegistrationTests(unittest.TestCase):
         forward = ModuleType(f"{PACKAGE}.forward")
         self.install_forward = Mock()
         forward.install_huanyu_forward = self.install_forward
+        entropy = ModuleType(f"{PACKAGE}.entropy")
+        self.install_entropy = Mock()
+        entropy.install_huanyu_entropy_chunking = self.install_entropy
         visual = ModuleType("verl_omni_ext.models.qwen3_6_whisper.forward")
         self.visual_patch = Mock()
         visual.patch_visual_fsdp_unshard = self.visual_patch
@@ -69,6 +72,7 @@ class RegistrationTests(unittest.TestCase):
             base.__name__: base,
             audio_runtime.__name__: audio_runtime,
             forward.__name__: forward,
+            entropy.__name__: entropy,
             visual.__name__: visual,
         })
         self.modules_patch.start()
@@ -113,6 +117,7 @@ class RegistrationTests(unittest.TestCase):
 
     def test_valid_model_uses_huanyu_loader_freezes_audio_and_installs_new_forward(self):
         result = self.adapter.configure_model(self.model, self.config)
+        self.install_entropy.assert_called_once_with()
         self.assertIs(result, self.model)
         self.base_configure.assert_called_once_with(self.model, self.config)
         self.attach.assert_called_once_with(self.model, self.config)
@@ -137,6 +142,7 @@ class RegistrationTests(unittest.TestCase):
         self.model.config.vision_config = SimpleNamespace(spatial_merge_size=2, deepstack_visual_indexes=[])
         with patch.dict(os.environ, {"HUANYU_USE_PRECOMPUTE": "1", "HUANYU_EMBED_CACHE_DIR": "huanyu-cache"}):
             self.adapter.configure_model(self.model, self.config)
+        self.install_entropy.assert_called_once_with()
         self.install_forward.assert_called_once_with(
             self.model, start_token_id=10, end_token_id=11, placeholder_token_id=12,
             use_precompute=True, image_token_id=13, spatial_merge_size=2,
@@ -184,7 +190,19 @@ class RegistrationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "incompatible checkpoint"):
             self.adapter.configure_model(self.model, self.config)
         self.install_forward.assert_not_called()
+        self.install_entropy.assert_not_called()
         self.assertEqual(self.model.config.architectures, [HF_ARCHITECTURE])
+
+    def test_entropy_installation_failure_is_not_silently_ignored(self):
+        self.install_entropy.side_effect = RuntimeError("entropy utility missing")
+        with self.assertRaisesRegex(RuntimeError, "entropy utility missing"):
+            self.adapter.configure_model(self.model, self.config)
+
+    def test_text_and_audio_model_without_visual_still_installs_entropy(self):
+        self.model.model.visual = None
+        self.adapter.configure_model(self.model, self.config)
+        self.visual_patch.assert_not_called()
+        self.install_entropy.assert_called_once_with()
 
     def test_tokenizer_marker_mismatch_stops_before_audio_load(self):
         self.model.config.audio_start_token_id = 99
