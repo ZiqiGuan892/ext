@@ -177,6 +177,28 @@ AttributeError: type object 'vLLMOmniHttpServer' has no attribute '_preprocess_i
 
 同步更新后的 `rollout_inputs.py` 到所有节点的 `verl_omni_ext/models/qwen3_6_huanyu/`，继续使用同一个 `run_32card.sh`。无需修改训练参数、重算 cache 或重建 parquet。
 
+## 2026-10-19：generate 被 autoregressive server mode 检查拦截
+
+15:18 的日志已进入 `SingleTurnAgentLoop → server_manager.generate → vLLMOmniHttpServer.generate`，随后在 Huanyu 包装器内报错：
+
+```text
+rollout_inputs.py → contract_arguments
+RuntimeError: Huanyu rollout requires the autoregressive server mode
+```
+
+这说明异步 `generate` hook 已安装并被远端调用。本次失败在调用原始生成方法之前，不是 encoder 算子、模型生成或 RM 打分报错。调用栈中的 `qwen3_6_whisper/rollout_sampling.py` 是复用的采样包装器，仅凭这个路径不能认定模型又走回 Whisper 音频适配器。
+
+旧检查 `getattr(self, "_ar_mode", False)` 将“私有属性不存在”和“显式 False”合并为同一个错误。该日志没有打印属性值，因此不能据此断言引擎实际使用了非 AR 模式；此前启动参数已包含 `engine_kwargs.vllm_omni.output_mode=ar`，但仍须在报错 server 进程中确认。
+
+修复只在本目录：
+
+- 同时读取 server 的 `_ar_mode` 与 `self.config.engine_kwargs.vllm_omni.output_mode`，配置支持字典和属性对象。
+- `_ar_mode` 缺失且配置明确为 `ar` 时允许继续；旧版 server 的 `_ar_mode=True` 且配置未设置时仍兼容。
+- 显式 `_ar_mode=False`、非 AR 配置、两者冲突或没有模式依据时仍拒绝。不会通过设置 `_ar_mode=True`、修改配置或移除检查强行切换 server。
+- 通过时每个 server 仅打印一次 `Huanyu rollout mode verified`，包含两项实际值；失败信息也包含两项值，以区分接口缺失与真正的模式冲突。媒体条目与占位符校验保持不变，其他模型不经过该检查。
+
+同步新版 `rollout_inputs.py` 到两节点当前 ext 目录后，启动新的训练任务即可，不修改原训练参数、parquet 或 cache。若仍报错，请保留完整的新错误行：`_ar_mode=False` 表示需要核查实际 server 初始化分支；`<missing>` 配合配置缺失表示该服务器版本的配置保存接口仍需核实。不要再用旧错误推断具体字段值。
+
 ## 验证与边界
 
 ```bash
@@ -185,7 +207,7 @@ python3 -B -m unittest discover \
 bash -n verl_omni_ext/models/qwen3_6_huanyu/run_32card.sh
 ```
 
-本次本地验证：86 项 CPU 测试全部通过，启动脚本此前的 Bash 语法检查通过且本轮未改动。8 项新增回归测试覆盖异步 generate 的真实执行、31 秒音频与图像、纯文本、RM 透传、异常传播、Ray 类解包、入口优先级与不支持接口的拒绝；同时检查包装器保留局部身份与原签名。另有 11 项测试验证原生模块缺失、内部依赖缺失、错误包来源、文件存在但搜索路径错误以及接口缺失。原有测试覆盖严格权重加载、FP32 Actor 主参数不被 BF16 临时视图修改、真实长度与占位符、混合 batch/左 padding、文本梯度、长音频推理条目数、独立注册和其他模型的 hook 分流。真实模型依赖使用测试替身，不能据此证明 NPU 上数值一致。
+本次本地验证：91 项 CPU 测试全部通过，启动脚本此前的 Bash 语法检查通过且本轮未改动。本轮新增 5 项模式检查回归测试，覆盖缺少私有字段时根据 AR 配置处理图像及 31 秒音频、字典/属性混合配置、异步 generate、缺失证据、模式冲突和 RM 透传；同时验证不修改输入、配置或实际模式。此前 8 项接口回归测试覆盖异步 generate 的真实执行、纯文本、异常传播、Ray 类解包、入口优先级与不支持接口的拒绝，并检查包装器保留局部身份与原签名。另有 11 项测试验证原生模块缺失、内部依赖缺失、错误包来源、文件存在但搜索路径错误以及接口缺失。原有测试覆盖严格权重加载、FP32 Actor 主参数不被 BF16 临时视图修改、真实长度与占位符、混合 batch/左 padding、文本梯度、长音频推理条目数、独立注册和其他模型的 hook 分流。真实模型依赖使用测试替身，不能据此证明 NPU 上数值一致。
 
 Windows 本地沙箱中的 asyncio 测试初始化曾阻塞，允许本地 IPC 后全部 86 项测试完成；这不是服务器训练测试。未在本地安装 Ray/cloudpickle，真实 Ray 远端序列化与服务器接口仍需服务器验收。
 

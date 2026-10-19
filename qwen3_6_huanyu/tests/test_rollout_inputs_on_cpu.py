@@ -1,6 +1,8 @@
 """Huanyu rollout item/chunk contracts, without Ray, vLLM or model weights."""
 
 import asyncio
+from collections import UserDict
+from copy import deepcopy
 import importlib.util
 import inspect
 from pathlib import Path
@@ -134,6 +136,119 @@ class RolloutInputsTest(unittest.TestCase):
 
         with self.assertRaises(RuntimeError):
             rollout._install_on_server_class(Server)
+
+    def test_config_ar_without_private_flag_contracts_media_for_mapping_and_attribute_configs(self):
+        class Server:
+            def _preprocess_input(self, prompt_ids, multi_modal_data):
+                return self.model_config.processor.dedup_pad_tokens(prompt_ids), multi_modal_data
+
+        rollout._install_on_server_class(Server)
+        # Exercise Mapping/attribute lookup independently at every config level.
+        for mask in range(8):
+            config = {"output_mode": "ar"}
+            if mask & 1:
+                config = SimpleNamespace(**config)
+            config = {"vllm_omni": config}
+            if mask & 2:
+                config = SimpleNamespace(**config)
+            config = {"engine_kwargs": config}
+            config = SimpleNamespace(**config) if mask & 4 else UserDict(config)
+            with self.subTest(attribute_levels=mask):
+                server = Server()
+                server.model_config = SimpleNamespace(processor=Processor())
+                server.config = config
+                before_config = deepcopy(config)
+                ids = [7, 10, 12, 12, 11] + audio_span(375) + audio_span(12) + [8]
+                before_ids = list(ids)
+                media = {"image": [object()], "audio": [Waveform(31 * 16000)]}
+                result = server._preprocess_input(ids, media)
+                self.assertEqual(result[0], [7, 100, 101, 200, 201, 8])
+                self.assertIs(result[1], media)
+                self.assertEqual(ids, before_ids)
+                self.assertIs(server.config, config)
+                self.assertEqual(config, before_config)
+                self.assertFalse(hasattr(server, "_ar_mode"))
+
+    def test_missing_or_unconfirmed_mode_rejected_before_native_preprocessing(self):
+        calls = []
+
+        class Server:
+            def _preprocess_input(self, prompt_ids, multi_modal_data):
+                calls.append(prompt_ids)
+
+        rollout._install_on_server_class(Server)
+        server = Server()
+        server.model_config = SimpleNamespace(processor=Processor())
+        with self.assertRaisesRegex(RuntimeError, "missing") as caught:
+            server._preprocess_input([7], {})
+        self.assertIn("_ar_mode=<missing>", str(caught.exception))
+        self.assertIn("output_mode=<missing>", str(caught.exception))
+        for config in (
+            None, {}, {"engine_kwargs": None}, {"engine_kwargs": {}},
+            {"engine_kwargs": {"vllm_omni": None}},
+            *({"engine_kwargs": {"vllm_omni": {"output_mode": mode}}}
+              for mode in (None, "", "unknown", "diffusion")),
+        ):
+            with self.subTest(config=config), self.assertRaisesRegex(RuntimeError, "autoregressive"):
+                server.config = config
+                server._preprocess_input([7], {})
+        self.assertEqual(calls, [])
+        self.assertFalse(hasattr(server, "_ar_mode"))
+
+    def test_explicit_private_mode_and_config_conflicts_cannot_override_each_other(self):
+        calls = []
+
+        class Server:
+            def _preprocess_input(self, prompt_ids, multi_modal_data):
+                calls.append(prompt_ids)
+
+        rollout._install_on_server_class(Server)
+        for flag, mode in ((False, "ar"), (True, "diffusion"), (True, "unknown"),
+                           (None, "ar"), (0, "ar"), ("True", "ar")):
+            with self.subTest(private_flag=flag, output_mode=mode):
+                server = Server()
+                server.model_config = SimpleNamespace(processor=Processor())
+                server._ar_mode = flag
+                server.config = {"engine_kwargs": {"vllm_omni": {"output_mode": mode}}}
+                before_config = deepcopy(server.config)
+                with self.assertRaisesRegex(RuntimeError, "autoregressive"):
+                    server._preprocess_input([7], {})
+                self.assertIs(server._ar_mode, flag)
+                self.assertEqual(server.config, before_config)
+        self.assertEqual(calls, [])
+
+    def test_async_generate_accepts_config_ar_without_private_flag(self):
+        class Server:
+            async def generate(self, prompt_ids, image_data=None, audio_data=None):
+                return self.model_config.processor.dedup_pad_tokens(prompt_ids), image_data, audio_data
+
+        rollout._install_on_server_class(Server)
+        server = Server()
+        server.model_config = SimpleNamespace(processor=Processor())
+        server.config = SimpleNamespace(engine_kwargs={"vllm_omni": {"output_mode": "ar"}})
+        audio = [Waveform(16000)]
+        result = asyncio.run(server.generate(audio_span(12), audio_data=audio))
+        self.assertEqual(result[0], [200, 201])
+        self.assertIsNone(result[1])
+        self.assertIs(result[2], audio)
+        self.assertFalse(hasattr(server, "_ar_mode"))
+
+    def test_non_huanyu_preprocessing_ignores_missing_and_conflicting_mode_evidence(self):
+        class Server:
+            def _preprocess_input(self, prompt_ids, multi_modal_data):
+                return prompt_ids, multi_modal_data
+
+        rollout._install_on_server_class(Server)
+        server = Server()
+        server.model_config = SimpleNamespace(processor=object())
+        ids, media = object(), object()
+        for config in ({}, {"engine_kwargs": {"vllm_omni": {"output_mode": "diffusion"}}}):
+            with self.subTest(config=config):
+                server.config = config
+                result = server._preprocess_input(ids, media)
+                self.assertIs(result[0], ids)
+                self.assertIs(result[1], media)
+                self.assertFalse(hasattr(server, "_ar_mode"))
 
     def test_async_generate_contracts_long_audio_and_image_without_mutating_inputs(self):
         class Server:

@@ -17,6 +17,47 @@ logger = logging.getLogger(__name__)
 _IMAGE_PATTERN = "(<image>./</image>)"
 _AUDIO_PATTERN = "(<audio>./</audio>)"
 _HOOK_FLAG = "_huanyu_metadata_contraction"
+_MISSING = object()
+
+
+def _field(value, key):
+    if isinstance(value, Mapping):
+        return value.get(key, _MISSING)
+    return getattr(value, key, _MISSING)
+
+
+def _require_autoregressive_mode(server):
+    # _ar_mode is a private implementation detail, absent in some servers.
+    # An explicit AR rollout config can establish the mode without this flag;
+    # it must never override an existing False flag or a conflicting config.
+    flag = getattr(server, "_ar_mode", _MISSING)
+    config = _field(server, "config")
+    engine_kwargs = _field(config, "engine_kwargs")
+    omni_kwargs = _field(engine_kwargs, "vllm_omni")
+    mode = _field(omni_kwargs, "output_mode")
+    flag_text = "<missing>" if flag is _MISSING else repr(flag)
+    mode_text = "<missing>" if mode is _MISSING else repr(mode)
+    details = (
+        f"server={type(server).__module__}.{type(server).__name__} "
+        f"_ar_mode={flag_text} "
+        f"config.engine_kwargs.vllm_omni.output_mode={mode_text}"
+    )
+    reason = None
+    if flag is not _MISSING and flag is not True and flag is not False:
+        reason = "the server's private mode flag is not a boolean"
+    elif flag is False:
+        reason = "the server explicitly reports non-AR mode; config cannot override it"
+    elif mode is not _MISSING and mode is not None and mode != "ar":
+        reason = "the rollout config explicitly selects a non-AR or unknown output mode"
+    elif flag is not True and mode != "ar":
+        reason = "neither the private mode flag nor the rollout config confirms AR mode"
+    if reason:
+        raise RuntimeError(
+            f"Huanyu rollout requires the autoregressive server mode: {reason}; {details}"
+        )
+    if not getattr(server, "_huanyu_mode_reported", False):
+        logger.info("Huanyu rollout mode verified: %s", details)
+        server._huanyu_mode_reported = True
 
 
 def _ids(value, name):
@@ -179,8 +220,7 @@ def _install_on_server_class(server_class):
         processor = getattr(getattr(self, "model_config", None), "processor", None)
         if not getattr(processor, "_huanyu_training_processor", False):
             return None
-        if not getattr(self, "_ar_mode", False):
-            raise RuntimeError("Huanyu rollout requires the autoregressive server mode")
+        _require_autoregressive_mode(self)
         bound = signature.bind(self, *args, **kwargs)
         bound.apply_defaults()
         if method_name == "_preprocess_input":
