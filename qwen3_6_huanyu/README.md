@@ -190,6 +190,8 @@ RuntimeError: Huanyu rollout requires the autoregressive server mode
 
 旧检查 `getattr(self, "_ar_mode", False)` 将“私有属性不存在”和“显式 False”合并为同一个错误。该日志没有打印属性值，因此不能据此断言引擎实际使用了非 AR 模式；此前启动参数已包含 `engine_kwargs.vllm_omni.output_mode=ar`，但仍须在报错 server 进程中确认。
 
+随后提供的服务器源码搜索结果补齐了版本差异：`vllm_omni_async_server.py:70` 使用 `strategy_cls = ARStrategy if omni_kwargs.get("output_mode", "diffusion") == "ar" else DiffusionStrategy`，整个文件未找到 `_ar_mode`。该版本改为策略类分派，插件继续依赖旧私有字段是不兼容的。应按实际 rollout 配置确认 AR，而不是把缺少旧字段解释为配置选中了 diffusion；原启动脚本中的 `output_mode=ar` 无需更改。
+
 修复只在本目录：
 
 - 同时读取 server 的 `_ar_mode` 与 `self.config.engine_kwargs.vllm_omni.output_mode`，配置支持字典和属性对象。
