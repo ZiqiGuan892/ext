@@ -150,7 +150,7 @@ python3 -u /opt/huawei/dataset/ccb_data/code/hufenyu/verl_omni_qwen36_gzq/verl_o
 
 新目录结构为 `manifest.json`、`audio/<内容哈希>.pt`、`vision/<内容哈希>.pt`。键来自真实 fbank/像素及 grid，图片绝对路径变化本身不会造成旧式路径键错配。manifest 校验 checkpoint 路径、配置、权重分片元数据/头部、前处理设置及运行时源码版本；不把整个 35B 权重读入内存做哈希。checkpoint 必须保持不可变，多节点挂载/复制需保持一致的分片元数据。缓存不兼容时需使用新目录，不能手改 manifest 绕过校验。
 
-重复执行相同命令会校验并复用已有完整条目；损坏条目报错，不覆盖。不将没有 Huanyu manifest 的旧 cache 目录接管为新缓存。Linux 缓存文件系统需支持同目录硬链接，以便原子发布且不覆盖已有文件。
+重复执行相同命令会校验并复用已有完整条目；损坏条目报错，不覆盖。不将没有 Huanyu manifest 的旧 cache 目录接管为新缓存。发布使用同目录临时文件、目录锁及 rename，不要求支持硬链接；文件系统需支持原子 mkdir 和同目录 rename。所有并发预计算进程必须使用此更新后的发布协议。
 
 若仅要复核完整性，给上述 python 命令添加 `--verify-only`（可去掉日志管道）。它重新扫描两个 parquet 并检查每个需要的条目，不启动 encoder、不写入 cache。这是覆盖和完整性检查，不是 NPU 数值验收。
 
@@ -166,7 +166,21 @@ bash /opt/huawei/dataset/ccb_data/code/hufenyu/verl_omni_qwen36_gzq/verl_omni_ex
 
 Huanyu 在线音频现在也逐 chunk 编码并按真实长度独立 padding，与离线输入形状一致。未改变 encoder/projector 网络或权重。CPU 回归验证缓存读写、缺项/损坏拒绝、混合 batch 插入、梯度与 checkpoint 重算；真实 checkpoint 的 NPU 数值一致性和分布式性能仍需服务器小样本验证。不能仅凭 cache 已生成就断言之前的 AllGather 超时已解决。
 
-本次本地验证：`python -B -m unittest discover -s verl_omni_ext/models/qwen3_6_huanyu/tests -p 'test_*_on_cpu.py' -q`，133 项通过；`precompute.py --help` 和 `bash -n run_32card.sh` 通过。非重入 checkpoint 测试仅绕过编译装饰器，实际执行反向重算。Huanyu 目录外的 79 个插件文件哈希与修改前一致。
+预计算功能初次发布时的本地验证：`python -B -m unittest discover -s verl_omni_ext/models/qwen3_6_huanyu/tests -p 'test_*_on_cpu.py' -q`，133 项通过；`precompute.py --help` 和 `bash -n run_32card.sh` 通过。非重入 checkpoint 测试仅绕过编译装饰器，实际执行反向重算。Huanyu 目录外的 79 个插件文件哈希与修改前一致。
+
+## 2026-10-19：预计算在发布 manifest 时被挂载拒绝
+
+日志为 `cache.py → _publish → os.link(temporary, manifest.json)` 抛出 `PermissionError: [Errno 1] Operation not permitted`。临时文件创建、写入和 fsync 已完成，失败的是硬链接操作，说明该挂载拒绝此操作；不能直接据此认定整个目录没有写权限。此时尚未开始样本编码，与 Huanyu 网络、通信超时或 `_version.py` 警告无关。
+
+修复限定于本目录的缓存发布逻辑：先完整写入临时文件并 fsync，再用 `.huanyu-<目标文件名>.lock` 目录锁串行化检查和 rename。锁内再次确认目标不存在，已有条目由原有完整性校验处理，不覆盖。manifest 的旧目录接管检查也放在同一把锁内，避免多个初始化进程互相误判。manifest 和所有 audio/vision 条目共用这一机制，均不再调用 `os.link`。
+
+更新服务器 `verl_omni_ext/models/qwen3_6_huanyu/cache.py` 后，直接重跑上面的完整预计算命令，继续使用 `/opt/huawei/dataset/ccb_data/data/omni/embed_cache_huanyu_sampleall`。本修复不改变缓存格式、内容键或 contract；本次失败留下的空目录可直接使用，不必删除目录、改路径或重新转换 parquet。如果存在之前成功写出的完整条目，会按原规则校验后复用。
+
+目录锁最多等待 30 秒；异常退出遗留的锁不会被自动删除，以免打断另一个节点正在发布的缓存。若报 `publication lock timed out`，日志会包含具体锁路径，应先确认所有节点均没有使用该锁的写入进程，再处理该锁；不要删除整个缓存目录。并发进程须统一更新，目录锁不保护不遵守此协议的旧程序或外部写入者。
+
+附件末尾的 `bash: syntax error near unexpected token ')'` 是另一个问题：只粘贴了命令尾部的 `)`，没有对应的开头 `(`。复制本节完整命令块时保留成对括号；仅执行 `python3 ... | tee ...` 时不要额外追加 `)`。第二次执行已经没有此语法错误，但仍因硬链接失败，二者无因果关系。
+
+本次修复新增 9 项 CPU 回归，覆盖硬链接被禁用、并发发布/初始化、已有目标保护及异常清理；完整 Huanyu CPU 测试共 142 项通过。测试使用本地文件系统和故障注入，服务器实际挂载及 NPU 预计算仍需重跑验证。
 
 ## 2026-10-19：TaskRunner 找不到 huanyu_audio
 

@@ -11,11 +11,13 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import time
 
 import torch
 
 
 FORMAT = "huanyu_frozen_embeddings_v1"
+_PUBLISH_LOCK_TIMEOUT = 30.0
 
 
 def _json(value):
@@ -126,24 +128,46 @@ def make_cache_contract(model_path, processor):
                            "vision_execution": "single_image_hf_bf16_eager_v1"}))
 
 
-def _publish(path, writer):
-    """Atomically publish a new immutable file; never replace another writer."""
+def _publish(path, writer, validate_new=None):
+    """Publish a complete file, serializing cooperating writers without hard links.
+
+    The directory lock covers the existence check and same-directory rename.
+    All concurrent cache writers must use this protocol. A crashed owner's lock
+    is never automatically stolen: an operator must first rule out live writers.
+    """
+    lock = path.with_name(f".huanyu-{path.name}.lock")
     fd, temporary = tempfile.mkstemp(prefix=".huanyu-", suffix=".tmp", dir=path.parent)
     try:
         with os.fdopen(fd, "wb") as handle:
             writer(handle)
             handle.flush()
             os.fsync(handle.fileno())
+        deadline = time.monotonic() + _PUBLISH_LOCK_TIMEOUT
+        while True:
+            try:
+                lock.mkdir()
+                break
+            except FileExistsError:
+                if os.path.lexists(path):
+                    return False
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"Huanyu cache publication lock timed out: {lock}; "
+                        "check for active precompute writers before removing a leftover lock"
+                    ) from None
+                time.sleep(0.05)
         try:
-            if os.name == "nt":
-                # Windows rename fails when the destination exists; POSIX
-                # rename would overwrite it, so use link publication there.
+            if os.path.lexists(path):
+                return False
+            if validate_new is not None:
+                validate_new()
+            try:
                 os.rename(temporary, path)
-            else:
-                os.link(temporary, path)
+            except FileExistsError:
+                return False
             return True
-        except FileExistsError:
-            return False
+        finally:
+            lock.rmdir()  # Only the process that successfully created it releases it.
     finally:
         Path(temporary).unlink(missing_ok=True)
 
@@ -157,14 +181,17 @@ class HuanyuEmbeddingCache:
         if create:
             self.root.mkdir(parents=True, exist_ok=True)
             if not manifest.exists():
-                # Allow only directories created by a concurrent cache initializer.
-                if any((path.name in ("audio", "vision") and
-                        (not path.is_dir() or any(path.iterdir()))) or
-                       (path.name not in ("audio", "vision") and not path.name.startswith(".huanyu-"))
-                       for path in self.root.iterdir()):
-                    raise ValueError(f"Refusing to adopt an existing non-Huanyu cache: {self.root}")
+                def validate_new():
+                    # Run under the manifest lock: another initializer may have
+                    # published a manifest since our initial existence check.
+                    if any((path.name in ("audio", "vision") and
+                            (not path.is_dir() or any(path.iterdir()))) or
+                           (path.name not in ("audio", "vision") and not path.name.startswith(".huanyu-"))
+                           for path in self.root.iterdir()):
+                        raise ValueError(f"Refusing to adopt an existing non-Huanyu cache: {self.root}")
+
                 payload = {"format": FORMAT, "contract_digest": self.contract_digest, "contract": self.contract}
-                _publish(manifest, lambda handle: handle.write((_json(payload) + "\n").encode()))
+                _publish(manifest, lambda handle: handle.write((_json(payload) + "\n").encode()), validate_new)
             for modality in ("audio", "vision"):
                 (self.root / modality).mkdir(exist_ok=True)
         if not manifest.is_file():
