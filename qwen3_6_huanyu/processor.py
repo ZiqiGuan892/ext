@@ -8,6 +8,7 @@ Qwen vision frontend and tokenizer with the active vLLM-Omni Huanyu frontend.
 import importlib
 import inspect
 import json
+import os
 from pathlib import Path
 import types
 
@@ -58,6 +59,7 @@ class HuanyuProcessor:
         self.config = config
         self.audio_preprocessor = dict(audio_preprocessor)
         self.chat_template = getattr(tokenizer, "chat_template", None)
+        self.embedding_cache = None
         self.sampling_rate = int(audio_preprocessor["sampling_rate"])
         self.feature_size = int(audio_preprocessor["feature_size"])
         self.n_fft = int(audio_preprocessor.get("n_fft", 400))
@@ -167,7 +169,39 @@ class HuanyuProcessor:
         encoded = dict(self.tokenizer(rendered, add_special_tokens=False, return_tensors=return_tensors))
         encoded.update(vision)
         encoded.update(self._bound_inputs(encoded["input_ids"], audio_features, audio_lengths, groups, vision))
+        self._use_embedding_cache(encoded, vision, audio_features, audio_lengths)
         return encoded
+
+    def _use_embedding_cache(self, inputs, vision, features, lengths):
+        """Keep grids/token spans, replace only training encoder inputs.
+
+        Raw images and waveforms remain in AgentLoop multi_modal_data for rollout.
+        Missing entries are fatal; never mix cache hits with online fallbacks.
+        """
+        cache = self.embedding_cache
+        if cache is None:
+            return
+        from .cache import audio_key, vision_key, split_vision_inputs
+
+        hidden = int(_get(_get(self.config, "text_config"), "hidden_size"))
+        audio_embeds = [cache.get("audio", audio_key(feat, int(length)),
+                                 expected_tokens=((int(length) + 3) // 4) // 2, hidden_size=hidden)
+                        for feat, length in zip(features, lengths)]
+        image_embeds = []
+        if vision:
+            for pixels, grid in split_vision_inputs(vision["pixel_values"], vision["image_grid_thw"]):
+                image_embeds.append(cache.get(
+                    "vision", vision_key(pixels, grid),
+                    expected_tokens=int(grid.prod()) // self.spatial_merge_size ** 2, hidden_size=hidden,
+                ))
+        inputs.pop("huanyu_audio_features", None)
+        inputs.pop("pixel_values", None)
+        inputs.update(
+            huanyu_cached_audio_embeds=audio_embeds,
+            huanyu_cached_vision_embeds=image_embeds,
+            huanyu_cached_image_counts=torch.tensor([len(image_embeds)], dtype=torch.long),
+            huanyu_cache_enabled=torch.ones(1, dtype=torch.long),
+        )
 
     def _bound_inputs(self, input_ids, features, lengths, groups, vision):
         from .audio_alignment import find_audio_bounds
@@ -205,7 +239,9 @@ class HuanyuProcessor:
             raise ValueError("Huanyu training expects dataset videos converted to image frames")
         vision = self._vision(data.get("images"))
         features, lengths, groups = self._audio(data.get("audios"), kwargs.get("sampling_rate", self.sampling_rate))
-        return {**vision, **self._bound_inputs(input_ids, features, lengths, groups, vision)}
+        inputs = {**vision, **self._bound_inputs(input_ids, features, lengths, groups, vision)}
+        self._use_embedding_cache(inputs, vision, features, lengths)
+        return inputs
 
     def dedup_pad_tokens(self, prompt_ids):
         """The Huanyu rollout hook contracts spans using actual media metadata.
@@ -276,7 +312,7 @@ def _bind_qwen_rope(processor):
     processor.get_rope_index = types.MethodType(get_rope_index, processor)
 
 
-def build_huanyu_processor(model_path, model_config):
+def build_huanyu_processor(model_path, model_config, *, install_bridge=True, use_cache=None):
     from .runtime_imports import load_huanyu_native
 
     from transformers import AutoConfig, AutoTokenizer
@@ -308,7 +344,19 @@ def build_huanyu_processor(model_path, model_config):
     image_processor = Qwen2VLImageProcessor.from_pretrained(model_path)
     processor = HuanyuProcessor(tokenizer, image_processor, frontend, config, pre)
     _bind_qwen_rope(processor)
-    install_agent_loop_bridge()
+    if use_cache is None:
+        use_cache = os.environ.get("HUANYU_USE_PRECOMPUTE", "0") == "1"
+    if use_cache:
+        from .cache import HuanyuEmbeddingCache, make_cache_contract
+        cache_dir = os.environ.get("HUANYU_EMBED_CACHE_DIR", "")
+        if not cache_dir:
+            raise ValueError("HUANYU_USE_PRECOMPUTE=1 requires HUANYU_EMBED_CACHE_DIR")
+        if os.environ.get("MINICPMO_TUNE_VISION", "0") == "1" or os.environ.get("MINICPMO_TUNE_AUDIO", "0") == "1":
+            raise ValueError("Huanyu precompute requires frozen vision and audio")
+        processor.embedding_cache = HuanyuEmbeddingCache(cache_dir, make_cache_contract(model_path, processor))
+        print(f"[huanyu-cache] strict audio+vision cache reader: {cache_dir}", flush=True)
+    if install_bridge:
+        install_agent_loop_bridge()
     return processor
 
 

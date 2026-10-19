@@ -31,6 +31,20 @@ export RM_MODEL_PATH=/opt/huawei/dataset/downloaded_models/Qwen3.5-35B-A3B
 export FILTER_OVERLONG=false
 export MINICPMO_USE_PRECOMPUTE=0
 export MINICPMO_TUNE_AUDIO=0
+export HUANYU_USE_PRECOMPUTE="${HUANYU_USE_PRECOMPUTE:-0}"
+export HUANYU_EMBED_CACHE_DIR="${HUANYU_EMBED_CACHE_DIR:-}"
+case "$HUANYU_USE_PRECOMPUTE" in
+    0) ;;
+    1)
+        [[ -n "$HUANYU_EMBED_CACHE_DIR" && -f "$HUANYU_EMBED_CACHE_DIR/manifest.json" ]] || {
+            echo '[huanyu] cache mode requires HUANYU_EMBED_CACHE_DIR with manifest.json; run Huanyu precompute first' >&2
+            exit 2
+        }
+        [[ "${MINICPMO_TUNE_VISION:-0}" != 1 ]] || { echo '[huanyu] cached vision must remain frozen' >&2; exit 2; }
+        ;;
+    *) echo '[huanyu] HUANYU_USE_PRECOMPUTE must be 0 or 1' >&2; exit 2 ;;
+esac
+_huanyu_ray_cache_dir="$(python3 -c 'import json, os; print(json.dumps(os.environ["HUANYU_EMBED_CACHE_DIR"]))')"
 
 # Budget the EXPANDED multimodal prompt. Length filtering remains disabled.
 # Capture the values here: the inherited DEBUG wrapper resets MAX_PROMPT_LENGTH.
@@ -56,7 +70,7 @@ export MAX_PROMPT_LENGTH=$_huanyu_prompt_length MAX_RESPONSE_LENGTH=$_huanyu_res
 export ROLLOUT_PROMPT_LENGTH=$_huanyu_rollout_prompt_length ROLLOUT_MAX_MODEL_LEN=$_huanyu_model_length
 export MAX_TOKEN_LEN_PER_GPU=$_huanyu_token_budget
 
-echo '[huanyu] adapter=Qwen36HuanyuForTraining dataset=Qwen36HuanyuOmniRLHFDataset pipeline=qwen3_6_huanyu; online frozen audio; length filter off'
+echo "[huanyu] adapter=Qwen36HuanyuForTraining dataset=Qwen36HuanyuOmniRLHFDataset pipeline=qwen3_6_huanyu; HUANYU_USE_PRECOMPUTE=${HUANYU_USE_PRECOMPUTE}; length filter off"
 echo "[huanyu] expanded prompt=${_huanyu_prompt_length} rollout prompt=${_huanyu_rollout_prompt_length} response=${_huanyu_response_length} model length=${_huanyu_model_length} token budget=${_huanyu_token_budget}"
 
 # Keep HF config.architectures intact. architecture below selects only the
@@ -82,4 +96,7 @@ exec bash /opt/huawei/dataset/ccb_data/code/hufenyu/verl_omni_qwen36_gzq/example
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu="${_huanyu_token_budget}" \
     "++ray_kwargs.ray_init.runtime_env.env_vars.PYTHONPATH=${_huanyu_ray_pythonpath}" \
     "++ray_kwargs.ray_init.runtime_env.env_vars.HUANYU_VLLM_OMNI_ROOT=${HUANYU_VLLM_OMNI_ROOT}" \
+    "++ray_kwargs.ray_init.runtime_env.env_vars.HUANYU_USE_PRECOMPUTE='${HUANYU_USE_PRECOMPUTE}'" \
+    "++ray_kwargs.ray_init.runtime_env.env_vars.HUANYU_EMBED_CACHE_DIR=${_huanyu_ray_cache_dir}" \
+    "++ray_kwargs.ray_init.runtime_env.env_vars.MINICPMO_USE_PRECOMPUTE='0'" \
     data.filter_overlong_prompts=false

@@ -98,6 +98,15 @@ class Qwen36HuanyuThinkerAdapter(OmniModelBase):
             raise ValueError("Huanyu integration currently supports a frozen audio encoder/projector only")
         if os.environ.get("MINICPMO_USE_PRECOMPUTE", "0") == "1":
             raise ValueError("Set MINICPMO_USE_PRECOMPUTE=0 for Huanyu: Whisper caches are not compatible; use online encoding")
+        use_cache = os.environ.get("HUANYU_USE_PRECOMPUTE", "0") == "1"
+        if use_cache:
+            if not os.environ.get("HUANYU_EMBED_CACHE_DIR"):
+                raise ValueError("HUANYU_USE_PRECOMPUTE=1 requires HUANYU_EMBED_CACHE_DIR")
+            if os.environ.get("MINICPMO_TUNE_VISION", "0") == "1":
+                raise ValueError("Huanyu precompute requires frozen vision and audio")
+            vision_config = _value(module.config, "vision_config")
+            if _value(vision_config, "deepstack_visual_indexes", []):
+                raise ValueError("Huanyu precompute does not support deepstack visual features")
         module = super().configure_model(module, model_config)
         _flatten_text_config(module.config)
         token_ids = _audio_token_ids(_value(model_config, "tokenizer"), module.config)
@@ -119,7 +128,11 @@ class Qwen36HuanyuThinkerAdapter(OmniModelBase):
         for child in (module.model.audio_encoder, module.model.audio_projection):
             child.requires_grad_(False)
             child.eval()
-        install_huanyu_forward(module, **token_ids)
-        logger.info("Huanyu training adapter selected: alias=%s, HF architecture=%s, audio=frozen, cache=off",
-                    TRAINING_ARCHITECTURE, module.config.architectures)
+        cache_args = {}
+        if use_cache:
+            cache_args = dict(use_precompute=True, image_token_id=_value(module.config, "image_token_id"),
+                              spatial_merge_size=_value(vision_config, "spatial_merge_size", 2))
+        install_huanyu_forward(module, **token_ids, **cache_args)
+        logger.info("Huanyu training adapter selected: alias=%s, HF architecture=%s, audio=frozen, cache=%s",
+                    TRAINING_ARCHITECTURE, module.config.architectures, "strict" if use_cache else "off")
         return module

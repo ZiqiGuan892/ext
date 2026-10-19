@@ -130,6 +130,18 @@ class AudioRuntimeTests(unittest.TestCase):
             runtime.attach_huanyu_audio(self.module, self.model_cfg)
         self.assertFalse(hasattr(self.module.model, "audio_encoder"))
 
+    def test_each_chunk_has_same_padding_online_and_offline(self):
+        runtime.attach_huanyu_audio(self.module, self.model_cfg)
+        observed = []
+        hook = self.module.model.audio_encoder.register_forward_pre_hook(
+            lambda part, args: observed.append((tuple(args[0].shape), args[1].tolist())))
+        self.addCleanup(hook.remove)
+        features = torch.randn(2, 4, 24)
+        together = runtime.encode_huanyu_audio(self.module, features, [16, 9])
+        self.assertEqual(observed, [((1, 4, 16), [16]), ((1, 4, 12), [9])])
+        separately = runtime.encode_huanyu_audio(self.module, features[1:2, :, :9], [9])
+        torch.testing.assert_close(together[1], separately[0], rtol=0, atol=0)
+
     def test_meta_outer_construction_is_materialized(self):
         with torch.device("meta"):
             runtime.attach_huanyu_audio(self.module, self.model_cfg)

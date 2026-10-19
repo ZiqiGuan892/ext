@@ -73,6 +73,31 @@ def _audio(item, sampling_rate):
     return np.ascontiguousarray(array, dtype=np.float32)
 
 
+def decode_huanyu_media(row, sampling_rate=16000):
+    """Decode an OmniMix parquet row with the SAME readers as training.
+
+    Used by offline precompute; keys are derived from processed tensors, so
+    cross-modality column order does not affect lookup. Video frames and optional
+    video audio use the current sampler just like the dataset below.
+    """
+    if sampling_rate != 16000:
+        raise ValueError("Verified Huanyu checkpoint expects sampling_rate=16000")
+    images, audios = [], []
+    for item in row.get("images") or []:
+        images.append(_image(item if isinstance(item, dict) else {"image": item}))
+    for item in row.get("audios") or []:
+        audios.append(_audio(item if isinstance(item, dict) else {"audio": item}, sampling_rate))
+    for item in row.get("videos") or []:
+        helper = _video_helpers()
+        spec = helper.video_spec_from_item(item if isinstance(item, dict) else {"video": item})
+        images.extend(helper.sample_frames(spec))
+        if helper.use_audio_in_video():
+            waveform = helper.extract_video_audio(spec, sampling_rate)
+            if waveform is not None:
+                audios.append(waveform)
+    return images, audios
+
+
 class Qwen36HuanyuOmniRLHFDataset(RLHFDataset):
     """Keep upstream schema and decode images/audio/video without old caches."""
 

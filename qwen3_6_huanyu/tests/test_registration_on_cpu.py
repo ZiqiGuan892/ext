@@ -78,7 +78,8 @@ class RegistrationTests(unittest.TestCase):
         spec.loader.exec_module(self.adapter_module)
         self.adapter = self.adapter_module.Qwen36HuanyuThinkerAdapter
         self.environment = patch.dict(os.environ, {
-            "MINICPMO_TUNE_AUDIO": "0", "MINICPMO_TUNE_VISION": "0", "MINICPMO_USE_PRECOMPUTE": "0"
+            "MINICPMO_TUNE_AUDIO": "0", "MINICPMO_TUNE_VISION": "0", "MINICPMO_USE_PRECOMPUTE": "0",
+            "HUANYU_USE_PRECOMPUTE": "0", "HUANYU_EMBED_CACHE_DIR": "",
         })
         self.environment.start()
         self.addCleanup(self.environment.stop)
@@ -130,6 +131,32 @@ class RegistrationTests(unittest.TestCase):
             self.adapter.configure_model(self.model, self.config)
         self.attach.assert_not_called()
         self.install_forward.assert_not_called()
+
+    def test_huanyu_cache_mode_uses_separate_switch_and_injection(self):
+        self.model.config.image_token_id = 13
+        self.model.config.vision_config = SimpleNamespace(spatial_merge_size=2, deepstack_visual_indexes=[])
+        with patch.dict(os.environ, {"HUANYU_USE_PRECOMPUTE": "1", "HUANYU_EMBED_CACHE_DIR": "huanyu-cache"}):
+            self.adapter.configure_model(self.model, self.config)
+        self.install_forward.assert_called_once_with(
+            self.model, start_token_id=10, end_token_id=11, placeholder_token_id=12,
+            use_precompute=True, image_token_id=13, spatial_merge_size=2,
+        )
+
+    def test_cached_vision_cannot_be_tuned_or_require_deepstack(self):
+        self.model.config.vision_config = SimpleNamespace(deepstack_visual_indexes=[1])
+        with patch.dict(os.environ, {"HUANYU_USE_PRECOMPUTE": "1", "HUANYU_EMBED_CACHE_DIR": "huanyu-cache"}):
+            with self.assertRaisesRegex(ValueError, "deepstack"):
+                self.adapter.configure_model(self.model, self.config)
+            with patch.dict(os.environ, {"MINICPMO_TUNE_VISION": "1"}):
+                with self.assertRaisesRegex(ValueError, "frozen vision"):
+                    self.adapter.configure_model(self.model, self.config)
+        self.attach.assert_not_called()
+
+    def test_huanyu_cache_mode_requires_explicit_cache_root(self):
+        with patch.dict(os.environ, {"HUANYU_USE_PRECOMPUTE": "1"}):
+            with self.assertRaisesRegex(ValueError, "HUANYU_EMBED_CACHE_DIR"):
+                self.adapter.configure_model(self.model, self.config)
+        self.attach.assert_not_called()
 
     def test_incorrect_backbone_is_rejected(self):
         self.model.config.model_type = "unrelated_model"

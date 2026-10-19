@@ -29,13 +29,14 @@
 | thinker_adapter.py | 独立注册 Qwen36HuanyuForTraining + thinker，挂载 Huanyu 音频模块 |
 | audio_runtime.py | 复用当前 vLLM-Omni 的 encoder、projector、fold；严格加载音频权重 |
 | runtime_imports.py | 检查实际进程的 vLLM-Omni 来源、Huanyu 文件和接口；提供独立导入预检 |
-| processor.py | 40 维 fbank、Qwen 图像处理、媒体 token 展开、原生 HF mRoPE、AgentLoop 输入桥接 |
+| processor.py | 40 维 fbank、Qwen 图像处理、媒体 token 展开、原生 HF mRoPE、AgentLoop 输入桥接及可选严格 cache 读取 |
 | dataset.py | 读取原始图片、音频、视频帧；不读取 Whisper cache |
 | forward.py | 保留 HF 图像/文本前向，在经过验证的音频 token 位置注入 embedding |
 | rollout_inputs.py | 按媒体元数据收缩推理占位符，兼容独立预处理方法及内联预处理的 async generate 接口 |
 | rollout_adapter.py | 独立注册 qwen3_6_huanyu，复用现有单 llm stage 拓扑 |
 | run_32card.sh | 调用原 32 卡入口，追加 Huanyu 配置、关闭长度预筛，显式传递 Ray 导入路径 |
 | check_runtime.py | 不加载模型权重的真实依赖/processor/mRoPE CPU 接口检查 |
+| precompute.py / cache.py | Huanyu 专用音频、图片和视频帧 embedding 预计算、内容键与模型身份校验 |
 
 ```text
 音频路径/bytes/zarr member
@@ -115,7 +116,57 @@ HUANYU_VLLM_OMNI_ROOT=/vllm-workspace/vllm-omni
 
 入口还会把包含指定 vLLM-Omni 和 gzq 插件目录的 `PYTHONPATH`，通过 `++ray_kwargs.ray_init.runtime_env.env_vars.PYTHONPATH` 显式传入 Ray；同样传递 `HUANYU_VLLM_OMNI_ROOT` 供 worker 检查。这是新任务的启动环境，不会修改已经运行的 worker，也不会自动启停 Ray。
 
-不需要重新生成 parquet。本次使用在线编码，不能复用 Whisper 音频 cache。共享脚本可能仍打印原 cache 路径，但本目录 dataset 不访问该缓存。关闭长度预筛只跳过全量预扫描，真实请求仍受上下文长度限制。
+不需要重新生成 parquet。默认使用在线编码；可按下节生成并启用 Huanyu 专用 cache，不能复用 Whisper cache。共享脚本可能仍打印原 cache 路径，但本目录不访问旧缓存。关闭长度预筛只跳过全量预扫描，真实请求仍受上下文长度限制。
+
+## Huanyu 预计算原 35B OmniMix 数据集
+
+需先将本目录全部更新同步到服务器。环境加载与 Ray 启停仍由操作者负责。以下预计算命令不使用 Ray，只使用执行节点的一张 NPU（`npu:0`），应在该卡空闲时运行。原始 parquet、原始媒体及所有旧 Whisper/MiniCPM cache 均不修改。
+
+```bash
+cd /opt/huawei/dataset/ccb_data/code/hufenyu/verl_omni_qwen36_gzq
+mkdir -p /opt/huawei/dataset/ccb_data/code/hufenyu/verl_omni_qwen36_gzq/logs/huanyu_precompute
+
+(
+set -o pipefail
+python3 -u /opt/huawei/dataset/ccb_data/code/hufenyu/verl_omni_qwen36_gzq/verl_omni_ext/models/qwen3_6_huanyu/precompute.py \
+  --parquet \
+    /opt/huawei/dataset/ccb_data/data/omni/omni_mix_f8_genrm_sampleall/train.parquet \
+    /opt/huawei/dataset/ccb_data/data/omni/omni_mix_f8_genrm_sampleall/validation.parquet \
+  --model_path /opt/huawei/dataset/downloaded_models/Qwen3.6-35B-A3B-huanyu06b-iter2000-omni4b-hf-huanyu7tokens \
+  --cache_dir /opt/huawei/dataset/ccb_data/data/omni/embed_cache_huanyu_sampleall \
+  --device npu:0 \
+  --sampling_rate 16000 \
+  --read-batch-size 16 \
+  --log-interval 10 \
+  2>&1 | tee -a /opt/huawei/dataset/ccb_data/code/hufenyu/verl_omni_qwen36_gzq/logs/huanyu_precompute/precompute.log
+)
+```
+
+一条命令先处理 train，再处理 validation，共用同一个 cache。也可以将 `--parquet` 后分别只保留其中一个文件，分两次运行。成功以最后的 `[huanyu-precompute] COMPLETE` 为准；中途异常带 parquet 路径和行号。每约 10 秒（在一条样本完成后）输出累计行数、音频 chunk 数、图片数、已创建/复用条目数、速率和估算剩余时间。
+
+`--read-batch-size` 是 parquet 的读取批大小，不是 NPU 推理批大小。当前为每个音频 chunk、每张图片分别编码，限制峰值显存，并使音频计算不受同批其他样本 padding 的影响；没有旧脚本的 `--batch_size`、`--num_workers`、`--max_slice_nums` 选项。视频使用与训练相同的采样 helper，采样帧计入 vision cache，启用视频音轨时也处理音轨。预计算和训练的 `MINICPMO_VIDEO_*`、`MINICPMO_USE_AUDIO_IN_VIDEO` 等解码设置必须一致；否则内容键可能不命中并明确报错。
+
+缓存保存的是音频 fold/projector 和视觉 merger 后的 BF16 `[tokens, 2048]`，不是 fbank 或原始像素。预计算不加载 35B 文本主干。音频编码复用服务器 Huanyu 实现，视觉编码使用当前训练侧 HF 类与严格匹配的 `model.visual.*` 权重。非空 DeepStack 配置不支持并报错。
+
+新目录结构为 `manifest.json`、`audio/<内容哈希>.pt`、`vision/<内容哈希>.pt`。键来自真实 fbank/像素及 grid，图片绝对路径变化本身不会造成旧式路径键错配。manifest 校验 checkpoint 路径、配置、权重分片元数据/头部、前处理设置及运行时源码版本；不把整个 35B 权重读入内存做哈希。checkpoint 必须保持不可变，多节点挂载/复制需保持一致的分片元数据。缓存不兼容时需使用新目录，不能手改 manifest 绕过校验。
+
+重复执行相同命令会校验并复用已有完整条目；损坏条目报错，不覆盖。不将没有 Huanyu manifest 的旧 cache 目录接管为新缓存。Linux 缓存文件系统需支持同目录硬链接，以便原子发布且不覆盖已有文件。
+
+若仅要复核完整性，给上述 python 命令添加 `--verify-only`（可去掉日志管道）。它重新扫描两个 parquet 并检查每个需要的条目，不启动 encoder、不写入 cache。这是覆盖和完整性检查，不是 NPU 数值验收。
+
+**缓存生成完成后，训练时必须显式启用读取：**
+
+```bash
+HUANYU_USE_PRECOMPUTE=1 \
+HUANYU_EMBED_CACHE_DIR=/opt/huawei/dataset/ccb_data/data/omni/embed_cache_huanyu_sampleall \
+bash /opt/huawei/dataset/ccb_data/code/hufenyu/verl_omni_qwen36_gzq/verl_omni_ext/models/qwen3_6_huanyu/run_32card.sh
+```
+
+入口把这两个变量传入新 Ray 任务；旧 `MINICPMO_USE_PRECOMPUTE` 保持 0。训练侧应打印 `[huanyu-cache] strict audio+vision cache reader`，模型适配器日志应为 `cache=strict`。processor 保留媒体 token/grid 和 RoPE，读 cache 替代训练侧 encoder 输入；forward 校验逐样本数量、位置和长度后注入 embedding，跳过音频/视觉编码。缺项、版本不匹配或未传入缓存标记即失败，不在部分 rank 上在线回退。rollout 仍携带原始媒体，推理侧仍自行编码；缓存也不消除 LLM/FSDP 本身的通信。
+
+Huanyu 在线音频现在也逐 chunk 编码并按真实长度独立 padding，与离线输入形状一致。未改变 encoder/projector 网络或权重。CPU 回归验证缓存读写、缺项/损坏拒绝、混合 batch 插入、梯度与 checkpoint 重算；真实 checkpoint 的 NPU 数值一致性和分布式性能仍需服务器小样本验证。不能仅凭 cache 已生成就断言之前的 AllGather 超时已解决。
+
+本次本地验证：`python -B -m unittest discover -s verl_omni_ext/models/qwen3_6_huanyu/tests -p 'test_*_on_cpu.py' -q`，133 项通过；`precompute.py --help` 和 `bash -n run_32card.sh` 通过。非重入 checkpoint 测试仅绕过编译装饰器，实际执行反向重算。Huanyu 目录外的 79 个插件文件哈希与修改前一致。
 
 ## 2026-10-19：TaskRunner 找不到 huanyu_audio
 

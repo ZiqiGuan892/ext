@@ -196,11 +196,29 @@ def _frozen_bf16_call(part, *args):
 
 
 def encode_huanyu_audio(module, features, lengths):
-    """Encode chunk-batched fbank features into valid [tokens, text_hidden] rows.
+    """Encode each chunk independently into valid [tokens, text_hidden] rows.
 
     ``features`` is [number_of_chunks, feature_bins, padded_frames]; ``lengths``
-    contains actual, unpadded frame counts. Chunk order is preserved.
+    contains actual, unpadded frame counts. Per-chunk padding/shape is identical
+    online and offline, independent of other audio lengths in a training batch.
     """
+    if not isinstance(features, torch.Tensor) or features.ndim != 3:
+        raise ValueError("Huanyu features must have shape [chunks, feature_bins, padded_frames]")
+    lengths = torch.as_tensor(lengths, device=features.device)
+    if lengths.ndim != 1 or len(lengths) != len(features) or lengths.is_floating_point() or lengths.dtype == torch.bool:
+        raise ValueError("Huanyu lengths must be one integer per feature chunk")
+    if torch.any(lengths <= 0) or torch.any(lengths > features.shape[2]):
+        raise ValueError("Huanyu lengths must fit the unpadded feature chunks")
+    outputs = []
+    for index, length in enumerate(lengths.tolist()):
+        chunk = features[index:index + 1, :, :length]
+        chunk = torch.nn.functional.pad(chunk, (0, -length % 4))
+        outputs.extend(_encode_huanyu_audio_batch(module, chunk, lengths[index:index + 1]))
+    return outputs
+
+
+def _encode_huanyu_audio_batch(module, features, lengths):
+    """Native encoder/fold invocation; all public calls use one real chunk."""
     model = getattr(module, "model", None)
     runtime = getattr(model, "_huanyu_audio_runtime", None)
     if runtime is None:
