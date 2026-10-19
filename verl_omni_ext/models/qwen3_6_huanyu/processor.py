@@ -250,6 +250,8 @@ def _bind_qwen_rope(processor):
 
 
 def build_huanyu_processor(model_path, model_config):
+    from .runtime_imports import load_huanyu_native
+
     from transformers import AutoConfig, AutoTokenizer
     from transformers.models.qwen2_vl.image_processing_qwen2_vl import Qwen2VLImageProcessor
 
@@ -270,7 +272,7 @@ def build_huanyu_processor(model_path, model_config):
         raise ValueError("This training bridge supports the verified 40-bin declarative Huanyu checkpoint only")
     if int(_get(audio_config, "projector_downsample_rate", 0)) != 2:
         raise ValueError("Huanyu processor requires verified VGG /4 and projector fold /2")
-    runtime = importlib.import_module("vllm_omni.model_executor.models.minicpmo_5_0.huanyu_audio")
+    runtime = load_huanyu_native()
     frontend = runtime.HuanyuFbankFeatureExtractor(
         feature_size=int(pre["feature_size"]), sampling_rate=int(pre["sampling_rate"]),
         n_fft=int(pre.get("n_fft", 400)), hop_length=int(pre.get("hop_length", 160)),

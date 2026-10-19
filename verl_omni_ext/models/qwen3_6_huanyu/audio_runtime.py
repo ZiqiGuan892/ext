@@ -13,6 +13,7 @@ from pathlib import Path
 import torch
 
 from .audio_weights import validate_audio_state_dict
+from .runtime_imports import load_huanyu_native
 
 
 _NATIVE_PACKAGE = "vllm_omni.model_executor.models.minicpmo_5_0"
@@ -21,7 +22,7 @@ _PREFIXES = ("model.audio_encoder.", "model.audio_projection.")
 
 def load_huanyu_runtime():
     """Return the installed native Huanyu module, shared by preprocessing/encoding."""
-    return import_module(f"{_NATIVE_PACKAGE}.huanyu_audio")
+    return load_huanyu_native()
 
 
 def _mapping(value, name):

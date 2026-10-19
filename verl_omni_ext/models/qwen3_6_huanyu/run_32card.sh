@@ -5,6 +5,25 @@ set -euo pipefail
 
 cd /opt/huawei/dataset/ccb_data/code/hufenyu/verl_omni_qwen36_gzq
 
+# The driver and NEW Ray workers must import the same Huanyu-enabled checkout.
+# Exporting PYTHONPATH only in this shell does not establish the Ray job's env.
+export HUANYU_VLLM_OMNI_ROOT=/vllm-workspace/vllm-omni
+_huanyu_retained_path=""
+IFS=: read -r -a _huanyu_path_entries <<< "${PYTHONPATH:-}"
+for _huanyu_path in "${_huanyu_path_entries[@]}"; do
+    case "${_huanyu_path%/}" in
+        ""|"$HUANYU_VLLM_OMNI_ROOT"|"$PWD"|\
+        /opt/huawei/dataset/ccb_data/code/hufenyu/vllm-omni-xy|\
+        /opt/huawei/dataset/ccb/data/code/hufenyu/vllm-omni-xy|\
+        /opt/huawei/dataset/hfy_guiyang/vllm-omni-xy-qwen-vit) continue ;;
+    esac
+    _huanyu_retained_path+="${_huanyu_retained_path:+:}${_huanyu_path}"
+done
+export PYTHONPATH="${HUANYU_VLLM_OMNI_ROOT}:${PWD}${_huanyu_retained_path:+:${_huanyu_retained_path}}"
+python3 -B verl_omni_ext/models/qwen3_6_huanyu/runtime_imports.py --check
+# JSON quotes are passed as part of ONE argv element for Hydra to parse; no eval.
+_huanyu_ray_pythonpath="$(python3 -c 'import json, os; print(json.dumps(os.environ["PYTHONPATH"]))')"
+
 export MODEL_PATH=/opt/huawei/dataset/downloaded_models/Qwen3.6-35B-A3B-huanyu06b-iter2000-omni4b-hf-huanyu7tokens
 export TRAIN_FILE=/opt/huawei/dataset/ccb_data/data/omni/omni_mix_f8_genrm_sampleall/train.parquet
 export VAL_FILE=/opt/huawei/dataset/ccb_data/data/omni/omni_mix_f8_genrm_sampleall/validation.parquet
@@ -27,4 +46,6 @@ exec bash /opt/huawei/dataset/ccb_data/code/hufenyu/verl_omni_qwen36_gzq/example
     data.custom_cls.path=pkg://verl_omni_ext.models.qwen3_6_huanyu.dataset \
     data.custom_cls.name=Qwen36HuanyuOmniRLHFDataset \
     ++actor_rollout_ref.rollout.engine_kwargs.vllm_omni.pipeline_name=qwen3_6_huanyu \
+    "++ray_kwargs.ray_init.runtime_env.env_vars.PYTHONPATH=${_huanyu_ray_pythonpath}" \
+    "++ray_kwargs.ray_init.runtime_env.env_vars.HUANYU_VLLM_OMNI_ROOT=${HUANYU_VLLM_OMNI_ROOT}" \
     data.filter_overlong_prompts=false
