@@ -114,21 +114,47 @@ class PrecomputeTests(unittest.TestCase):
                 self.proj = torch.nn.Linear(4, 6, bias=False)
                 TinyVision.constructions += 1
 
-            def forward(self, pixels, grid_thw):
-                result = self.proj(pixels).reshape(-1, 4, 6).mean(1)
+            def forward(self, pixels, grid_thw, **kwargs):
+                assert kwargs == {"output_attentions": False, "output_hidden_states": False}
+                values = self.proj(pixels).unsqueeze(0).unsqueeze(0)
+                result, _ = fake_hf.eager_attention_forward(
+                    self, torch.zeros_like(values), torch.zeros_like(values), values, None, scaling=1.,
+                )
+                result = result.reshape(-1, 4, 6).mean(1)
                 return SimpleNamespace(pooler_output=result)
+
+        def eager(module, query, key, value, attention_mask, scaling, dropout=0., **kwargs):
+            scores = (query @ key.transpose(-1, -2)) * scaling
+            weights = scores.softmax(-1, dtype=torch.float32).to(query.dtype)
+            return (weights @ value).transpose(1, 2).contiguous(), weights
+
+        fake_hf = SimpleNamespace(Qwen3_5MoeVisionModel=TinyVision, eager_attention_forward=eager)
 
         save_file({"model.visual.proj.weight": torch.ones(6, 4)}, str(self.root / "model.safetensors"))
         processor = FakeProcessor()
         processor.config = SimpleNamespace(text_config={"hidden_size": 6},
                                            vision_config=SimpleNamespace(deepstack_visual_indexes=[]))
         encoders = cli.FrozenEncoders(str(self.root), processor, "cpu")
-        with patch.object(cli.importlib, "import_module", return_value=SimpleNamespace(Qwen3_5MoeVisionModel=TinyVision)):
+        with patch.object(cli.importlib, "import_module", return_value=fake_hf):
             for _ in range(2):
                 output = encoders.vision(torch.ones(4, 4), torch.tensor([1, 2, 2]))
                 torch.testing.assert_close(output, torch.full((1, 6), 4., dtype=torch.bfloat16))
+                self.assertIs(fake_hf.eager_attention_forward, eager)
         self.assertEqual(TinyVision.constructions, 1)
         self.assertIsNone(encoders.audio_model)
+
+    def test_vision_rejects_an_unobserved_attention_path(self):
+        class UnobservedVision(torch.nn.Module):
+            def forward(self, pixels, **kwargs):
+                return SimpleNamespace(pooler_output=torch.ones(1, 6))
+
+        encoders = cli.FrozenEncoders(str(self.root), FakeProcessor(), "cpu")
+        encoders.vision_model = UnobservedVision().eval()
+        original = lambda *args, **kwargs: None
+        encoders.vision_hf = SimpleNamespace(eager_attention_forward=original)
+        with self.assertRaisesRegex(RuntimeError, "did not use the bounded eager"):
+            encoders.vision(torch.ones(4, 4), torch.tensor([1, 2, 2]))
+        self.assertIs(encoders.vision_hf.eager_attention_forward, original)
 
     def test_audio_pads_each_real_chunk_and_never_loads_text_model(self):
         seen = []

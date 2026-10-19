@@ -117,7 +117,7 @@ def make_cache_contract(model_path, processor):
     llm = importlib.import_module("vllm_omni.model_executor.models.minicpmo_5_0.minicpmo_5_0_omni_llm")
     sources = {"native_huanyu": _file_identity(native.__file__),
                "native_projector": _file_identity(llm.__file__), "hf_qwen35": _file_identity(hf.__file__)}
-    for name in ("processor.py", "audio_runtime.py"):
+    for name in ("processor.py", "audio_runtime.py", "vision_attention.py"):
         sources[name] = _file_identity(Path(__file__).parent / name)
     image_cfg = processor.image_processor.to_dict()
     # JSON roundtrip rejects opaque runtime objects rather than stringifying them.
@@ -125,7 +125,7 @@ def make_cache_contract(model_path, processor):
                            "shards": shards, "sources": sources,
                            "audio_preprocessor": processor.audio_preprocessor,
                            "image_processor": image_cfg, "audio_execution": "single_chunk_bf16_v1",
-                           "vision_execution": "single_image_hf_bf16_eager_v1"}))
+                           "vision_execution": "single_image_hf_bf16_eager_q128_v1"}))
 
 
 def _publish(path, writer, validate_new=None):

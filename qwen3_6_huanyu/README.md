@@ -133,7 +133,7 @@ python3 -u /opt/huawei/dataset/ccb_data/code/hufenyu/verl_omni_qwen36_gzq/verl_o
     /opt/huawei/dataset/ccb_data/data/omni/omni_mix_f8_genrm_sampleall/train.parquet \
     /opt/huawei/dataset/ccb_data/data/omni/omni_mix_f8_genrm_sampleall/validation.parquet \
   --model_path /opt/huawei/dataset/downloaded_models/Qwen3.6-35B-A3B-huanyu06b-iter2000-omni4b-hf-huanyu7tokens \
-  --cache_dir /opt/huawei/dataset/ccb_data/data/omni/embed_cache_huanyu_sampleall \
+  --cache_dir /opt/huawei/dataset/ccb_data/data/omni/embed_cache_huanyu_sampleall_q128 \
   --device npu:0 \
   --sampling_rate 16000 \
   --read-batch-size 16 \
@@ -146,7 +146,9 @@ python3 -u /opt/huawei/dataset/ccb_data/code/hufenyu/verl_omni_qwen36_gzq/verl_o
 
 `--read-batch-size` 是 parquet 的读取批大小，不是 NPU 推理批大小。当前为每个音频 chunk、每张图片分别编码，限制峰值显存，并使音频计算不受同批其他样本 padding 的影响；没有旧脚本的 `--batch_size`、`--num_workers`、`--max_slice_nums` 选项。视频使用与训练相同的采样 helper，采样帧计入 vision cache，启用视频音轨时也处理音轨。预计算和训练的 `MINICPMO_VIDEO_*`、`MINICPMO_USE_AUDIO_IN_VIDEO` 等解码设置必须一致；否则内容键可能不命中并明确报错。
 
-缓存保存的是音频 fold/projector 和视觉 merger 后的 BF16 `[tokens, 2048]`，不是 fbank 或原始像素。预计算不加载 35B 文本主干。音频编码复用服务器 Huanyu 实现，视觉编码使用当前训练侧 HF 类与严格匹配的 `model.visual.*` 权重。非空 DeepStack 配置不支持并报错。
+缓存保存的是音频 fold/projector 和视觉 merger 后的 BF16 `[tokens, 2048]`，不是 fbank 或原始像素。预计算不加载 35B 文本主干。音频编码复用服务器 Huanyu 实现，视觉编码使用当前训练侧 HF 类与严格匹配的 `model.visual.*` 权重。视觉 eager attention 每块最多计算 128 个 query，每块仍使用完整 K/V；不缩图、不截断视觉 token。非空 DeepStack 配置不支持并报错。
+
+当前预计算使用新的 `_q128` 目录，避免与旧版完整矩阵 eager 缓存混用。需要同步本目录的 `precompute.py`、`vision_attention.py` 和 `cache.py`；训练所有节点也需更新以读取相同 contract。原 `embed_cache_huanyu_sampleall` 目录保留，不删除、不修改 manifest。新目录生成后，再次运行相同命令仍会校验并复用其完整条目。
 
 新目录结构为 `manifest.json`、`audio/<内容哈希>.pt`、`vision/<内容哈希>.pt`。键来自真实 fbank/像素及 grid，图片绝对路径变化本身不会造成旧式路径键错配。manifest 校验 checkpoint 路径、配置、权重分片元数据/头部、前处理设置及运行时源码版本；不把整个 35B 权重读入内存做哈希。checkpoint 必须保持不可变，多节点挂载/复制需保持一致的分片元数据。缓存不兼容时需使用新目录，不能手改 manifest 绕过校验。
 
@@ -158,7 +160,7 @@ python3 -u /opt/huawei/dataset/ccb_data/code/hufenyu/verl_omni_qwen36_gzq/verl_o
 
 ```bash
 HUANYU_USE_PRECOMPUTE=1 \
-HUANYU_EMBED_CACHE_DIR=/opt/huawei/dataset/ccb_data/data/omni/embed_cache_huanyu_sampleall \
+HUANYU_EMBED_CACHE_DIR=/opt/huawei/dataset/ccb_data/data/omni/embed_cache_huanyu_sampleall_q128 \
 bash /opt/huawei/dataset/ccb_data/code/hufenyu/verl_omni_qwen36_gzq/verl_omni_ext/models/qwen3_6_huanyu/run_32card.sh
 ```
 
@@ -181,6 +183,20 @@ Huanyu 在线音频现在也逐 chunk 编码并按真实长度独立 padding，�
 附件末尾的 `bash: syntax error near unexpected token ')'` 是另一个问题：只粘贴了命令尾部的 `)`，没有对应的开头 `(`。复制本节完整命令块时保留成对括号；仅执行 `python3 ... | tee ...` 时不要额外追加 `)`。第二次执行已经没有此语法错误，但仍因硬链接失败，二者无因果关系。
 
 本次修复新增 9 项 CPU 回归，覆盖硬链接被禁用、并发发布/初始化、已有目标保护及异常清理；完整 Huanyu CPU 测试共 142 项通过。测试使用本地文件系统和故障注入，服务器实际挂载及 NPU 预计算仍需重跑验证。
+
+## 2026-10-19：第 9 条样本的视觉 eager attention OOM
+
+新日志已出现 `mode=populate rows=124016`、`created=1` 和音频 `290/4 tensors; features=40`，说明 manifest 发布及音频权重加载已通过。真正失败在 `train.parquet row 8 (zero-based)`：`FrozenEncoders.vision → Qwen3_5MoeVisionModel → eager_attention_forward → torch.matmul(query, key.T) * scaling`，单次申请 31.13 GiB，设备当时仅余 24.31 GiB。不是 Huanyu 音频网络加载失败，也不是 Ray/HCCL 通信超时。`33.60 GiB already allocated` 包含运行时中间张量，不能解释成预计算加载了 35B 文本主干。
+
+原脚本虽然每次只编码一张图片，但 eager 会构造形如 `[batch, heads, S, S]` 的注意力分数，缩放和 FP32 softmax 还需额外空间。`--read-batch-size 16` 控制 CPU parquet 读取；调成 1 仍不能消除单张大图的平方矩阵。该 HF attention 的接口和分段行为可参照 [Transformers Qwen3.5 MoE 源码](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_5_moe/modeling_qwen3_5_moe.py)，服务器的具体失败点以本次 traceback 为准。
+
+修复在本目录新增 `vision_attention.py`：仅在离线视觉前向期间拦截该模型实例的 HF eager 调用，将 query 轴按 128 分块；每块仍对完整 K/V 做原实现的缩放、FP32 softmax 和 BF16 输出。不切 key 轴，不将图片裁成互相隔离的小图，也不改变 HF 已有的图片/视频帧 `cu_seqlens` 边界。逐块释放 attention weights，按原顺序拼回 query 输出。HF 原函数在异常时也会恢复，不安装到训练或 rollout 的模型前向。
+
+guard 要求 `eval + no_grad + dropout=0 + noncausal`，并验证输出布局、dtype 和 device；关闭 attention/hidden-state 收集。若实际 HF 前向未经过 hook，则报错，不保存未经验证的输出。正常日志包含 `attention=eager_query_chunked query_chunk=128`、图片 `grid/patches/merged_tokens` 和 `vision attention verified` 的调用数、最大 query 分块及完整 key 长度。只在首张图和较大的新尺寸记录这些信息，避免逐层刷屏。
+
+分块保留完整 attention 数学语义与输入，但不同 NPU GEMM 形状不保证逐 bit 一致。manifest 因此新增 helper 源码哈希和执行标识 `single_image_hf_bf16_eager_q128_v1`，不把旧缓存冒充新执行结果。本节上方的预计算和训练命令已改用 `embed_cache_huanyu_sampleall_q128`。已有旧目录不受影响，不能手改旧 manifest 绕过检查。该方案降低 score/softmax 峰值显存，不降低全量 attention 的平方计算量；实际 NPU 数值、峰值内存和耗时仍需服务器验证。
+
+本次本地完整 CPU 回归共 157 项通过。新增测试以 FP32/BF16 小张量对照完整 eager，并覆盖 query mask、GQA、完整 K/V、不同帧不交叉、异常恢复和 hook 未命中时拒绝保存。测试不代表已在服务器 NPU 上完成预计算。
 
 ## 2026-10-19：TaskRunner 找不到 huanyu_audio
 

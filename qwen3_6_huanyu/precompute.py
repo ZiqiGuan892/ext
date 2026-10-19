@@ -25,6 +25,7 @@ if not __package__:
     __package__ = _package
 
 from .cache import HuanyuEmbeddingCache, audio_key, make_cache_contract, split_vision_inputs, vision_key
+from .vision_attention import QUERY_CHUNK_SIZE, chunked_vision_attention
 
 
 def _field(value, name, default=None):
@@ -104,6 +105,8 @@ class FrozenEncoders:
             raise ValueError(f"Unsupported precompute device: {self.device}")
         self.audio_model = None
         self.vision_model = None
+        self.vision_hf = None
+        self._largest_vision_patches = 0
         self.hidden_size = int(_field(_field(processor.config, "text_config"), "hidden_size"))
 
     def audio(self, feature, length):
@@ -148,12 +151,26 @@ class FrozenEncoders:
                                    for key, value in states.items()}, strict=True, assign=True)
             model.requires_grad_(False)
             self.vision_model = model.to(device=self.device).eval()
-            print(f"[huanyu-precompute] loaded frozen vision only: {len(states)} tensors; {cls.__name__}", flush=True)
+            self.vision_hf = hf
+            print(f"[huanyu-precompute] loaded frozen vision only: {len(states)} tensors; {cls.__name__}; "
+                  f"attention=eager_query_chunked query_chunk={QUERY_CHUNK_SIZE}", flush=True)
         merge = self.processor.spatial_merge_size ** 2
-        count = int(grid.prod()) // merge
-        with torch.no_grad(), torch.autocast(device_type=self.device.type, enabled=False):
+        patches = int(grid.prod())
+        count = patches // merge
+        report = self._largest_vision_patches == 0 or patches > max(self._largest_vision_patches, 4096)
+        if report:
+            print(f"[huanyu-precompute] vision grid={grid.tolist()} patches={patches} "
+                  f"merged_tokens={count} query_chunk={QUERY_CHUNK_SIZE}", flush=True)
+        with torch.no_grad(), torch.autocast(device_type=self.device.type, enabled=False), \
+                chunked_vision_attention(self.vision_hf, self.vision_model) as stats:
             output = self.vision_model(pixels.to(device=self.device, dtype=torch.bfloat16),
-                                       grid_thw=grid.to(device=self.device).reshape(1, 3))
+                                       grid_thw=grid.to(device=self.device).reshape(1, 3),
+                                       output_attentions=False, output_hidden_states=False)
+        if not stats["calls"]:
+            raise RuntimeError("Vision did not use the bounded eager attention hook; cache output was not saved")
+        if report:
+            print(f"[huanyu-precompute] vision attention verified: {stats}", flush=True)
+        self._largest_vision_patches = max(self._largest_vision_patches, patches)
         return vision_output_tokens(output, count, self.hidden_size)
 
 
