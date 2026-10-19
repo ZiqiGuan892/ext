@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
-# Huanyu-only entry. Source env_export.sh and start Ray on all nodes beforehand.
+# Huanyu-only entry. Source env_export_huanyu.sh and start Ray beforehand.
 # Existing backend owns batching, sampling, GenRM and training log tee.
 set -euo pipefail
 
-cd /opt/huawei/dataset/ccb_data/code/hufenyu/verl_omni_qwen36_gzq
+# Use the root selected by the Huanyu environment; without it, follow this
+# checkout's location so copying the plugin cannot redirect into another copy.
+export PROJECT_ROOT="${PROJECT_ROOT:-${QWEN36_HUANYU_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}}"
+cd "${PROJECT_ROOT}"
 
 # The driver and NEW Ray workers must import the same Huanyu-enabled checkout.
 # Exporting PYTHONPATH only in this shell does not establish the Ray job's env.
@@ -76,7 +79,7 @@ echo "[huanyu] expanded prompt=${_huanyu_prompt_length} rollout prompt=${_huanyu
 # Keep HF config.architectures intact. architecture below selects only the
 # verl training adapter; the RM retains its independent Qwen3.5 registration.
 # The inherited vLLM pipeline already dispatches audio_config to Huanyu.
-exec bash /opt/huawei/dataset/ccb_data/code/hufenyu/verl_omni_qwen36_gzq/examples/qwen3_6_whisper/run_qwen36_whisper_32card.sh \
+exec bash "${PROJECT_ROOT}/examples/qwen3_6_whisper/run_qwen36_whisper_32card.sh" \
     "$@" \
     actor_rollout_ref.model.external_lib=verl_omni_ext.models.qwen3_6_huanyu \
     actor_rollout_ref.model.architecture=Qwen36HuanyuForTraining \
