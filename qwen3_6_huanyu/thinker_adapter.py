@@ -78,6 +78,7 @@ class Qwen36HuanyuThinkerAdapter(OmniModelBase):
 
     @classmethod
     def configure_processor(cls, model_path, model_config):
+        from .aqa_position_ids import install_huanyu_aqa_position_ids
         from .audio_training import validate_audio_mode
         from .processor import build_huanyu_processor
         from .rollout_inputs import install_huanyu_rollout_inputs
@@ -86,6 +87,7 @@ class Qwen36HuanyuThinkerAdapter(OmniModelBase):
         validate_audio_mode(model_config)
         processor = build_huanyu_processor(model_path, model_config)
         install_huanyu_rollout_inputs()
+        install_huanyu_aqa_position_ids()
         return processor
 
     @classmethod

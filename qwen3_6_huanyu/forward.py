@@ -15,6 +15,7 @@ import torch
 from torch.nn import functional as F
 
 from .audio_alignment import find_audio_bounds, insert_audio_embeddings
+from .aqa_position_ids import restore_huanyu_aqa_positions
 
 
 _ACTIVE_AUDIO = ContextVar("huanyu_training_audio", default=None)
@@ -215,6 +216,8 @@ def install_huanyu_forward(module, *, start_token_id, end_token_id, placeholder_
         ids = args[0] if args else kwargs.get("input_ids")
         if ids is None or not isinstance(ids, torch.Tensor) or ids.ndim != 2:
             raise ValueError("Huanyu training requires input_ids [B,S] and use_remove_padding=false")
+        if "position_ids" in kwargs:
+            kwargs["position_ids"] = restore_huanyu_aqa_positions(kwargs["position_ids"], ids)
         if kwargs.get("inputs_embeds") is not None:
             raise ValueError("Huanyu forward builds audio embeddings from input_ids; inputs_embeds is unsupported")
         if use_precompute:

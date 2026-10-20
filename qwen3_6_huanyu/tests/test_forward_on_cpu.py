@@ -1,10 +1,12 @@
 """Exercise the Huanyu/HF forward boundary without Transformers or vLLM."""
 
 import importlib
+import os
 from pathlib import Path
 import sys
 from types import ModuleType
 import unittest
+from unittest.mock import patch
 
 import torch
 from torch import nn
@@ -87,6 +89,23 @@ class ForwardTests(unittest.TestCase):
         output.sum().backward()
         torch.testing.assert_close(model.embedding.weight.grad[9], torch.ones(4))
         torch.testing.assert_close(model.embedding.weight.grad[4], torch.zeros(4))
+
+    def test_aqa_transport_positions_are_restored_before_hf_forward(self):
+        audio = torch.ones(2, 4, requires_grad=True)
+        model, _ = self.make_model([audio])
+        ids = torch.tensor([[9, 2, 4, 4, 3]])
+        positions = torch.arange(5).unsqueeze(0)
+        with patch.dict(os.environ, {"HUANYU_AQA_AUDIO_TRAIN": "1"}):
+            output = model(
+                ids, position_ids=positions,
+                huanyu_audio_features=[torch.ones(40, 16)], huanyu_audio_lengths=[16],
+            )
+        restored = model.kwargs_seen["position_ids"]
+        self.assertEqual(tuple(restored.shape), (4, 1, 5))
+        torch.testing.assert_close(restored, positions.unsqueeze(0).expand(4, -1, -1))
+        output.sum().backward()
+        torch.testing.assert_close(audio.grad, torch.ones_like(audio))
+        torch.testing.assert_close(model.embedding.weight.grad[9], torch.ones(4))
 
     def test_text_only_forward_never_encodes_audio(self):
         model, calls = self.make_model([])

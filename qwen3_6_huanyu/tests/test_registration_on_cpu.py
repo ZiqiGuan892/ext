@@ -116,6 +116,22 @@ class RegistrationTests(unittest.TestCase):
         self.assertEqual(self.rollout_registry, self.original_rollouts)
         self.assertEqual(self.model.config.architectures, [HF_ARCHITECTURE])
 
+    def test_processor_configuration_installs_aqa_position_bridge(self):
+        processor = ModuleType(f"{PACKAGE}.processor")
+        processor.build_huanyu_processor = Mock(return_value=object())
+        rollout = ModuleType(f"{PACKAGE}.rollout_inputs")
+        rollout.install_huanyu_rollout_inputs = Mock()
+        aqa = ModuleType(f"{PACKAGE}.aqa_position_ids")
+        aqa.install_huanyu_aqa_position_ids = Mock()
+        with patch.dict(sys.modules, {
+            processor.__name__: processor, rollout.__name__: rollout, aqa.__name__: aqa,
+        }):
+            result = self.adapter.configure_processor("checkpoint", self.config)
+        self.assertIs(result, processor.build_huanyu_processor.return_value)
+        processor.build_huanyu_processor.assert_called_once_with("checkpoint", self.config)
+        rollout.install_huanyu_rollout_inputs.assert_called_once_with()
+        aqa.install_huanyu_aqa_position_ids.assert_called_once_with()
+
     def test_valid_model_uses_huanyu_loader_freezes_audio_and_installs_new_forward(self):
         result = self.adapter.configure_model(self.model, self.config)
         self.install_entropy.assert_called_once_with()
