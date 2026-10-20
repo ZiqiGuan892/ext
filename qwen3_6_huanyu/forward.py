@@ -149,7 +149,8 @@ def _cached_samples(ids, audio_chunks, vision_chunks, lengths, audio_counts, ima
 
 
 def install_huanyu_forward(module, *, start_token_id, end_token_id, placeholder_token_id, encode_audio=None,
-                           use_precompute=False, image_token_id=None, spatial_merge_size=2):
+                           use_precompute=False, image_token_id=None, spatial_merge_size=2,
+                           require_audio_only=False):
     """Install a model-instance-only wrapper; no HF class or shared file changes."""
     if getattr(module, _FLAG, False):
         return module
@@ -163,6 +164,8 @@ def install_huanyu_forward(module, *, start_token_id, end_token_id, placeholder_
                       placeholder_token_id=placeholder_token_id)
     if use_precompute and (image_token_id is None or spatial_merge_size < 1):
         raise ValueError("Huanyu precompute requires image token ID and spatial merge size")
+    if use_precompute and require_audio_only:
+        raise ValueError("Trainable Huanyu audio requires online encoding, not cached embeddings")
 
     def inject_audio(embedding_module, args, output):
         active = _ACTIVE_AUDIO.get()
@@ -240,6 +243,12 @@ def install_huanyu_forward(module, *, start_token_id, end_token_id, placeholder_
             raise ValueError("Huanyu cached inputs require HUANYU_USE_PRECOMPUTE=1 on training workers")
         batch, lens = _prepare_features(features, lengths)
         actual_counts = (ids == start_token_id).sum(dim=1).tolist()
+        if require_audio_only:
+            if batch is None or any(count == 0 for count in actual_counts):
+                raise ValueError("Huanyu audio training requires audio in every AQA sample on every rank")
+            if any(kwargs.get(key) is not None and kwargs[key].numel() for key in
+                   ("pixel_values", "pixel_values_videos", "image_grid_thw", "video_grid_thw")):
+                raise ValueError("Huanyu audio training requires AQA audio-only inputs; image/video inputs are unsupported")
         if chunk_counts is not None:
             counts = _lengths(chunk_counts)
             if counts != actual_counts:

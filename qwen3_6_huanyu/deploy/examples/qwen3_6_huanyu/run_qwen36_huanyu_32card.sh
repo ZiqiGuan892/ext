@@ -2,15 +2,15 @@
 # 32 卡全量跑 Qwen3.6-Huanyu 的 **thin wrapper**。
 #
 # 它不重写训练命令——真正的 verl 训练命令、前置自检、数据集 schema 检查、尺寸
-# 硬检查全在共享后端 run_qwen36_whisper_gspo_npu.sh 里；OmniMix 数据集 + GenRM 判官
-# 的参数由 run_qwen36_whisper_gspo_npu_omni_mix_genrm.sh 追加（它再 exec 后端）。
+# 硬检查全在共享后端 run_qwen36_huanyu_gspo_npu.sh 里；OmniMix 数据集 + GenRM 判官
+# 的参数由 run_qwen36_huanyu_gspo_npu_omni_mix_genrm.sh 追加（它再 exec 后端）。
 # 本脚本合并原 no_length_filter.sh 的配置：
 #   1. 选择 /vllm-workspace/vllm-omni，关闭 train/validation 的长度预筛；
 #   2. 指定完整 Huanyu checkpoint；
 #   3. 保留 32 卡默认配置（global 16 + reward 16 = 32，NNODES=1）；
 #   4. 默认关闭累计 frequency_penalty，保留环境变量显式覆盖。
 #
-# 口径来源：run_qwen36_whisper_gspo_npu.sh 的「Ray 侧资源账本校验」段
+# 口径来源：run_qwen36_huanyu_gspo_npu.sh 的「Ray 侧资源账本校验」段
 #     （grep -n "Ray cluster only has" 定位；我加过注释后行号会漂，别写死行号）
 #     _want = NUM_NPUS * NNODES + REWARD_POOL_NPUS   # 必须 ≤ ray 集群 NPU
 # 32 卡满配 = global 16（actor/rollout）×1 + reward 16（genrm 判官）。
@@ -20,18 +20,19 @@
 # 32 NPU Ray 集群。本脚本不 source 环境、不安装依赖、不 start/stop ray。
 # 此处导出路径仅影响新进程，不能切换已启动的旧 Ray Worker。
 #
-# 用法（集群就绪后，repo 根目录；文件名保留原名）：
-#   bash examples/qwen3_6_whisper/run_qwen36_whisper_32card.sh
+# 用法（由 run_huanyu.sh 传入 Huanyu 适配参数后调用）：
+#   bash examples/qwen3_6_huanyu/run_qwen36_huanyu_32card.sh
 #
 # 起跑后等自检通过、看到一条训练 loss 后，核对 fp 生效证据（每进程一行）：
-#   grep "rollout-sampling.*frequency_penalty" run_qwen36_whisper_gspo_npu.log
+#   grep "rollout-sampling.*frequency_penalty" run_qwen36_huanyu_gspo_npu.log
 #   diag 应看到 frequency_penalty←0.0；非默认惩罚仍由 sampling_params 日志列出。
 
 set -euo pipefail
 
-# 优先继承 env 的项目根；独立调用时从服务器脚本位置推导。
+# 定位 repo 根：本脚本在 examples/qwen3_6_huanyu/ 下。
 export PROJECT_ROOT="${PROJECT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
-cd "$PROJECT_ROOT"
+_REPO_ROOT="${PROJECT_ROOT}"
+cd "$_REPO_ROOT"
 
 # ---------------------------------------------------------------- 0) vLLM-Omni 版本及长度预筛
 _huanyu_vllm_omni_root=/vllm-workspace/vllm-omni
@@ -81,8 +82,8 @@ echo "===   ROLLOUT_FREQUENCY_PENALTY=${ROLLOUT_FREQUENCY_PENALTY}  ROLLOUT_REPE
 #
 # 入口是 OmniMix+GenRM 那层（目标跑法：GenRM 判官打分），不是裸后端 —— 它拿到
 # 本脚本 export 的 NUM_NPUS/NNODES/ROLLOUT_TP/REWARD_POOL_NPUS/fp 后，追加
-# _OMNI_MIX_ARGS + _REWARD_ARGS 再 exec 后端。日志仍是 run_qwen36_whisper_gspo_npu.log
+# _OMNI_MIX_ARGS + _REWARD_ARGS 再 exec 后端。日志仍是 run_qwen36_huanyu_gspo_npu.log
 # （后端 tee 的），所以上面那条 grep 证据行照样有效。
 # 最后覆盖，确保下游默认值或传入参数不会重新打开长度预筛。
-exec bash "${PROJECT_ROOT}/examples/qwen3_6_whisper/run_qwen36_whisper_gspo_npu_omni_mix_genrm.sh" \
+exec bash "${PROJECT_ROOT}/examples/qwen3_6_huanyu/run_qwen36_huanyu_gspo_npu_omni_mix_genrm.sh" \
     "$@" data.filter_overlong_prompts=false

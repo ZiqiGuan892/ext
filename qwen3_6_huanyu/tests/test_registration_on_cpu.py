@@ -106,6 +106,7 @@ class RegistrationTests(unittest.TestCase):
         # Here, check that the adapter delegates to it before wiring forward.
         module.model.audio_encoder = torch.nn.Linear(2, 2)
         module.model.audio_projection = torch.nn.Linear(2, 2)
+        module.model._huanyu_audio_runtime = {}
         return module
 
     def test_alias_registration_leaves_whisper_and_reward_names_unchanged(self):
@@ -147,6 +148,36 @@ class RegistrationTests(unittest.TestCase):
             self.model, start_token_id=10, end_token_id=11, placeholder_token_id=12,
             use_precompute=True, image_token_id=13, spatial_merge_size=2,
         )
+
+    def test_explicit_unfreeze_enables_both_audio_modules_before_optimizer(self):
+        self.config.override_config = {"huanyu_freeze_audio": False}
+        self.adapter.configure_model(self.model, self.config)
+        self.assertFalse(self.model.config.huanyu_freeze_audio)
+        for part in (self.model.model.audio_encoder, self.model.model.audio_projection):
+            self.assertTrue(all(parameter.requires_grad for parameter in part.parameters()))
+        self.assertTrue(all(not p.requires_grad for p in self.model.model.visual.parameters()))
+        args = self.install_forward.call_args.kwargs
+        self.assertTrue(args["require_audio_only"])
+        self.assertEqual(args["encode_audio"].__name__, "encode_trainable_huanyu_audio")
+        self.assertNotIn("use_precompute", args)
+        self.assertTrue(self.model.model._huanyu_audio_runtime["checkpoint_chunks"])
+        self.assertEqual(self.model.config.architectures, [HF_ARCHITECTURE])
+
+    def test_unfreeze_cannot_consume_cache_even_without_legacy_tune_env(self):
+        self.config.override_config = {"huanyu_freeze_audio": False}
+        with patch.dict(os.environ, {"HUANYU_USE_PRECOMPUTE": "1", "HUANYU_EMBED_CACHE_DIR": "cache"}):
+            with self.assertRaisesRegex(ValueError, "precomputed embeddings cannot train audio"):
+                self.adapter.configure_model(self.model, self.config)
+        self.attach.assert_not_called()
+        self.install_forward.assert_not_called()
+
+    def test_hf_config_unfreeze_and_explicit_refreeze_override(self):
+        self.model.config.huanyu_freeze_audio = False
+        self.config.override_config = {"huanyu_freeze_audio": True}
+        self.adapter.configure_model(self.model, self.config)
+        self.assertTrue(self.model.config.huanyu_freeze_audio)
+        self.assertTrue(all(not p.requires_grad for p in self.model.model.audio_encoder.parameters()))
+        self.assertNotIn("encode_audio", self.install_forward.call_args.kwargs)
 
     def test_cached_vision_cannot_be_tuned_or_require_deepstack(self):
         self.model.config.vision_config = SimpleNamespace(deepstack_visual_indexes=[1])

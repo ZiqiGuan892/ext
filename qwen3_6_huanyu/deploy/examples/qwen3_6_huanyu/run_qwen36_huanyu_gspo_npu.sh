@@ -36,11 +36,27 @@
 # -----------------------------------------------------------------------------
 set -x
 
+# Direct launches bypass run_q36_job.sh, which installs the local entry points.
+# A source checkout on sys.path is insufficient: plugin discovery uses installed
+# distribution metadata. Install before the first Python/plugin import.
+export PROJECT_ROOT="${PROJECT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+EXT_ROOT="${PROJECT_ROOT}"
+export PYTHONPATH="${EXT_ROOT}${PYTHONPATH:+:$PYTHONPATH}"
+# Match the job launcher for shared mounts. setuptools-scm strips Git environment
+# overrides, so the trust entry must be in Git's configuration before installation.
+git config --global --add safe.directory "${EXT_ROOT}" || exit $?
+python3 -m pip install -e "${EXT_ROOT}" --no-deps --no-build-isolation || exit $?
+
 # =============================================================================
 # §1. Ascend / vLLM 运行时
 # =============================================================================
 export CPATH=/usr/include${CPATH:+:$CPATH}
-export VLLM_ASCEND_ENABLE_NZ=0            # 配合 additional_config.weight_nz_mode=0
+# 注意：VLLM_ASCEND_ENABLE_NZ **没有任何代码读它**（vllm_ascend 全树 grep 无命中），
+# 留着只为不惊动历史，别指望它生效。真正关 NZ 的是下面命令里的
+# actor_rollout_ref.rollout.engine_kwargs.vllm_omni.additional_config.weight_nz_mode=0
+# —— wake_up() 读的是各引擎自己的 additional_config（vllm_ascend/utils.py:281
+# 明确 "Get config value instead of env"），free_cache_engine=True 时必过这一关。
+export VLLM_ASCEND_ENABLE_NZ=0
 # 改动 A/B/C：加载链三件套（verl_omni 上游注册 + out-of-tree 包 + GP-004 vllm-omni 侧）
 export VERL_USE_EXTERNAL_MODULES=verl_omni,verl_omni_ext
 export VLLM_OMNI_EXTERNAL_MODULES=verl_omni_ext.models.qwen3_6_whisper.vllm_omni
@@ -107,8 +123,70 @@ export VERL_USE_EXTERNAL_MODULES="verl_omni,verl_omni_ext"
 #    梯度检查点已经开着（enable_gradient_checkpointing=true），
 #    而 13.txt 里实际序列只有 180~270 token，激活本来就不大，
 #    这个 offload 买到的显存很有限，却在最要命的时刻占着锁页。默认关。
+#    ⚠️ 2026-10-14 实测：这里原本写成 `:-true`，与本节注释自相矛盾，且**必崩**。
+#    开着 activation offload + enable_gradient_checkpointing=true 时，反传里
+#    tensor_pop 拿到的不是张量而是占位元组 (key, shape)（activation_offload.py:311
+#    bulk_offload_group 写回），说明该 group 还没被 bulk_reload_group 换回真张量
+#    —— 前/反向的 group 计数错位了。该方案假定前后向按同一串 FSDP layer 镜像执行
+#    （num_offload_group = len(fsdp layers)-1，逐层 commit），本模型多了
+#    visual/audio 塔、forward 又被 verl_omni_ext 打过补丁，这个假定不成立。
+#    表现：16 卡全中，`assert not isinstance(tensor, tuple)`（:295）—— 不是 OOM，
+#    显存指标全干净。默认关；genrm 入口脚本第 169 行也显式设了 false。
 export MINICPMO_FSDP2_PIN_MEMORY=${MINICPMO_FSDP2_PIN_MEMORY:-0}  # 0=fsdp pin 补丁生效，1=恢复 verl 原样
-ACTIVATION_OFFLOAD=${ACTIVATION_OFFLOAD:-true}
+ACTIVATION_OFFLOAD=${ACTIVATION_OFFLOAD:-false}
+
+# 3) 反向预取：FSDP2 的**默认**反向预取按「静态前向顺序」猜下一个要 unshard 的单元
+#    （torch `_fsdp_param_group._backward_prefetch` 自己的注释：may have mistargeted
+#    prefetches if not all modules used in forward are used in this backward）。
+#    本模型图像/音频 rollout 落在不同 DP rank（实测 12 图像 / 4 音频），两组实际执行的
+#    子图不同 ⇒ 猜偏 ⇒ 其中一组多发一条 all-gather ⇒ 集合通信序列错位 ⇒ HCCL 按算子
+#    序号配对 ⇒ 第 1 步 backward 死锁（run#78 实测：逐条对齐到 i=1643，图像组在 1644
+#    多发一块视觉块的 all_gather）。off = 补丁把预取目标指成自身（等价于不预取，
+#    `unshard()` 已 unsharded 时早退、不发集合通信），代价是失去反向的重量叠；
+#    on 恢复 torch 默认（会死锁）。补丁在 fsdp_backward_prefetch.py，见其 docstring。
+export Q36_BACKWARD_PREFETCH=${Q36_BACKWARD_PREFETCH:-off}  # off=不预取（默认，防死锁），on=torch 默认
+
+# 4) GDN 循环状态精度。当前默认走本仓库 FP32 recurrence，保留已验证的 prefill。
+#    以下是 legacy BF16 路径的历史诊断；FP32_REFERENCE=1 时不执行降精度补丁。
+#    Qwen3.6-whisper 的 LM 40 层里 30 层是 linear_attention（GDN），ckpt config.json 的
+#    text_config.mamba_ssm_dtype='float32' ⇒ vLLM 把 GDN 的 ssm_state 推成 fp32，而
+#    vllm-ascend 的自定义算子 npu_recurrent_gated_delta_rule 原生支持 DT_FLOAT
+#    （vllm_ascend/ops/gdn.py:469/494/578 就是不加转换直接传，csrc 的 op_host 声明
+#    Input("state").DataType({DT_BF16, DT_FLOAT})）。
+#    但本包 ensure_ascend_gdn_bf16_patched()（models/qwen3_6_whisper/__init__.py:67）
+#    却把它拦下来：每步 decode 前 .to(bfloat16)、调用后 copy_ 回 fp32 buffer ⇒
+#    整条前缀的循环状态每步被舍入一次（bf16 ≈ 3 位十进制），30 层 × 上百步 decode 累积。
+#    形态吻合：先几百字正常 → 忽然跑偏 → 字级复读 → 自己停在换行；越长越容易崩，
+#    且与模态无关（10-13 纯文本 GSM8K 37/44 复读、10-14 图像 17/21，短音频 0 复读），
+#    采样惩罚不能修复循环状态的数值失配；过强的累计惩罚还会损伤长回答。
+#    0 = 原 dtype 直传；1 = 保留历史行为（每步降 bf16）。
+#    对照基线（genrm_dump_qwen36 里 repeat_hint 非空比例）：10-13 文本 37/44=84%，
+#    10-14 16 时那轮 18/26=69%。设 0 后这个比例应显著下降。
+#
+#    ★ 2026-10-14 19:38 实测：设 0 **直接崩**，默认只能留 1。原因不在本包：
+#      CANN 9.1.0 自己也装了同名算子（built-in），而 vllm-ascend 的扩展
+#        vllm_ascend_C.cpython-312-aarch64-linux-gnu.so 的 NEEDED 里是 **CANN 的
+#        /usr/local/Ascend/cann-9.1.0/aarch64-linux/lib64/libopapi.so**
+#        （它定义了 aclnnRecurrentGatedDeltaRule），
+#      厂商那份支持 fp32 的 vendors/custom_transformer/op_api/lib/libcust_opapi.so
+#        **全仓没有任何 .so 把它列进 NEEDED**（只有自引用），所以它根本不会被加载。
+#      结果运行时走 CANN 内置实现 → 报
+#        RuntimeError: call aclnnRecurrentGatedDeltaRule failed,
+#        AclNN_Parameter_Error(EZ1001): Tensor params.state not implemented for
+#        DT_FLOAT, should be in dtype support list [DT_BFLOAT16,]
+#      （厂商 csrc 源码里 STATE_TYPE_SUPPORT_LIST 是 {DT_BF16, DT_FLOAT}，但那是
+#        源码，编进 libopapi.so 的是 CANN 自己那份 bf16-only 的。）
+#      所以「GDN 降 bf16」不是随便加的，是这颗 CANN 上的硬约束；要试 fp32 需要
+#      让厂商库赢过 CANN 的，唯一不改 /vllm-workspace 的办法是预加载：
+#        LD_PRELOAD=/vllm-workspace/vllm-ascend/vllm_ascend/_cann_ops_custom/vendors/custom_transformer/op_api/lib/libcust_opapi.so \
+#        MINICPMO_GDN_STATE_BF16=0 bash examples/qwen3_6_huanyu/run_qwen36_huanyu_32card.sh
+#      风险：厂商库里同名 l0op::/aclnn* 符号会全局抢占（含其它自定义算子），
+#      可能引发「数字慢慢不对」这类静默问题 —— 只作为一次性的对照组实验跑。
+# Use the local FP32 decode recurrence instead of rounding the whole recurrent cache
+# on every decode step. This avoids the CANN DT_FLOAT limitation without
+# modifying vllm-workspace or relying on LD_PRELOAD symbol resolution.
+export MINICPMO_GDN_FP32_REFERENCE=${MINICPMO_GDN_FP32_REFERENCE:-1}
+export MINICPMO_GDN_STATE_BF16=${MINICPMO_GDN_STATE_BF16:-1}  # legacy A/B path when FP32_REFERENCE=0
 
 # NPU 运行时调优（取自参考脚本 §3，均为已验证值）
 export MULTI_STREAM_MEMORY_REUSE=2
@@ -124,14 +202,56 @@ export CPU_AFFINITY_CONF=1
 unset PYTORCH_NPU_ALLOC_CONF
 
 # =============================================================================
-# §2. HCCL / 通信超时（多机必备，取自参考脚本已验证值）
+# §2. HCCL / 通信超时
 # =============================================================================
-export HCCL_EXEC_TIMEOUT=7200
-export HCCL_CONNECT_TIMEOUT=7200
-export HCCL_IF_BASE_PORT=64000
-export ACL_DEVICE_SYNC_TIMEOUT=7200
-export TORCH_DIST_TIMEOUT=3600
-export HCCL_OP_EXPANSION_MODE=AIV
+# 一律写成 ${VAR:-默认}：**已经设过的值优先**。
+#
+# 2026-10-10 的挂起事故（log 见 qwen36_whisper_full.log）暴露出这六行是一把
+# "静默覆盖"的刀：本脚本原来无条件 `export HCCL_EXEC_TIMEOUT=7200`，而
+# env_export.sh 同一个变量写的是 `export HCCL_EXEC_TIMEOUT=${HCCL_EXEC_TIMEOUT:-300}`
+# ——后者只在未设置时兜底，于是 env_export.sh 的排障值一律被这里盖回 7200。
+# 实测证据（本文件 worker 侧 runtime_env 注入清单，log 755 行）：
+#
+#   变量                       env_export.sh 想要   实际生效
+#   HCCL_EXEC_TIMEOUT          300                  7200
+#   ACL_DEVICE_SYNC_TIMEOUT    900                  7200
+#   TORCH_DIST_TIMEOUT         600                  3600
+#   HCCL_IF_BASE_PORT          故意不设              64000
+#
+# 后果就是 env_export.sh 自己注释里点名批评过的那件事："它们不是容错余量，
+# 是挂了多久才报错"。那一轮 16 卡卡死 18 分钟，HCCL 的算子级报错（本该 300s
+# 点名是哪次集合通信、哪个 peer）一次都没打出来，手里只剩设备侧的 kernel 超时。
+#
+# 改成 ${VAR:-...} 之后：source 过 env_export.sh 的跑法用 env_export 的值，
+# 没 source 的（多机参考脚本跑法）仍是原来这组默认值，行为不变。
+export HCCL_EXEC_TIMEOUT=${HCCL_EXEC_TIMEOUT:-7200}
+export HCCL_CONNECT_TIMEOUT=${HCCL_CONNECT_TIMEOUT:-7200}
+# HCCL_IF_BASE_PORT 与 HCCL_*_SOCKET_PORT_RANGE="auto" 是两套互斥的端口分配
+# 机制。env_export.sh 里"故意不设"这条，指的是它自己的文件不提供默认值；
+# 本文件的 64000 只在外部完全没设时才生效（要彻底走 auto，用 `unset
+# HCCL_IF_BASE_PORT` 或下面那条 echo 确认清楚再决定，别两边都开着）。
+export HCCL_IF_BASE_PORT=${HCCL_IF_BASE_PORT:-64000}
+export ACL_DEVICE_SYNC_TIMEOUT=${ACL_DEVICE_SYNC_TIMEOUT:-7200}
+export TORCH_DIST_TIMEOUT=${TORCH_DIST_TIMEOUT:-3600}
+export HCCL_OP_EXPANSION_MODE=${HCCL_OP_EXPANSION_MODE:-AIV}
+
+# 生效值回声。上面那类"两个文件都 export、谁覆盖谁"的 bug 每次都是靠
+# 事后翻 runtime_env 才发现的；这四行让它变成启动 3 秒就能看到的东西。
+echo "[env] HCCL_EXEC_TIMEOUT=${HCCL_EXEC_TIMEOUT} ACL_DEVICE_SYNC_TIMEOUT=${ACL_DEVICE_SYNC_TIMEOUT} TORCH_DIST_TIMEOUT=${TORCH_DIST_TIMEOUT} HCCL_CONNECT_TIMEOUT=${HCCL_CONNECT_TIMEOUT}"
+echo "[env] HCCL_OP_EXPANSION_MODE=${HCCL_OP_EXPANSION_MODE} HCCL_IF_BASE_PORT=${HCCL_IF_BASE_PORT:-<unset>} MINICPMO_HANG_PROBE=${MINICPMO_HANG_PROBE:-0} MINICPMO_HANG_DUMP_DIR=${MINICPMO_HANG_DUMP_DIR:-<unset>}"
+# 对照实验的开关回声。2026-10-10 那轮挂起，事后是靠翻 runtime_env 注入清单才确认
+# 「MINICPMO_DISABLE_IMAGE_EXPAND 当时根本没进到 worker」——注入清单是 1000 行
+# 之后的数字，而这一行在启动 3 秒处。想让这轮日志有意义，先看这一行。
+echo "[env] MINICPMO_DISABLE_IMAGE_EXPAND=${MINICPMO_DISABLE_IMAGE_EXPAND:-<unset>} MINICPMO_DISABLE_TRAIN_PROMPT_EXPAND=${MINICPMO_DISABLE_TRAIN_PROMPT_EXPAND:-<unset>} MINICPMO_IMAGE_SPAN_DROP_SENTINELS=${MINICPMO_IMAGE_SPAN_DROP_SENTINELS:-<unset>} MINICPMO_MM_ALIGN_STRICT=${MINICPMO_MM_ALIGN_STRICT:-<unset>} MINICPMO_ROLLOUT_DIAG=${MINICPMO_ROLLOUT_DIAG:-1} MINICPMO_GDN_STATE_BF16=${MINICPMO_GDN_STATE_BF16:-<unset>}"
+
+# [2026-10-13] 判官降级分：omni_mix **没有规则评分器**，判官一旦塌缩/请求失败，
+# 旧的 rule 兜底只会落到 ``rule_failed:NotImplementedError`` ⇒ 该样本 0 分
+# （而且和「判官判它错」长得一模一样）。``similarity`` 改成量参考答案与学生答案的
+# 字符 2-gram Dice 相似度，给一个粗粒度但**非零**的止损分；``genrm_fallback=1.0``
+# 依旧标记着「这一分不是判出来的」，所以在 dump/指标里仍然分得开。
+# 取值：rule（旧默认）/ zero / similarity（omni_mix 推荐）。
+export GENRM_FALLBACK_ON_ERROR=${GENRM_FALLBACK_ON_ERROR:-similarity}
+echo "[env] GENRM_FALLBACK_ON_ERROR=${GENRM_FALLBACK_ON_ERROR}"
 
 # 网卡名：多机 HCCL/GLOO 通信用，不可为空否则可能选错网卡
 SOCKET_IFNAME=${SOCKET_IFNAME:-eth0}
@@ -168,7 +288,7 @@ set -eo pipefail
 
 # 改动 G：out-of-tree 包根（本仓根）= ext 包目录的父两级；改名 EXT_ROOT 避免
 # checkpoint / tensorboard 默认写到上游 verl-omni 仓里
-EXT_ROOT=${PROJECT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}
+# EXT_ROOT was resolved before installing the local plugin above.
 
 # =============================================================================
 # §4. 路径与规模参数
@@ -232,7 +352,27 @@ ROLLOUT_TP=${ROLLOUT_TP:-4}
 # device id，报 aclInit error 107001 "Invalid device ID"。这里提前拦掉。
 _DETECTED_NPUS=$(ls -d /dev/davinci[0-9]* 2>/dev/null | wc -l | tr -d ' ')
 NUM_NPUS=${NUM_NPUS:-${_DETECTED_NPUS:-8}}
-NNODES=${NNODES:-${VC_WORKER_NUM:-${MA_NUM_HOSTS:-1}}}
+# [2026-10-13] 节点数要连**来源**一起记：本机环境里有 MA_NUM_HOSTS=2（平台注入的），
+# 旧写法默默把它当 NNODES=2 ⇒ global pool 16x2=32，再加 reward pool 的 16 卡 ⇒
+# trainer 里报 "Total available GPUs 32.0 is less than total desired GPUs 48"。
+# 那 16 张卡是**凭空多出来的**，因为本机就一个节点。来源写清楚，warning 才说得清。
+if [ -n "${NNODES:-}" ]; then
+    _NNODES_SRC="显式 NNODES"
+elif [ -n "${VC_WORKER_NUM:-}" ]; then
+    NNODES=${VC_WORKER_NUM}
+    _NNODES_SRC="VC_WORKER_NUM"
+elif [ -n "${MA_NUM_HOSTS:-}" ]; then
+    NNODES=${MA_NUM_HOSTS}
+    _NNODES_SRC="MA_NUM_HOSTS(平台注入，通常与『本机实际跑几个节点』无关)"
+else
+    NNODES=1
+    _NNODES_SRC="默认 1"
+fi
+if [ "${NNODES}" -gt 1 ] && [ "${_NNODES_SRC}" != "显式 NNODES" ]; then
+    echo "WARNING: NNODES=${NNODES} 是从 ${_NNODES_SRC} 推出来的，不是显式设置。" >&2
+    echo "         单机多卡请显式 export NNODES=1；否则 global pool = NUM_NPUS x NNODES 会翻倍，" >&2
+    echo "         叠加 reward pool 后超出集群卡数（真机形态：desired 48 > available 32）。" >&2
+fi
 
 if [ "${NUM_NPUS}" -le 0 ] 2>/dev/null; then
     echo "FATAL: NUM_NPUS=${NUM_NPUS} is not a positive integer."
@@ -260,11 +400,20 @@ if command -v ray >/dev/null 2>&1; then
     _ray_npu=$(ray status 2>/dev/null | grep -oE '[0-9]+\.[0-9]+/[0-9]+\.[0-9]+ NPU' | head -n1 | sed 's#.*/##; s# NPU##' || true)
     if [ -n "${_ray_npu:-}" ]; then
         _ray_npu_int=$(printf '%.0f' "${_ray_npu}")
-        _want=$((NUM_NPUS * NNODES))
-        echo "Ray cluster reports ${_ray_npu_int} NPU, this job wants ${_want}."
+        # [2026-10-13] 加上 reward pool —— trainer 的资源账本是**所有 pool 相加**
+        # （trainer_base._create_resource_pools：global_pool + reward_pool），
+        # 只算 global 会让 32>=32 通过、然后在 trainer 里以一条看不懂的消息炸掉。
+        # 该值与启动命令里的 reward.reward_model.n_gpus_per_node 必须一致。
+        REWARD_POOL_NPUS=${REWARD_POOL_NPUS:-16}
+        _want=$(( NUM_NPUS * NNODES + REWARD_POOL_NPUS ))
+        echo "Ray cluster reports ${_ray_npu_int} NPU; this job wants ${_want}" \
+             "= global(${NUM_NPUS}x${NNODES}) + reward(${REWARD_POOL_NPUS})."
         if [ "${_ray_npu_int}" -lt "${_want}" ]; then
-            echo "FATAL: Ray cluster only has ${_ray_npu_int} NPU but the job needs ${_want}."
-            echo "       Restart Ray with --resources='{\"NPU\": ${NUM_NPUS}}' per node."
+            echo "FATAL: Ray cluster only has ${_ray_npu_int} NPU but the job needs ${_want}," >&2
+            echo "       of which global pool takes ${NUM_NPUS}x${NNODES} and the reward pool" >&2
+            echo "       (enable_resource_pool=true) takes ${REWARD_POOL_NPUS}." >&2
+            echo "       先查 NNODES 是否被平台注入的 MA_NUM_HOSTS/VC_WORKER_NUM 顶大了" >&2
+            echo "       (单机请 export NNODES=1)，再考虑重启 Ray 或缩小 reward pool。" >&2
             exit 1
         fi
     fi
@@ -414,15 +563,43 @@ fi
 #     python3 -c "import json,sys; c=json.load(open(sys.argv[1]+'/config.json')); \
 #                 print(c.get('vocab_size') or c.get('llm_config',{}).get('vocab_size'))" ${MODEL_PATH}
 # 若显著大于 248144，按比例把 L 压一档再起跑。
-MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-2048}
+# [2026-10-13] 默认 2048 → 8448：这个值同时是三样东西的上限 ——（a）文本过滤
+# data.max_prompt_length，（b）rollout.prompt_length = 本值 + 32，（c）训练侧
+# L = 本值 + MAX_RESPONSE_LENGTH 的显存口径。**多模态展开后的长度只看 (b)**：
+# 一张 2544x3231 的图在 rollout 侧就是 8080 个 <|image_pad|>，2048/3072 的预算
+# 会让 7.7% 的行（实测 2 万行抽样）在 rollout 侧撞 "Multimodal prompt produced
+# N tokens" 而整条 rollout 报废。8448 把这个比例压到 0.7%（p99=8242）。
+# 代价是显存：L 从 5120 涨到 10496，前反传的 logits（约 3 份，见 §4.5 算式）
+# 大致同比例上涨。**OOM 时优先降回本值**（再配 MAX_TOKEN_LEN_PER_GPU），
+# 不要单独去降 ROLLOUT_PROMPT_LENGTH —— 那样过滤与 rollout 的口径会脱节。
+MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-8448}
 # 2048 而非 1024：thinking 模型的 CoT 在 1024 下常在写出 \boxed{} 前就被截断，
 # 被截样本判 0 分，reward 被摁住爬不起来（Qwen3.5 实测 clip_ratio 0.81~0.91）。
-MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-1024}
+# 1024→2048（2026-10-10）：genrm_dump_qwen36 里被截样本的 token 数正好压在
+# 511/512，且整段没有 </think> —— 说明它连思维链的中段都没写完。512 及以下
+# 对 thinking 模型不是"省时间"，是"这一步直接跑废"（见下方长度预算注释）。
+MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-2048}
 _SEQ_LEN=$(( MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH ))
 
 # rollout 侧跟着一起缩，否则 KV cache 仍按大长度预留、白占显存
+#
+# [2026-10-13] 同时驱动 `rollout.max_num_batched_tokens`（见下方 hydra 参数区）：
+# vLLM 的 SchedulerConfig 要求 max_num_batched_tokens >= max_model_len，否则直接
+# pydantic 报 "max_num_batched_tokens (8192) is smaller than max_model_len (10624)"
+# 起不来。verl 的 RolloutConfig 默认 8192（rollout.py:196），本脚本原先不设它 ——
+# 一旦把 MAX_PROMPT_LENGTH 抬到 8448（⇒ max_model_len=10624）两值就脱节。
+# 与 max_model_len 同源即可满足约束，又不为 chunked prefill 多要显存
+# （enable_chunked_prefill=False，一条序列的 prefill 必须一次装下）。
 ROLLOUT_MAX_MODEL_LEN=${ROLLOUT_MAX_MODEL_LEN:-$(( _SEQ_LEN + 128 ))}
 ROLLOUT_PROMPT_LENGTH=${ROLLOUT_PROMPT_LENGTH:-$(( MAX_PROMPT_LENGTH + 32 ))}
+
+# 媒体预算：把 rollout.prompt_length 交给数据集，让它在**加载期**就丢掉
+# 「文本短、媒体大」的行。2026-10-13 事故：上游 filter_overlong_prompts 只量
+# 文本（53 tokens），图片在 rollout 侧展开成 8080 个 <|image_pad|> ⇒ 超过
+# prompt_length=3104 ⇒ 上游 fail-loud 报 "Multimodal prompt produced N tokens"。
+# 实测（2 万行抽样）：预算 3104 丢 7.7% 行、4096 丢 4.1%、5120 丢 3.2%。
+# 想少丢就调大本值 —— 代价在训练侧：L=prompt+response 直接决定前反传显存。
+export MINICPMO_MM_PROMPT_BUDGET="${MINICPMO_MM_PROMPT_BUDGET:-$ROLLOUT_PROMPT_LENGTH}"
 
 # token 预算 = 每卡序列数 × L。当前 use_dynamic_bsz=False，这个值不生效（见启动命令
 # 上方说明），但保持它跟长度一致：万一哪天把 dynamic_bsz 打开，这个值恰好等于
@@ -430,7 +607,8 @@ ROLLOUT_PROMPT_LENGTH=${ROLLOUT_PROMPT_LENGTH:-$(( MAX_PROMPT_LENGTH + 32 ))}
 MAX_TOKEN_LEN_PER_GPU=${MAX_TOKEN_LEN_PER_GPU:-$(( _SEQ_LEN * _SEQS_PER_RANK ))}
 
 echo "Seq len: prompt=${MAX_PROMPT_LENGTH} response=${MAX_RESPONSE_LENGTH} L=${_SEQ_LEN}" \
-     "| rollout max_model_len=${ROLLOUT_MAX_MODEL_LEN} | token budget/gpu=${MAX_TOKEN_LEN_PER_GPU}"
+     "| rollout max_model_len=${ROLLOUT_MAX_MODEL_LEN} (batched_tokens 同值) | token budget/gpu=${MAX_TOKEN_LEN_PER_GPU}" \
+     "| 媒体预算=${MINICPMO_MM_PROMPT_BUDGET}"
 
 # ⚠️ 调小 MAX_PROMPT_LENGTH 有一个静默副作用：data.filter_overlong_prompts=true
 #    会把 prompt 超长的样本**直接丢掉**（不是截断，truncation=error）。
@@ -494,8 +672,19 @@ _CHAT_TEMPLATE_ARGS=( "++data.apply_chat_template_kwargs.enable_thinking=${_ENAB
 
 # 与长度预算的关系：开了 thinking，response 会显著变长。上面 MAX_RESPONSE_LENGTH
 # 取 2048 就是按"要写 CoT"定的（见该处注释：1024 时常在 \boxed{} 前被截断，
-# 截断样本判 0 分，reward 被摁住）。若为省时间把 ENABLE_THINKING 关掉，
-# 可以顺手把 MAX_RESPONSE_LENGTH 压到 512 换取更快的 rollout。
+# 截断样本判 0 分，reward 被摁住）。
+#
+# ⚠️ 反面经验（2026-10-10，别再照抄旧结论）：以前这里写着"把 thinking 关掉就能
+# 顺手把 MAX_RESPONSE_LENGTH 压到 512"。实测 512 对 thinking 模型是灾难而不是
+# 提速：genrm_dump_qwen36 里被截样本正好卡在 511/512 token、连 </think> 都没有，
+# 尾部退化成复读（「平安、平安、…」），judge 吐不出 Verdict → 整组 reward=0。
+# 想压缩预算请在 ENABLE_THINKING=False（模板会注入**已闭合**的空 </think>，
+# 模型直接作答）的前提下压，且至少要留够最终答案的长度。
+if [ "${_ENABLE_THINKING_PY}" = "True" ] && [ "${MAX_RESPONSE_LENGTH}" -lt 1024 ]; then
+    echo "⚠️  [warn] enable_thinking=True 但 MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH} < 1024：" >&2
+    echo "          CoT 极可能在 \boxed{} 之前被硬截断（实测 512 时整段复读、无 </think>）。" >&2
+    echo "          除非你在做刻意的截断实验，否则请把预算抬到 2048 或关闭 thinking。" >&2
+fi
 
 
 # -----------------------------------------------------------------------------
@@ -561,6 +750,13 @@ echo "=== 前置自检 ==="
 python3 - <<'PY'
 import os
 import sys
+from importlib.metadata import entry_points
+
+assert any(
+    ep.name == "qwen3_6_whisper"
+    and ep.value == "verl_omni_ext.models.qwen3_6_whisper"
+    for ep in entry_points(group="verl_omni.models")
+), "Qwen3.6 plugin entry point missing; install this checkout with python3 -m pip install -e . --no-deps --no-build-isolation"
 
 import verl_omni_ext  # 本脚本已 export VERL_USE_EXTERNAL_MODULES 含 verl_omni_ext → 自动 activate()
 from verl_omni.pipelines.model_base import OmniModelBase, OmniRolloutPipelineBase
@@ -634,6 +830,109 @@ echo "=== 自检通过 ==="
 #   "${_DATASET_ARGS[@]}"        自定义 Dataset 类，见紧随其后那一段（默认展开为空）
 # 它们用数组展开而不是直接写死一行，正是因为这段续行里不能加 `#`：
 # 要让这些参数可开可关，只能把分支放到命令外面。
+# ─────────────────────────────────────────────────────────────────────────────
+# [2026-10-10 新增] 采样参数必须与 checkpoint 的 generation_config.json 对齐
+# ─────────────────────────────────────────────────────────────────────────────
+# Qwen3.6-35B-A3B-whisper-0814-rl/generation_config.json 给的是
+#     do_sample=true, temperature=1.0, top_k=20, top_p=0.95
+# 而 verl 的 RolloutConfig 默认 top_k=-1 / top_p=1.0（rollout.py:40-42），并且
+#     vllm_async_server.py:1196 `_get_override_generation_config()` 会把
+#     temperature/top_k/top_p 显式塞进 engine 的 override_generation_config，
+#     **盖掉 checkpoint 自带的 generation_config.json**。
+# 于是此前实际生效的是 top_k=-1 / top_p=1（全词表无截断采样）。这正是
+# genrm_dump_qwen36 里 thinking 模式跑到中途退化成「平安、平安、…」复读的直接
+# 诱因：temperature=1.0 配无截断的 tail 会持续放大尾部低概率 token（若只是预算
+# 不够，复读应当出现在末尾截断处，而不是生成到 ~200 token 就开始）。
+# 显式写回 checkpoint 的推荐值（temperature 本来就是 1.0，一并写死，避免上游
+# 再改默认值）。多模态模型尤其要紧：视觉/音频 token 混在序列里时，无截断采样
+# 更容易塌进重复。
+# 可用环境变量覆盖：ROLLOUT_TOP_P / ROLLOUT_TOP_K / ROLLOUT_TEMPERATURE。
+# 注意 argv 里已按「续行段不能加 `#`」的规矩写死数值，注释只能放在这里。
+# ─────────────────────────────────────────────────────────────────────────────
+# [2026-10-10 续] repetition_penalty：上一段修好了 top_k/top_p，复读仍在
+# ─────────────────────────────────────────────────────────────────────────────
+# 证据：genrm_dump_qwen36/sample_0001.json 的 actor 输出
+#     repeat='关于'x446；qwen36_whisper_full.log 的 rollout-diag
+#     repeat='102307,5205'x188@135。
+# 同一条音频 prompt 的 n=4 里，有的干净（sample_0002 被 judge 判 1.0），有的从第
+# 135 个 token 起塌进同一个 2-gram —— 采样塌陷，不是模型不会答。T=1.0/top_p=0.95/
+# top_k=20 配 repetition_penalty=1.0 是最容易塌的组合；同一家族的 judge
+# （Qwen3.5-35B-A3B）自己的 generation_config.json 就写着 1.1。
+#
+# 注意这里**不能**直接抄 generation_config.json 的结论：actor 的
+# generation_config.json 里根本没有 repetition_penalty 字段，默认就是 1.0。所以
+# 这是「主动加一道闸」，默认 1.05（比 judge 的 1.1 保守：actor 采样要保留多样性，
+# judge 只要不塌就行）。1.0 恢复上游行为（对照组用）。
+#
+# 关键：这个字段**必须**配合包内 rollout_sampling.py 的 L2 补丁才生效 —— 上游
+# agent loop 把它写死成 1.0（agent_loop.py:594 / agent_loop_tq.py:68），
+# RolloutConfig.repetition_penalty 本来是死配置。
+# 补丁打上后每个 agent-loop 进程打**两行**，缺一不可：
+#   [rollout-sampling] 采样闸补丁已安装到: [...]      ← import 期，点名打在哪些类上
+#   [rollout-sampling][diag] pid=… cls=… 观测: …      ← 第一次调用时，无条件打
+#                                                      （「补丁调到没有」的唯一答案）
+#   [rollout-sampling] repetition_penalty=1.05 …      ← 只有真注入了才打（生效行）
+# run#10 的教训：self-check 报 ✓ applied、真机却一行都没有 —— 原因是补丁只打在
+# 基类上，而 Ray 会把继承的方法复制到 backing class，actor 解析不到。现在三个候选
+# 类都打（基类 / TQ 装饰类 / Ray backing class），共用同一个 replacement。
+# 可用环境变量覆盖：ROLLOUT_REPETITION_PENALTY。
+#
+# ⚠️ 前缀必须是 ``++``（2026-10-10 22:0x 修）：`repetition_penalty` 在
+# RolloutConfig 这个 dataclass 里（verl/workers/config/rollout.py:168），但
+# **不在** hydra 的 rollout.yaml 里，于是 struct 里没有这个键，写成
+# ``actor_rollout_ref.rollout.repetition_penalty=…`` 会在启动第 30 秒直接抛
+#   omegaconf.errors.ConfigAttributeError: Key 'repetition_penalty' is not in struct
+#   hydra.errors.ConfigCompositionException: Could not override ...
+# 整轮跑废（run_006 就是这么死的，N=1 的 run_001 死在这次改动之前、侥幸没踩到）。
+# ``++`` = 有则覆盖、无则新增，两种情况都对（``+`` 只在「本来没有」时对）。
+# 同文件里 ``++data.apply_chat_template_kwargs.enable_thinking=…`` 是同一个理由。
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# [2026-10-10 23:3x 续] frequency_penalty / presence_penalty：rp 上线后复读仍在
+# ─────────────────────────────────────────────────────────────────────────────
+# rp **压不住环**，这是 vLLM 的语义而不是配置没生效：它只问「这个 token 出现过
+# 没有」，出现 1 次和出现 477 次统一除以 1.1。于是 2-gram 环（judge `' an'x477`、
+# actor `'102307,5205'x188@135`）在 rp=1.1 下照样转 —— 环里每个 token 都「出现过」。
+#
+# 压环要的是**累计**惩罚：frequency_penalty 按 token 在本序列里出现的**次数**
+# 线性扣 logits，被生成 477 次的那个 token 会被越扣越狠。judge 侧一直有这个开关
+# （GENRM_FREQUENCY_PENALTY，默认 0.0），actor 侧此前**没有这条路** ——
+# 上游 agent loop 的 sampling_params 只有 temperature/top_p/top_k/
+# repetition_penalty/logprobs（agent_loop.py:590-596）。本包的 L2 补丁
+# （rollout_sampling.py）刚把这几条补上，生效证据是每进程一行的
+# [rollout-sampling] frequency_penalty=...
+# 可用环境变量覆盖：ROLLOUT_FREQUENCY_PENALTY / ROLLOUT_PRESENCE_PENALTY。
+#
+# FP32 GDN 修复后默认 fp=0：fp=0.5 会累计抑制正常重复使用的数字/日期/公式。
+# 四样本对照中，图表题恢复了中文推导、</think> 和最终答案；保留显式覆盖，
+# 但不再用强频率惩罚掩盖推理侧的数值问题。
+# ⚠️ 注释永远不要插进下方 `\` 续行块中间：会把命令截断、丢掉后面全部 hydra
+# 覆盖（见 memory: hydra-continuation-comment-trap，判据 = xtrace 行长度骤缩）。
+#
+# ⚠️ 这两个闸**不能**写成 ``++actor_rollout_ref.rollout.frequency_penalty=…``
+# （2026-10-10 23:40 修）：它们**不是** RolloutConfig 的字段（整个
+# verl/workers/config/rollout.py 里只有 repetition_penalty 一处），而
+# ``omega_conf_to_dataclass`` 是 ``OmegaConf.merge(OmegaConf.structured(RolloutConfig), cfg)``
+# → 多出来的键会抛 ``ConfigKeyError: Key 'frequency_penalty' not in 'RolloutConfig'``
+# （本机跑 ``OmegaConf.merge`` 那一行实测过：侧信道键 OK、直写键抛错），
+# 也就是「整轮起不来」，不是「读不到」。
+# 所以走**侧信道**：``rollout.engine_kwargs.q36_sampling.<闸>``。
+#   · ``engine_kwargs`` 是自由字典（rollout.py:137），塞什么键都不触发结构校验；
+#   · 服务端只读 ``engine_kwargs[<引擎名>]``（vllm_async_server.py:287，引擎名 =
+#     vllm_omni），所以 ``q36_sampling`` 这一层**永远传不到引擎里**，是纯配置位；
+#   · 消费方是本包的 rollout_sampling.py 补丁，不是引擎。
+#
+# 默认 0.0 = 与上游逐字节相同的分布（0.0 是 vLLM 的 no-op）。
+#
+# ⚠️ ref 侧 `fsdp_config.forward_prefetch` 仍是 true（本配置下 ref worker 从不执行：
+# `compute_ref_log_prob` 在日志里出现 0 次）。前向预取与反向预取是**同一个缺陷的两份**
+# （verl 的静态表 modules[i+1:i+2] vs torch 的默认 post_forward_order 反向序）——
+# 真要启用 ref worker，这里必须一并改成 false，否则图像/音频 rank 子图不同时会同样死锁。
+#
+# ⚠️ 下面这条命令是 `\` 续行的**一整条**：中间**不能插注释行**（注释会把续行吃掉，
+# 命令在注释前就结束，后面所有覆盖被静默丢弃 —— 2026-10-12 02:0x 实测：`output_mode=ar`
+# 被丢 ⇒ ARStrategy 退化成 DiffusionStrategy ⇒ `ConfigKeyError: Key 'hf_config_path'
+# not in 'DiffusionModelConfig'`，每轮 4 分钟就死）。同类说明只能写在命令**之前或之后**。
 python3 -m verl_omni.trainer.main_omni \
     trainer.device=npu \
     \
@@ -659,7 +958,7 @@ python3 -m verl_omni.trainer.main_omni \
     actor_rollout_ref.model.lora_rank=0 \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.model.enable_gradient_checkpointing=true \
-    actor_rollout_ref.model.enable_activation_offload=${ACTIVATION_OFFLOAD:-true} \
+    actor_rollout_ref.model.enable_activation_offload=${ACTIVATION_OFFLOAD:-false} \
     actor_rollout_ref.model.exclude_modules=".*model\.visual.*|.*model\.audio_encoder.*|.*model\.audio_projection.*|.*tts.*|.*talker.*|.*code2wav.*|.*code_predictor.*" \
     actor_rollout_ref.actor.freeze_vision_tower=true \
     actor_rollout_ref.actor.trainer_type=policy_gradient \
@@ -683,7 +982,7 @@ python3 -m verl_omni.trainer.main_omni \
     actor_rollout_ref.actor.loss_agg_mode=seq-mean-token-mean \
     actor_rollout_ref.actor.fsdp_config.param_offload=true \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=false \
-    actor_rollout_ref.actor.fsdp_config.forward_prefetch=true \
+    actor_rollout_ref.actor.fsdp_config.forward_prefetch=${ACTOR_FORWARD_PREFETCH:-false} \
     actor_rollout_ref.actor.fsdp_config.model_dtype=${ACTOR_MODEL_DTYPE:-bfloat16} \
     actor_rollout_ref.actor.fsdp_config.use_orig_params=true \
     actor_rollout_ref.actor.fsdp_config.use_torch_compile=False \
@@ -699,12 +998,19 @@ python3 -m verl_omni.trainer.main_omni \
     actor_rollout_ref.rollout.name=vllm_omni \
     actor_rollout_ref.rollout.mode=async \
     actor_rollout_ref.rollout.n=${ROLLOUT_N:-8} \
+    actor_rollout_ref.rollout.temperature=${ROLLOUT_TEMPERATURE:-1.0} \
+    actor_rollout_ref.rollout.top_p=${ROLLOUT_TOP_P:-0.95} \
+    actor_rollout_ref.rollout.top_k=${ROLLOUT_TOP_K:-20} \
+    ++actor_rollout_ref.rollout.repetition_penalty=${ROLLOUT_REPETITION_PENALTY:-1.05} \
+    ++actor_rollout_ref.rollout.engine_kwargs.q36_sampling.frequency_penalty=${ROLLOUT_FREQUENCY_PENALTY:-0.0} \
+    ++actor_rollout_ref.rollout.engine_kwargs.q36_sampling.presence_penalty=${ROLLOUT_PRESENCE_PENALTY:-0.0} \
     actor_rollout_ref.rollout.tensor_model_parallel_size=${ROLLOUT_TP:-2} \
     actor_rollout_ref.rollout.gpu_memory_utilization=${ROLLOUT_GPU_MEM_UTIL:-0.65} \
     actor_rollout_ref.rollout.max_num_seqs=4 \
     actor_rollout_ref.rollout.max_model_len=${ROLLOUT_MAX_MODEL_LEN:-4096} \
+    actor_rollout_ref.rollout.max_num_batched_tokens=${ROLLOUT_MAX_MODEL_LEN:-4096} \
     actor_rollout_ref.rollout.prompt_length=${ROLLOUT_PROMPT_LENGTH:-4160} \
-    actor_rollout_ref.rollout.enforce_eager=false \
+    actor_rollout_ref.rollout.enforce_eager=true \
     actor_rollout_ref.rollout.load_format=safetensors \
     actor_rollout_ref.rollout.free_cache_engine=True \
     actor_rollout_ref.rollout.enable_prefix_caching=false \
@@ -716,6 +1022,7 @@ python3 -m verl_omni.trainer.main_omni \
     actor_rollout_ref.rollout.agent.num_workers=${ROLLOUT_NUM_WORKERS} \
     +actor_rollout_ref.rollout.engine_kwargs.vllm_omni.output_mode=ar \
     +actor_rollout_ref.rollout.engine_kwargs.vllm_omni.pipeline_name=qwen3_6_whisper \
+    ++actor_rollout_ref.rollout.engine_kwargs.vllm_omni.additional_config.weight_nz_mode=0 \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
     actor_rollout_ref.rollout.val_kwargs.temperature=0 \
     actor_rollout_ref.rollout.val_kwargs.top_p=1.0 \
@@ -737,8 +1044,8 @@ python3 -m verl_omni.trainer.main_omni \
     trainer.default_local_dir="${DEFAULT_LOCAL_DIR}" \
     trainer.n_gpus_per_node=${NUM_NPUS} \
     trainer.nnodes=${NNODES} \
-    trainer.save_freq=50 \
+    trainer.save_freq=$([[ "${DEBUG_MODE:-0}" == "1" ]] && echo -1 || echo "${SAVE_FREQ:-50}") \
     trainer.test_freq=10 \
     trainer.total_epochs=10 \
     "$@" \
-    2>&1 | tee run_qwen36_whisper_gspo_npu.log
+    2>&1 | tee run_qwen36_huanyu_gspo_npu.log

@@ -3,7 +3,7 @@
 # Qwen3.6-35B-A3B-huanyu06b-iter2000-omni4b-hf-huanyu7tokens thinker · GSPO · Ascend NPU · OmniMix · GenRM
 # =============================================================================
 # 入口脚本：设置 OmniMix + GenRM 环境变量，然后 exec 主脚本。
-# 主脚本 run_qwen36_whisper_gspo_npu.sh 负责所有训练参数。
+# 主脚本 run_qwen36_huanyu_gspo_npu.sh 负责所有训练参数。
 #
 # 移植自 verl_omni_minicpmo_debug/examples/minicpmo_5_0/
 # run_minicpmo_thinker_gspo_npu_omni_mix_genrm.sh，调整为 Huanyu checkpoint，沿用现有 Qwen3.6 适配。
@@ -21,11 +21,8 @@
 # =============================================================================
 
 set -eo pipefail
-if [ -n "${PROJECT_ROOT:-}" ]; then
-    _HERE="${PROJECT_ROOT}/examples/qwen3_6_whisper"
-else
-    _HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-fi
+export PROJECT_ROOT="${PROJECT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+_HERE="${PROJECT_ROOT}/examples/qwen3_6_huanyu"
 
 # ---- GenRM 配置 ----
 export RM_ENABLE=1
@@ -280,4 +277,4 @@ echo "debug      = DEBUG_MODE=${DEBUG_MODE}"
 echo
 
 # exec 主脚本，传递 OmniMix + GenRM 参数
-exec bash "${_HERE}/run_qwen36_whisper_gspo_npu.sh" "${_OMNI_MIX_ARGS[@]}" "${_REWARD_ARGS[@]}" "$@"
+exec bash "${_HERE}/run_qwen36_huanyu_gspo_npu.sh" "${_OMNI_MIX_ARGS[@]}" "${_REWARD_ARGS[@]}" "$@"
