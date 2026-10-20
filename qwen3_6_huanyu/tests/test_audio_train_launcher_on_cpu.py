@@ -211,6 +211,7 @@ class AudioTrainingLauncherTests(unittest.TestCase):
         self.assertEqual(actual["reward.reward_model.n_gpus_per_node"], "16")
         self.assertEqual(actual["reward.reward_model.nnodes"], "1")
         self.assertEqual(actual["trainer.total_training_steps"], "2")
+        self.assertNotIn("trainer.rollout_data_dir", actual)
         for key, value in (
             ("HUANYU_USE_PRECOMPUTE", "0"),
             ("MINICPMO_USE_PRECOMPUTE", "0"),
@@ -270,6 +271,10 @@ class AudioTrainingLauncherTests(unittest.TestCase):
         )
         self.assertEqual(capture["env"]["RM_ENABLE"], "0")
         self.assertEqual(capture["env"]["REWARD_POOL_NPUS"], "0")
+        self.assertEqual(
+            actual["trainer.rollout_data_dir"],
+            "${trainer.default_local_dir}/../rollout_dump",
+        )
         requested_npus = (
             int(capture["env"]["NUM_NPUS"]) * int(capture["env"]["NNODES"])
             + int(capture["env"]["REWARD_POOL_NPUS"])
@@ -280,8 +285,13 @@ class AudioTrainingLauncherTests(unittest.TestCase):
         self.assertNotIn("qwen3_5_moe", " ".join(capture["argv"]))
 
     def test_16card_frozen_control_still_disables_cache(self):
+        rollout_dir = (self.project / "frozen_rollouts").as_posix()
         result = self.run_script(
-            {"HUANYU_FREEZE_AUDIO": "true", "ENABLE_THINKING": "0"},
+            {
+                "HUANYU_FREEZE_AUDIO": "true",
+                "ENABLE_THINKING": "0",
+                "ROLLOUT_DATA_DIR": rollout_dir,
+            },
             entry="run_huanyu_aqa_audio_train_16card.sh",
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -293,6 +303,7 @@ class AudioTrainingLauncherTests(unittest.TestCase):
         self.assertEqual(capture["env"]["MINICPMO_USE_PRECOMPUTE"], "0")
         self.assertEqual(actual["data.apply_chat_template_kwargs.enable_thinking"], "false")
         self.assertEqual(actual["reward.custom_reward_function.reward_kwargs.require_think_end"], "false")
+        self.assertEqual(actual["trainer.rollout_data_dir"], rollout_dir)
 
     def test_no_rm_path_preserves_genrm_paths_non_reward_omnimix_settings(self):
         # Exercise the real OmniMix wrapper, stubbing only the heavy base backend.
