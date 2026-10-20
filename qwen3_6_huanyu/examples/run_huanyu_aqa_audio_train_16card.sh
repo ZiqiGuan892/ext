@@ -16,5 +16,9 @@ export HUANYU_FREEZE_AUDIO="${HUANYU_FREEZE_AUDIO:-false}"
 # experiment directory. ROLLOUT_DATA_DIR or a trailing Hydra argument overrides it.
 _HUANYU_ROLLOUT_DATA_DIR='${trainer.default_local_dir}/../rollout_dump'
 _HUANYU_ROLLOUT_DATA_DIR="${ROLLOUT_DATA_DIR:-${_HUANYU_ROLLOUT_DATA_DIR}}"
+# Use local console metrics by default so Ray workers need no W&B login or
+# WANDB_MODE propagation. This does not disable the independent rollout dump.
+# A trailing trainer.logger override can opt into other tracking backends.
 exec bash "${_HUANYU_EXAMPLE_DIR}/run_huanyu_aqa_audio_train.sh" \
+    'trainer.logger=[console]' \
     "trainer.rollout_data_dir=${_HUANYU_ROLLOUT_DATA_DIR}" "$@"
