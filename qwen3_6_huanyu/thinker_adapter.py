@@ -1,13 +1,14 @@
 """Independent Huanyu training adapter; keeps the checkpoint HF architecture."""
 
-import logging
 import os
 from collections.abc import Mapping
 
 from verl_omni.pipelines.model_base import OmniModelBase
 
+from .training_logging import get_training_logger
 
-logger = logging.getLogger(__name__)
+
+logger = get_training_logger(__name__)
 TRAINING_ARCHITECTURE = "Qwen36HuanyuForTraining"
 
 

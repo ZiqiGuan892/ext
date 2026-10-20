@@ -6,14 +6,15 @@ loop. BF16 compute views remain connected to the optimizer's master parameters.
 """
 
 from collections.abc import Mapping
-import logging
 import os
 
 import torch
 from torch.utils.checkpoint import checkpoint
 
+from .training_logging import get_training_logger
 
-logger = logging.getLogger(__name__)
+
+logger = get_training_logger(__name__)
 
 
 def _get(config, name, default=None):

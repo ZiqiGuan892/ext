@@ -2,7 +2,10 @@
 
 import copy
 import importlib
+import io
+import logging
 import os
+from contextlib import ExitStack
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -165,6 +168,52 @@ class AudioTrainingGradientTests(unittest.TestCase):
         for prefix in ("model.audio_encoder.", "model.audio_projection."):
             self.assertTrue(any(not torch.equal(value, before[key])
                                 for key, value in parameters.items() if key.startswith(prefix)), prefix)
+
+    def test_training_evidence_is_visible_once_under_warning_root(self):
+        # Capture the real console handler, without assertLogs changing levels.
+        stream = io.StringIO()
+        root = logging.getLogger()
+        old_level, old_handlers = root.level, root.handlers[:]
+        root_stream = io.StringIO()
+        root_handler = logging.StreamHandler(root_stream)
+        root_handler.setLevel(logging.WARNING)
+        root.handlers = [root_handler]
+        root.setLevel(logging.WARNING)
+        try:
+            handlers = [
+                handler for handler in training.logger.handlers
+                if isinstance(handler, logging.StreamHandler)
+            ]
+            self.assertTrue(handlers, "Huanyu training needs its own console handler")
+            with ExitStack() as stack:
+                for handler in handlers:
+                    stack.enter_context(patch.object(handler, "stream", stream))
+                self.configure(checkpoint_chunks=True)
+                with torch.no_grad():
+                    training.encode_trainable_huanyu_audio(self.module, self.features, self.lengths)
+                for _ in range(2):
+                    self.module.zero_grad()
+                    outputs = training.encode_trainable_huanyu_audio(
+                        self.module, self.features, self.lengths)
+                    sum(value.float().square().sum() for value in outputs).backward()
+                    self.assert_audio_gradients(self.module)
+            messages = stream.getvalue()
+            for marker in (
+                "[huanyu-audio-train] enabled",
+                "forward mode=no_grad",
+                "forward mode=grad",
+                "backward component=audio_encoder",
+                "backward component=audio_projection",
+            ):
+                self.assertEqual(messages.count(marker), 1, messages)
+            self.assertIn("output_requires_grad=True", messages)
+            self.assertEqual(root_stream.getvalue(), "")
+            self.assertEqual(root.level, logging.WARNING)
+            self.assertEqual(root.handlers, [root_handler])
+        finally:
+            root.handlers = old_handlers
+            root.setLevel(old_level)
+            root_handler.close()
 
     def test_nonreentrant_checkpoint_preserves_outputs_and_all_audio_gradients(self):
         direct = self.configure()
