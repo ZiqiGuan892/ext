@@ -68,6 +68,7 @@ done
 export PYTHONPATH="${HUANYU_VLLM_OMNI_ROOT}:${_huanyu_ext_python_root}:/opt/huawei/algorithm/:/opt/huawei/dataset/ccb_data/code/package_install/verl${_huanyu_retained_pythonpath:+:${_huanyu_retained_pythonpath}}"
 echo "[huanyu env] ext Python root: ${_huanyu_ext_python_root}"
 echo "[huanyu env] vLLM-Omni Python root: ${HUANYU_VLLM_OMNI_ROOT}"
+_huanyu_graph_mode_script="${_huanyu_ext_python_root}/verl_omni_ext/models/qwen3_6_huanyu/graph_mode.sh"
 unset _huanyu_candidate _huanyu_ext_python_root
 unset _huanyu_retained_pythonpath _huanyu_python_entries _huanyu_path
 
@@ -141,9 +142,12 @@ export VERL_USE_EXTERNAL_MODULES=verl_omni,verl_omni_ext
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export VLLM_USE_V1=1
 export USE_OPTIMIZED_MODEL=0
-export VLLM_TORCH_COMPILE=0
-export TORCH_COMPILE_DISABLE=1
-export NPU_GRAPH_CAPTURE_DISABLE=1
+# One switch for eager/graph inference; the training backend reapplies it and
+# explicitly forwards it to Ray, so later per-run changes also reach workers.
+source "${_huanyu_graph_mode_script}" || {
+    return 2 2>/dev/null || exit 2
+}
+unset _huanyu_graph_mode_script
 export WANDB_MODE=${WANDB_MODE:-offline}
 export NUM_GPUS_ACTOR_ROLLOUT_REWARD=${NPUS_PER_NODE}
 export VLLM_NO_SUBCLASS_INSPECT=1

@@ -41,6 +41,10 @@ set -x
 # distribution metadata. Install before the first Python/plugin import.
 export PROJECT_ROOT="${PROJECT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 EXT_ROOT="${PROJECT_ROOT}"
+# All Huanyu entry points converge here. Apply before Python/plugin imports,
+# and append the same settings last in the training argv below.
+source "${PROJECT_ROOT}/verl_omni_ext/models/qwen3_6_huanyu/graph_mode.sh" || exit $?
+echo "[huanyu-graph] HUANYU_GRAPH_MODE=${HUANYU_GRAPH_MODE} actor/RM.enforce_eager=${HUANYU_ENFORCE_EAGER} VLLM_TORCH_COMPILE=${VLLM_TORCH_COMPILE} TORCH_COMPILE_DISABLE=${TORCH_COMPILE_DISABLE} NPU_GRAPH_CAPTURE_DISABLE=${NPU_GRAPH_CAPTURE_DISABLE}"
 export PYTHONPATH="${EXT_ROOT}${PYTHONPATH:+:$PYTHONPATH}"
 # Match the job launcher for shared mounts. setuptools-scm strips Git environment
 # overrides, so the trust entry must be in Git's configuration before installation.
@@ -64,9 +68,7 @@ export VERL_OMNI_EXT_PATCH_STRICT=1       # L2 补丁未打上直接 raise（改
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export VLLM_USE_V1=0
 export USE_OPTIMIZED_MODEL=0
-export VLLM_TORCH_COMPILE=0
-export TORCH_COMPILE_DISABLE=1
-export NPU_GRAPH_CAPTURE_DISABLE=1
+# Compile/capture flags are selected by graph_mode.sh, not hard-coded here.
 export ASCEND_SECURITY_CHECK_DISABLED=1
 export WANDB_MODE=${WANDB_MODE:-offline}
 
@@ -1010,7 +1012,7 @@ python3 -m verl_omni.trainer.main_omni \
     actor_rollout_ref.rollout.max_model_len=${ROLLOUT_MAX_MODEL_LEN:-4096} \
     actor_rollout_ref.rollout.max_num_batched_tokens=${ROLLOUT_MAX_MODEL_LEN:-4096} \
     actor_rollout_ref.rollout.prompt_length=${ROLLOUT_PROMPT_LENGTH:-4160} \
-    actor_rollout_ref.rollout.enforce_eager=true \
+    actor_rollout_ref.rollout.enforce_eager=${HUANYU_ENFORCE_EAGER} \
     actor_rollout_ref.rollout.load_format=safetensors \
     actor_rollout_ref.rollout.free_cache_engine=True \
     actor_rollout_ref.rollout.enable_prefix_caching=false \
@@ -1048,4 +1050,5 @@ python3 -m verl_omni.trainer.main_omni \
     trainer.test_freq=10 \
     trainer.total_epochs=10 \
     "$@" \
+    "${HUANYU_GRAPH_ARGS[@]}" \
     2>&1 | tee run_qwen36_huanyu_gspo_npu.log
