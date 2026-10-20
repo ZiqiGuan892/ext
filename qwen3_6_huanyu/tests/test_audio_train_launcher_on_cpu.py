@@ -121,11 +121,16 @@ class AudioTrainingLauncherTests(unittest.TestCase):
         self.project = Path(self.temporary.name)
         self.examples = self.project / "examples" / "qwen3_6_huanyu"
         self.examples.mkdir(parents=True)
-        for name in ("run_huanyu_aqa_audio_train.sh", "check_aqa_audio_train.py"):
+        for name in (
+            "run_huanyu_aqa_audio_train.sh",
+            "run_huanyu_aqa_audio_train_16card.sh",
+            "check_aqa_audio_train.py",
+        ):
             shutil.copyfile(EXAMPLES / name, self.examples / name)
         self.model = self.project / "verl_omni_ext" / "models" / "qwen3_6_huanyu"
         self.model.mkdir(parents=True)
         (self.model / "runtime_imports.py").write_text("pass\n")
+        shutil.copyfile(ROOT / "rule_based_reward.py", self.model / "rule_based_reward.py")
         self.bin = self.project / "bin"
         self.bin.mkdir()
         python_stub = self.bin / "python3"
@@ -137,9 +142,10 @@ class AudioTrainingLauncherTests(unittest.TestCase):
             "pathlib.Path(os.environ['HUANYU_TEST_CAPTURE']).write_text("
             "json.dumps({'argv':sys.argv[1:], 'env':dict(os.environ)}))"
         )
-        (self.examples / "run_qwen36_huanyu_32card.sh").write_text(
-            "#!/usr/bin/env bash\npython3 - \"$@\" <<'PY'\n" + capture + "\nPY\n", encoding="utf-8"
-        )
+        for name in ("run_qwen36_huanyu_32card.sh", "run_qwen36_huanyu_gspo_npu.sh"):
+            (self.examples / name).write_text(
+                "#!/usr/bin/env bash\npython3 - \"$@\" <<'PY'\n" + capture + "\nPY\n", encoding="utf-8"
+            )
         self.audio = self.project / "audio.wav"
         self.audio.write_bytes(b"audio")
         self.train = self.project / "train.parquet"
@@ -164,13 +170,15 @@ class AudioTrainingLauncherTests(unittest.TestCase):
             TRAIN_BATCH_SIZE="4",
             PPO_MINI_BATCH_SIZE="4",
             ROLLOUT_N="4",
+            RM_ENABLE="1",
+            ENABLE_THINKING="1",
             TOTAL_TRAINING_STEPS="2",
         )
 
-    def run_script(self, updates=None, arguments=()):
+    def run_script(self, updates=None, arguments=(), entry="run_huanyu_aqa_audio_train.sh"):
         env = dict(self.env, **(updates or {}))
         return subprocess.run(
-            [find_bash(), shell_path(self.examples / "run_huanyu_aqa_audio_train.sh"), *arguments],
+            [find_bash(), shell_path(self.examples / entry), *arguments],
             env=env, text=True, capture_output=True, timeout=60,
         )
 
@@ -224,12 +232,105 @@ class AudioTrainingLauncherTests(unittest.TestCase):
         self.assertEqual(capture["env"]["HUANYU_USE_PRECOMPUTE"], "0")
         self.assertEqual(actual["trainer.total_training_steps"], "null")
 
+    def test_16card_entry_disables_rm_pool_and_overrides_stale_reward_options(self):
+        result = self.run_script(
+            {"RM_ENABLE": "1", "REWARD_POOL_NPUS": "16", "NNODES": "2", "NUM_NPUS": "32"},
+            arguments=(
+                "reward.reward_model.enable=true",
+                "reward.reward_model.enable_resource_pool=true",
+                "reward.reward_model.n_gpus_per_node=16",
+                "reward.custom_reward_function.path=pkg://verl_omni_ext.reward.genrm_verifier",
+                "reward.custom_reward_function.name=old_score",
+            ),
+            entry="run_huanyu_aqa_audio_train_16card.sh",
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        capture = json.loads(self.capture.read_text())
+        actual = dict(item.lstrip("+").split("=", 1) for item in capture["argv"])
+        for key, value in (
+            ("reward.reward_model.enable", "false"),
+            ("reward.reward_model.enable_resource_pool", "false"),
+            ("reward.reward_model.n_gpus_per_node", "0"),
+            ("reward.reward_model.nnodes", "0"),
+            ("reward.reward_model.model_path", "null"),
+            ("reward.custom_reward_function.name", "compute_score"),
+            ("reward.custom_reward_function.reward_kwargs.require_think_end", "true"),
+            ("data.apply_chat_template_kwargs.enable_thinking", "true"),
+            ("trainer.n_gpus_per_node", "16"),
+            ("trainer.nnodes", "1"),
+            ("actor_rollout_ref.rollout.tensor_model_parallel_size", "4"),
+            ("actor_rollout_ref.model.override_config.huanyu_freeze_audio", "false"),
+            ("actor_rollout_ref.actor.use_dynamic_bsz", "false"),
+            ("data.filter_overlong_prompts", "false"),
+        ):
+            self.assertEqual(actual[key], value, key)
+        self.assertEqual(
+            actual["reward.custom_reward_function.path"],
+            "pkg://verl_omni_ext.models.qwen3_6_huanyu.rule_based_reward",
+        )
+        self.assertEqual(capture["env"]["RM_ENABLE"], "0")
+        self.assertEqual(capture["env"]["REWARD_POOL_NPUS"], "0")
+        requested_npus = (
+            int(capture["env"]["NUM_NPUS"]) * int(capture["env"]["NNODES"])
+            + int(capture["env"]["REWARD_POOL_NPUS"])
+        )
+        self.assertEqual(requested_npus, 16)
+        self.assertIn("rule_based_16card", capture["env"]["EXPERIMENT_NAME"])
+        self.assertIn("RM=0NPU RM_ENABLE=0", result.stdout)
+        self.assertNotIn("qwen3_5_moe", " ".join(capture["argv"]))
+
+    def test_16card_frozen_control_still_disables_cache(self):
+        result = self.run_script(
+            {"HUANYU_FREEZE_AUDIO": "true", "ENABLE_THINKING": "0"},
+            entry="run_huanyu_aqa_audio_train_16card.sh",
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        capture = json.loads(self.capture.read_text())
+        actual = dict(item.lstrip("+").split("=", 1) for item in capture["argv"])
+        self.assertEqual(actual["actor_rollout_ref.model.override_config.huanyu_freeze_audio"], "true")
+        self.assertEqual(capture["env"]["MINICPMO_TUNE_AUDIO"], "0")
+        self.assertEqual(capture["env"]["HUANYU_USE_PRECOMPUTE"], "0")
+        self.assertEqual(capture["env"]["MINICPMO_USE_PRECOMPUTE"], "0")
+        self.assertEqual(actual["data.apply_chat_template_kwargs.enable_thinking"], "false")
+        self.assertEqual(actual["reward.custom_reward_function.reward_kwargs.require_think_end"], "false")
+
+    def test_no_rm_path_preserves_genrm_paths_non_reward_omnimix_settings(self):
+        # Exercise the real OmniMix wrapper, stubbing only the heavy base backend.
+        source = ROOT / "deploy" / "examples" / "qwen3_6_huanyu"
+        name = "run_qwen36_huanyu_gspo_npu_omni_mix_genrm.sh"
+        (self.examples / name).write_text((source / name).read_text(encoding="utf-8"), encoding="utf-8")
+        (self.examples / "run_qwen36_huanyu_32card.sh").write_text(
+            '#!/usr/bin/env bash\nexec bash "$(dirname "$0")/'
+            + name + '" "$@"\n', encoding="utf-8",
+        )
+        result = self.run_script({"RM_ENABLE": "1"})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        reference = json.loads(self.capture.read_text())
+        result = self.run_script({"RM_ENABLE": "0"})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        actual = json.loads(self.capture.read_text())
+        reference_args = dict(item.lstrip("+").split("=", 1) for item in reference["argv"])
+        actual_args = dict(item.lstrip("+").split("=", 1) for item in actual["argv"])
+        self.assertEqual(reference_args["reward.reward_model.enable"], "True")
+        self.assertEqual(reference_args["reward.reward_model.enable_resource_pool"], "True")
+        for key, value in reference_args.items():
+            if key.startswith(("actor_rollout_ref.", "data.")):
+                self.assertEqual(actual_args.get(key), value, key)
+        for key in (
+            "MINICPMO_ENABLE_MM_FORWARD", "MINICPMO_ALLOW_PACKED_MM_FORWARD",
+            "MINICPMO_FSDP2_PIN_MEMORY", "MINICPMO_DISABLE_MM_DEDUP",
+            "MINICPMO_USE_CUSTOM_DATASET", "ACTOR_MODEL_DTYPE", "REF_MODEL_DTYPE",
+            "VLLM_ASCEND_WEIGHT_NZ_MODE", "ASCEND_WEIGHT_NZ_MODE", "ASCEND_ENABLE_TRANS_DATA_CACHE",
+        ):
+            self.assertEqual(actual["env"].get(key), reference["env"][key], key)
+
     def test_rejects_unequal_rank_batching_debug_mode_and_bad_hyperparameter(self):
         for updates, error in (
             ({"PPO_MINI_BATCH_SIZE": "8"}, "ppo_mini_batch"),
             ({"TRAIN_BATCH_SIZE": "6"}, "train_batch"),
             ({"DEBUG_MODE": "1"}, "TOTAL_TRAINING_STEPS=2"),
             ({"HUANYU_FREEZE_AUDIO": "maybe"}, "must be true or false"),
+            ({"RM_ENABLE": "maybe"}, "RM_ENABLE must be 0 or 1"),
         ):
             with self.subTest(updates=updates):
                 result = self.run_script(updates)

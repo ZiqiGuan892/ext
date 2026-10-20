@@ -2,14 +2,49 @@
 # Deploy this file AND check_aqa_audio_train.py to:
 #   ${PROJECT_ROOT}/examples/qwen3_6_huanyu/
 # Source the environment and start Ray on all nodes before running this entry.
-# This wrapper reuses the existing Huanyu 32-card / OmniMix + GenRM backend.
+# RM_ENABLE=1 retains the 32-card GenRM path; RM_ENABLE=0 uses 16 cards and rules.
 set -euo pipefail
 
 _HUANYU_EXAMPLE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export PROJECT_ROOT="${PROJECT_ROOT:-$(cd "${_HUANYU_EXAMPLE_DIR}/../.." && pwd)}"
 cd "${PROJECT_ROOT}"
 _HUANYU_MODEL_DIR="${PROJECT_ROOT}/verl_omni_ext/models/qwen3_6_huanyu"
-_HUANYU_BACKEND="${PROJECT_ROOT}/examples/qwen3_6_huanyu/run_qwen36_huanyu_32card.sh"
+export RM_ENABLE="${RM_ENABLE:-1}"
+case "${RM_ENABLE}" in
+    1)
+        _HUANYU_BACKEND="${PROJECT_ROOT}/examples/qwen3_6_huanyu/run_qwen36_huanyu_32card.sh"
+        export REWARD_POOL_NPUS=16
+        _huanyu_reward_args=(
+            reward.reward_model.n_gpus_per_node=16
+            reward.reward_model.nnodes=1
+        )
+        ;;
+    0)
+        # The GenRM wrapper unconditionally re-enables RM. Bypass it entirely.
+        _HUANYU_BACKEND="${PROJECT_ROOT}/examples/qwen3_6_huanyu/run_qwen36_huanyu_gspo_npu.sh"
+        export REWARD_POOL_NPUS=0
+        # The prompt-side <think> opener is absent from decoded responses. Keep
+        # the rule's final-answer requirement consistent with the chat template.
+        _huanyu_thinking=false
+        if [[ "${ENABLE_THINKING:-1}" == 1 ]]; then
+            _huanyu_thinking=true
+        fi
+        _huanyu_reward_args=(
+            reward.reward_model.enable=false
+            reward.reward_model.enable_resource_pool=false
+            reward.reward_model.model_path=null
+            reward.reward_model.n_gpus_per_node=0
+            reward.reward_model.nnodes=0
+            reward.reward_manager.source=register
+            reward.reward_manager.name=naive
+            reward.custom_reward_function.path=pkg://verl_omni_ext.models.qwen3_6_huanyu.rule_based_reward
+            reward.custom_reward_function.name=compute_score
+            "++reward.custom_reward_function.reward_kwargs.require_think_end=${_huanyu_thinking}"
+            "++data.apply_chat_template_kwargs.enable_thinking=${_huanyu_thinking}"
+        )
+        ;;
+    *) echo "[huanyu-aqa] FATAL: RM_ENABLE must be 0 or 1" >&2; exit 2 ;;
+esac
 for _huanyu_file in "${_HUANYU_MODEL_DIR}/runtime_imports.py" "${_HUANYU_BACKEND}" \
     "${_HUANYU_EXAMPLE_DIR}/check_aqa_audio_train.py"; do
     if [[ ! -f "${_huanyu_file}" ]]; then
@@ -41,10 +76,10 @@ export VAL_FILE="${VAL_FILE:-/opt/huawei/dataset/ccb_data/data/omni/omni_mix_aqa
 export MODEL_PATH=/opt/huawei/dataset/downloaded_models/Qwen3.6-35B-A3B-huanyu06b-iter2000-omni4b-hf-huanyu7tokens
 export RM_MODEL_PATH="${RM_MODEL_PATH:-/opt/huawei/dataset/downloaded_models/Qwen3.5-35B-A3B}"
 
-# The existing OmniMix backend fixes actor/rollout=16 and reward=16 NPUs.
+# Both paths use 16 actor/rollout NPUs; only GenRM needs another 16 NPUs.
 # One sequence per actor rank avoids retaining full unsharded gradients during
 # FSDP2 no_sync accumulation. More train samples may form multiple mini-batches.
-export NUM_NPUS=16 NNODES=1 ROLLOUT_TP=4 REWARD_POOL_NPUS=16
+export NUM_NPUS=16 NNODES=1 ROLLOUT_TP=4
 export TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-4}"
 export PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-4}"
 export ROLLOUT_N="${ROLLOUT_N:-4}"
@@ -81,11 +116,59 @@ elif [[ ! "${_huanyu_steps}" =~ ^[1-9][0-9]*$ ]]; then
     exit 2
 fi
 export PROJECT_NAME="${PROJECT_NAME:-huanyu_aqa}"
-export EXPERIMENT_NAME="${EXPERIMENT_NAME:-audio_freeze_${HUANYU_FREEZE_AUDIO}_online}"
+_huanyu_experiment="audio_freeze_${HUANYU_FREEZE_AUDIO}_online"
+if [[ "${RM_ENABLE}" == 0 ]]; then
+    _huanyu_experiment+="_rule_based_16card"
+fi
+export EXPERIMENT_NAME="${EXPERIMENT_NAME:-${_huanyu_experiment}}"
 export DEFAULT_LOCAL_DIR="${DEFAULT_LOCAL_DIR:-${PROJECT_ROOT}/runs/${PROJECT_NAME}/${EXPERIMENT_NAME}/checkpoints}"
 export TENSORBOARD_DIR="${TENSORBOARD_DIR:-${PROJECT_ROOT}/runs/${PROJECT_NAME}/${EXPERIMENT_NAME}/tensorboard}"
 export GENRM_DUMP_DIR="${GENRM_DUMP_DIR:-${PROJECT_ROOT}/runs/${PROJECT_NAME}/${EXPERIMENT_NAME}/genrm_dump}"
 export VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-false}"
+
+# Preserve the non-reward OmniMix settings when calling the base backend
+# directly. The common AQA settings below still override batching and freezing.
+_huanyu_backend_defaults=()
+if [[ "${RM_ENABLE}" == 0 ]]; then
+    if [[ ! -f "${_HUANYU_MODEL_DIR}/rule_based_reward.py" ]]; then
+        echo "[huanyu-aqa] FATAL: deploy ${_HUANYU_MODEL_DIR}/rule_based_reward.py" >&2
+        exit 2
+    fi
+    export MINICPMO_ENABLE_MM_FORWARD=1
+    export MINICPMO_ALLOW_PACKED_MM_FORWARD=1
+    export MINICPMO_FSDP2_PIN_MEMORY=0
+    export MINICPMO_DISABLE_MM_DEDUP=1
+    export MINICPMO_USE_CUSTOM_DATASET=1
+    export ACTOR_MODEL_DTYPE=fp32 REF_MODEL_DTYPE=bfloat16
+    export VLLM_ASCEND_WEIGHT_NZ_MODE=0 ASCEND_WEIGHT_NZ_MODE=0 ASCEND_ENABLE_TRANS_DATA_CACHE=0
+    _huanyu_backend_defaults=(
+        ++data.video_key=videos
+        ++data.audio_key=audios
+        ++data.mm_processor_kwargs.sampling_rate=16000
+        ++data.mm_processor_kwargs.max_slice_nums=1
+        ++data.mm_processor_kwargs.use_image_id=false
+        +actor_rollout_ref.model.override_config.stream_input=false
+        actor_rollout_ref.model.override_config.attn_implementation=eager
+        "actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${MAX_TOKEN_LEN_PER_GPU}"
+        actor_rollout_ref.actor.entropy_from_logits_chunk_size=512
+        actor_rollout_ref.actor.entropy_from_logits_with_chunking=true
+        actor_rollout_ref.actor.fsdp_config.entropy_from_logits_with_chunking=true
+        actor_rollout_ref.actor.fsdp_config.entropy_from_logits_chunk_size=512
+        actor_rollout_ref.actor.fsdp_config.entropy_checkpointing=False
+        "actor_rollout_ref.actor.checkpoint.save_contents=['model','extra']"
+        actor_rollout_ref.actor.entropy_checkpointing=False
+        "actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${MAX_TOKEN_LEN_PER_GPU}"
+        ++actor_rollout_ref.rollout.engine_kwargs.vllm_omni.additional_config.weight_nz_mode=0
+        ++actor_rollout_ref.rollout.engine_kwargs.vllm_omni.additional_config.rl_config.enabled=true
+        actor_rollout_ref.rollout.enforce_eager=true
+        actor_rollout_ref.rollout.max_num_seqs=64
+        actor_rollout_ref.rollout.gpu_memory_utilization=0.5
+        actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=1024
+        "actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=${MAX_TOKEN_LEN_PER_GPU}"
+        actor_rollout_ref.ref.entropy_checkpointing=False
+        actor_rollout_ref.ref.entropy_from_logits_with_chunking=False
+    )
+fi
 
 # Check all rows without decoding audio; a validation split containing mixed
 # OmniMix rows must not enter this mode even when val_before_train=false.
@@ -115,7 +198,10 @@ for _huanyu_env_key in PYTHONPATH HUANYU_VLLM_OMNI_ROOT HUANYU_FREEZE_AUDIO \
     _huanyu_ray_args+=("++ray_kwargs.ray_init.runtime_env.env_vars.${_huanyu_env_key}=${_huanyu_env_json}")
 done
 
-echo "[huanyu-aqa] freeze_audio=${HUANYU_FREEZE_AUDIO} cache=off visual=frozen; actor=16NPU RM=16NPU"
+echo "[huanyu-aqa] freeze_audio=${HUANYU_FREEZE_AUDIO} cache=off visual=frozen; actor=16NPU RM=${REWARD_POOL_NPUS}NPU RM_ENABLE=${RM_ENABLE}"
+if [[ "${RM_ENABLE}" == 0 ]]; then
+    echo "[huanyu-aqa] reward=rule_based (character bigram Dice against ground_truth; no model/API)"
+fi
 echo "[huanyu-aqa] train_batch=${TRAIN_BATCH_SIZE} ppo_mini_batch=${PPO_MINI_BATCH_SIZE} rollout_n=${ROLLOUT_N} static_microbatch=1"
 echo "[huanyu-aqa] prompt=${MAX_PROMPT_LENGTH} response=${MAX_RESPONSE_LENGTH} steps=${_huanyu_steps}"
 echo "[huanyu-aqa] forward_prefetch=off Q36_BACKWARD_PREFETCH=${Q36_BACKWARD_PREFETCH}; HCCL timeout is unchanged"
@@ -123,7 +209,7 @@ echo "[huanyu-aqa] forward_prefetch=off Q36_BACKWARD_PREFETCH=${Q36_BACKWARD_PRE
 # Required settings follow user arguments so the checked datasets and execution
 # contract cannot be bypassed by stale command-line options. Model selection is
 # the verl alias; the checkpoint's HF architecture and RM alias remain intact.
-exec bash "${_HUANYU_BACKEND}" "$@" \
+exec bash "${_HUANYU_BACKEND}" "${_huanyu_backend_defaults[@]}" "$@" \
     "data.train_files=${TRAIN_FILE}" \
     "data.val_files=${VAL_FILE}" \
     data.train_batch_size="${TRAIN_BATCH_SIZE}" \
@@ -163,8 +249,7 @@ exec bash "${_HUANYU_BACKEND}" "$@" \
     actor_rollout_ref.rollout.tensor_model_parallel_size=4 \
     ++actor_rollout_ref.rollout.engine_kwargs.vllm_omni.pipeline_name=qwen3_6_huanyu \
     ++actor_rollout_ref.rollout.engine_kwargs.vllm_omni.mm_processor_cache_gb=0 \
-    reward.reward_model.n_gpus_per_node=16 \
-    reward.reward_model.nnodes=1 \
+    "${_huanyu_reward_args[@]}" \
     trainer.n_gpus_per_node=16 \
     trainer.nnodes=1 \
     trainer.total_training_steps="${_huanyu_steps}" \
