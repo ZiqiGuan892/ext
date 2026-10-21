@@ -74,6 +74,36 @@ class HuanyuProcessor:
         self.vision_start_token_id = _token_id(tokenizer, "<|vision_start|>", _get(config, "vision_start_token_id"))
         self.vision_end_token_id = _token_id(tokenizer, "<|vision_end|>", _get(config, "vision_end_token_id"))
 
+    def save_pretrained(self, save_directory, **kwargs):
+        """Save preprocessing artifacts for verl's FSDP checkpoint manager.
+
+        The manager saves the trained model config and weights separately. Do
+        not overwrite them with this processor's original checkpoint config.
+        Reload these artifacts through ``build_huanyu_processor`` with the
+        Huanyu plugin installed, just as for the original checkpoint. Runtime
+        cache readers and bound AgentLoop/RoPE methods are not serialized.
+        """
+        if kwargs.get("push_to_hub", False):
+            raise ValueError("HuanyuProcessor.save_pretrained supports local checkpoint saving only")
+        directory = Path(save_directory)
+        directory.mkdir(parents=True, exist_ok=True)
+        # Preserve the full declarative frontend contract, including optional
+        # FFT/hop and token-rate settings. The native frontend is not an HF
+        # FeatureExtractionMixin and cannot be saved via save_pretrained.
+        audio_json = json.dumps(self.audio_preprocessor, ensure_ascii=False, indent=2) + "\n"
+        saved = list(self.tokenizer.save_pretrained(str(directory), **kwargs) or ())
+        saved.extend(self.image_processor.save_pretrained(str(directory), **kwargs) or ())
+        audio_path = directory / "audio_preprocessor_config.json"
+        audio_path.write_text(audio_json, encoding="utf-8")
+        saved.append(str(audio_path))
+
+        from .training_logging import get_training_logger
+
+        get_training_logger(__name__).info(
+            "[huanyu-processor] saved tokenizer, image processor and audio frontend config to %s", directory
+        )
+        return saved
+
     def apply_chat_template(self, messages, **kwargs):
         flattened = []
         for message in messages:

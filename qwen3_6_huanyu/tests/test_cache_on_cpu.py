@@ -1,8 +1,11 @@
 """Cache integrity, identity and exact frontend keys without an inference engine."""
 
 import importlib.util
+import copy
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import redirect_stdout
 import errno
+import io
 import json
 from pathlib import Path
 import sys
@@ -10,7 +13,7 @@ import tempfile
 import threading
 from types import ModuleType
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 from safetensors.torch import save_file
@@ -72,6 +75,211 @@ class CacheTests(unittest.TestCase):
             cache_module.HuanyuEmbeddingCache(self.root, {**self.contract, "revision": 2}, create=True)
         with self.assertRaisesRegex(FileNotFoundError, "precompute first"):
             cache_module.HuanyuEmbeddingCache(self.root / "absent", self.contract)
+
+    def _source_contracts(self):
+        current = {
+            **self.contract,
+            "model_path": "/fake/huanyu/model",
+            "metadata": {"config.json": {"size": 20, "sha256": "a" * 64}},
+            "shards": {"model.safetensors": {
+                "size": 100, "mtime_ns": 1234567, "header_sha256": "b" * 64,
+            }},
+            "audio_preprocessor": {"feature_size": 40, "sampling_rate": 16000},
+            "image_processor": {"patch_size": 16},
+            "audio_execution": "single_chunk_bf16_v1",
+            "vision_execution": "single_image_hf_bf16_eager_q128_v1",
+        }
+        old = copy.deepcopy(current)
+        old["sources"] = {
+            name: {"size": 10 + i, "sha256": str(i) * 64}
+            for i, name in enumerate(("native_huanyu", "native_projector", "hf_qwen35",
+                                      "processor.py", "audio_runtime.py", "vision_attention.py"))
+        }
+        return old, current
+
+    def test_all_source_hash_and_size_changes_are_compatible(self):
+        old, _ = self._source_contracts()
+        for name in old["sources"]:
+            for field, replacement in (("sha256", "f" * 64), ("size", 987654)):
+                with self.subTest(source=name, field=field):
+                    current = copy.deepcopy(old)
+                    current["sources"][name][field] = replacement
+                    payload = cache_module._manifest_payload(old)
+                    snapshot = copy.deepcopy((payload, current))
+                    self.assertFalse(cache_module._manifest_matches(payload, current))
+                    self.assertTrue(cache_module._source_compatible(payload, current))
+                    self.assertEqual((payload, current), snapshot)
+
+    def test_sources_only_update_reads_original_entries_without_rewriting(self):
+        old, current = self._source_contracts()
+        root = self.root / "old-source-cache"
+        writer = cache_module.HuanyuEmbeddingCache(root, old, create=True)
+        values = torch.ones(2, 6).bfloat16()
+        entry = writer.put("audio", self.key, values, 2, 6)
+        original = {path: path.read_bytes() for path in (root / "manifest.json", entry)}
+        with self.assertWarnsRegex(UserWarning, "source fingerprints ignored"):
+            reader = cache_module.HuanyuEmbeddingCache(root, current)
+        self.assertEqual(reader.contract_digest, writer.contract_digest)
+        self.assertEqual(reader.contract, old)
+        torch.testing.assert_close(reader.get("audio", self.key, 2, 6), values)
+        for path, content in original.items():
+            self.assertEqual(path.read_bytes(), content)
+        # Compatibility never disables entry digest validation.
+        payload = torch.load(entry, weights_only=True)
+        payload["contract_digest"] = cache_module._manifest_payload(current)["contract_digest"]
+        torch.save(payload, entry)
+        with self.assertRaisesRegex(ValueError, "entry metadata"):
+            reader.get("audio", self.key, 2, 6)
+
+    def test_precompute_can_resume_old_source_cache_using_its_original_digest(self):
+        old, current = self._source_contracts()
+        root = self.root / "old-source-cache"
+        original = cache_module.HuanyuEmbeddingCache(root, old, create=True)
+        existing = original.put("audio", self.key, torch.ones(2, 6), 2, 6)
+        before = {path: path.read_bytes() for path in (root / "manifest.json", existing)}
+        (root / "vision").rmdir()
+        with self.assertWarnsRegex(UserWarning, "source fingerprints ignored"):
+            resumed = cache_module.HuanyuEmbeddingCache(root, current, create=True)
+        self.assertEqual(resumed.contract_digest, original.contract_digest)
+        self.assertTrue((root / "vision").is_dir())
+        new_key = cache_module.audio_key(self.feature + 1, 8)
+        values = torch.full((3, 6), 2.0).bfloat16()
+        new_entry = resumed.put("audio", new_key, values, 3, 6)
+        self.assertEqual(torch.load(new_entry, weights_only=True)["contract_digest"], original.contract_digest)
+        torch.testing.assert_close(original.get("audio", new_key, 3, 6), values)
+        for path, content in before.items():
+            self.assertEqual(path.read_bytes(), content)
+
+    def test_manifest_numeric_types_must_match_the_digest_and_contract(self):
+        manifest = self.root / "manifest.json"
+        original = manifest.read_text()
+        for value in (True, 1.0):
+            for update_digest in (False, True):
+                with self.subTest(value=value, update_digest=update_digest):
+                    payload = json.loads(original)
+                    payload["contract"]["revision"] = value
+                    if update_digest:
+                        payload = cache_module._manifest_payload(payload["contract"])
+                    manifest.write_text(json.dumps(payload), encoding="utf-8")
+                    self.assertFalse(cache_module._manifest_matches(payload, self.contract))
+                    with self.assertRaisesRegex(ValueError, "contract differs"):
+                        cache_module.HuanyuEmbeddingCache(self.root, self.contract)
+                    self.assertIn("status=mismatch", cache_module.cache_contract_report(
+                        payload, self.contract, manifest,
+                    ))
+
+    def test_tampered_manifest_digest_cannot_use_compatibility(self):
+        old, current = self._source_contracts()
+        root = self.root / "old-processor-cache"
+        cache_module.HuanyuEmbeddingCache(root, old, create=True)
+        manifest = root / "manifest.json"
+        payload = json.loads(manifest.read_text())
+        payload["contract_digest"] = "0" * 64
+        manifest.write_text(json.dumps(payload), encoding="utf-8")
+        before = manifest.read_bytes()
+        with self.assertRaisesRegex(ValueError, "manifest_integrity=INVALID"):
+            cache_module.HuanyuEmbeddingCache(root, current)
+        self.assertEqual(manifest.read_bytes(), before)
+
+    def test_non_source_contract_changes_still_report_and_reject(self):
+        old, current = self._source_contracts()
+        root = self.root / "changed-config"
+        cache_module.HuanyuEmbeddingCache(root, old, create=True)
+        mutations = (
+            (("model_path",), "/other/model"),
+            (("metadata", "config.json", "sha256"), "e" * 64),
+            (("metadata", "config.json", "size"), 21),
+            (("shards", "model.safetensors", "size"), 101),
+            (("shards", "model.safetensors", "mtime_ns"), 1234568),
+            (("shards", "model.safetensors", "header_sha256"), "e" * 64),
+            (("audio_preprocessor", "feature_size"), 128),
+            (("image_processor", "patch_size"), 32),
+            (("audio_execution",), "single_chunk_bf16_v2"),
+            (("vision_execution",), "single_image_hf_bf16_eager_q64_v1"),
+            (("future_contract_field",), "must-not-be-ignored"),
+        )
+        before = (root / "manifest.json").read_bytes()
+        for keys, value in mutations:
+            with self.subTest(field=keys):
+                changed = copy.deepcopy(current)
+                cursor = changed
+                for key in keys[:-1]:
+                    cursor = cursor[key]
+                cursor[keys[-1]] = value
+                self.assertFalse(cache_module._source_compatible(cache_module._manifest_payload(old), changed))
+                for create in (False, True):
+                    with self.assertRaisesRegex(ValueError, "contract differs") as error:
+                        cache_module.HuanyuEmbeddingCache(root, changed, create=create)
+                    self.assertIn(keys[-1], str(error.exception))
+        self.assertEqual((root / "manifest.json").read_bytes(), before)
+
+    def test_sources_compatibility_keeps_numeric_types_strict(self):
+        old, current = self._source_contracts()
+        for value in (True, 1.0):
+            with self.subTest(value=value):
+                changed = {**current, "revision": value}
+                self.assertFalse(cache_module._source_compatible(cache_module._manifest_payload(old), changed))
+
+    def test_sources_compatibility_reports_accepted_existing_cache(self):
+        old, current = self._source_contracts()
+        report = cache_module.cache_contract_report(
+            cache_module._manifest_payload(old), current, self.root / "manifest.json",
+        )
+        self.assertIn("status=compatible_without_source_hashes", report)
+        self.assertIn("manifest_integrity=valid", report)
+
+    def test_difference_diagnostics_are_bounded_and_show_missing_nested_fields(self):
+        saved = {"values": {f"field{i:03d}": "a" * 500 for i in range(100)}}
+        current = {"values": {f"field{i:03d}": "b" * 500 for i in range(100)}}
+        current["new_field"] = 1
+        report = cache_module.cache_contract_report(
+            cache_module._manifest_payload(saved), current, self.root / "manifest.json", max_differences=4,
+        )
+        self.assertIn("differences=102 shown=4", report)
+        self.assertIn("manifest.contract.new_field", report)
+        self.assertIn("<missing>", report)
+        self.assertNotIn("field099", report)
+        self.assertLess(len(report), 2400)
+        self.assertEqual(saved["values"]["field000"], "a" * 500)
+
+    def test_read_only_inspector_disables_cache_reader_and_never_builds_encoders(self):
+        spec = importlib.util.spec_from_file_location(f"{PACKAGE}.inspect_cache", ROOT / "inspect_cache.py")
+        inspector = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(inspector)
+        processor_module = ModuleType(f"{PACKAGE}.processor")
+        processor_module.build_huanyu_processor = Mock(return_value=object())
+        before = (self.root / "manifest.json").read_bytes()
+        with patch.dict(sys.modules, {processor_module.__name__: processor_module}), \
+                patch.object(cache_module, "make_cache_contract", return_value=self.contract), \
+                redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(inspector.inspect_cache("/fake/model", self.root), 0)
+        self.assertIn("status=exact", output.getvalue())
+        kwargs = processor_module.build_huanyu_processor.call_args.kwargs
+        self.assertFalse(kwargs["install_bridge"])
+        self.assertFalse(kwargs["use_cache"])
+        with patch.dict(sys.modules, {processor_module.__name__: processor_module}), \
+                patch.object(cache_module, "make_cache_contract", return_value={**self.contract, "revision": 3}), \
+                redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(inspector.inspect_cache("/fake/model", self.root), 2)
+        self.assertIn("status=mismatch", output.getvalue())
+        self.assertEqual((self.root / "manifest.json").read_bytes(), before)
+
+    def test_read_only_inspector_accepts_legacy_source_metadata(self):
+        old, current = self._source_contracts()
+        root = self.root / "legacy-inspection"
+        cache_module.HuanyuEmbeddingCache(root, old, create=True)
+        spec = importlib.util.spec_from_file_location(f"{PACKAGE}.inspect_cache", ROOT / "inspect_cache.py")
+        inspector = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(inspector)
+        processor_module = ModuleType(f"{PACKAGE}.processor")
+        processor_module.build_huanyu_processor = Mock(return_value=object())
+        before = (root / "manifest.json").read_bytes()
+        with patch.dict(sys.modules, {processor_module.__name__: processor_module}), \
+                patch.object(cache_module, "make_cache_contract", return_value=current), \
+                redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(inspector.inspect_cache("/fake/model", root), 0)
+        self.assertIn("status=compatible_without_source_hashes", output.getvalue())
+        self.assertEqual((root / "manifest.json").read_bytes(), before)
 
     def test_existing_old_cache_is_not_adopted(self):
         old = self.root / "old"
@@ -156,6 +364,19 @@ class CacheTests(unittest.TestCase):
             self.assertEqual(result.root, root.resolve())
         self.assertEqual(json.loads((root / "manifest.json").read_text())["contract"], self.contract)
 
+    def test_concurrent_source_compatible_initializers_use_one_producer_digest(self):
+        old, current = self._source_contracts()
+        with patch.object(cache_module.warnings, "warn"):
+            root, results = self._initialize_concurrently([old, current])
+        manifest = json.loads((root / "manifest.json").read_text())
+        for result in results:
+            self.assertIsInstance(result, cache_module.HuanyuEmbeddingCache, str(result))
+            self.assertEqual(result.contract_digest, manifest["contract_digest"])
+            self.assertEqual(result.contract, manifest["contract"])
+        values = torch.ones(2, 6).bfloat16()
+        results[0].put("audio", self.key, values, 2, 6)
+        torch.testing.assert_close(results[1].get("audio", self.key, 2, 6), values)
+
     def test_concurrent_initializers_reject_a_different_contract(self):
         root, results = self._initialize_concurrently([self.contract, {**self.contract, "revision": 2}])
         accepted = [result for result in results if isinstance(result, cache_module.HuanyuEmbeddingCache)]
@@ -234,7 +455,7 @@ class CacheTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "modality or digest"):
             self.cache.get("../escape", self.key, 2, 6)
 
-    def test_contract_tracks_native_code_and_checkpoint_metadata(self):
+    def test_contract_ignores_source_changes_without_importing_model_implementations(self):
         model = self.root / "model"
         model.mkdir()
         (model / "config.json").write_text('{"model_type":"qwen3_5_moe"}')
@@ -242,17 +463,20 @@ class CacheTests(unittest.TestCase):
         source = model / "native.py"
         source.write_text("# native encoder v1\n")
         runtime = ModuleType(f"{PACKAGE}.runtime_imports")
-        runtime.load_huanyu_native = lambda: type("Native", (), {"__file__": str(source)})
+        runtime.load_huanyu_native = Mock(side_effect=AssertionError("must not load native encoder"))
         processor = type("Processor", (), {
             "audio_preprocessor": {"feature_size": 40},
             "image_processor": type("Image", (), {"to_dict": lambda self: {"patch_size": 16}})(),
         })()
-        fake_module = type("HF", (), {"__file__": str(source)})
         with patch.dict(sys.modules, {runtime.__name__: runtime}), \
-                patch.object(cache_module.importlib, "import_module", return_value=fake_module):
+                patch("importlib.import_module", side_effect=AssertionError("must not import model implementations")):
             first = cache_module.make_cache_contract(model, processor)
+            self.assertNotIn("sources", first)
             self.assertEqual(first, cache_module.make_cache_contract(model, processor))
             source.write_text("# native encoder v2\n")
+            self.assertEqual(first, cache_module.make_cache_contract(model, processor))
+            runtime.load_huanyu_native.assert_not_called()
+            (model / "config.json").write_text('{"model_type":"qwen3_5_moe","revision":2}')
             self.assertNotEqual(first, cache_module.make_cache_contract(model, processor))
 
 

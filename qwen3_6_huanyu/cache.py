@@ -1,17 +1,18 @@
-"""Strict, content-keyed frozen Huanyu embeddings; independent of Whisper caches.
+"""Content-keyed frozen Huanyu embeddings; independent of Whisper caches.
 
 Entries contain final BF16 LLM-space tokens. Inputs are hashed before device/dtype
-conversion, so training and precomputation share exactly the same CPU frontend.
+conversion. Source-file revisions do not invalidate caches; checkpoint identity,
+frontend configuration and embedding integrity are still checked.
 Missing/corrupt entries are fatal: never silently run an encoder on one rank.
 """
 
 import hashlib
-import importlib
 import json
 import os
 from pathlib import Path
 import tempfile
 import time
+import warnings
 
 import torch
 
@@ -79,14 +80,13 @@ def _file_identity(path):
 
 
 def make_cache_contract(model_path, processor):
-    """Describe the checkpoint and actual frontend/encoder implementation.
+    """Describe the checkpoint, frontend settings and execution conventions.
 
     Shards use size + nanosecond mtime and header hash instead of reading the
     entire 35B model. Keep a checkpoint immutable; copied mounts must preserve
     metadata, or build a new cache contract for that checkpoint installation.
+    Python source hashes/sizes are deliberately not part of this contract.
     """
-    from .runtime_imports import load_huanyu_native
-
     root = Path(model_path).resolve(strict=True)
     config = root / "config.json"
     if not config.is_file():
@@ -112,20 +112,105 @@ def make_cache_contract(model_path, processor):
                              "header_sha256": hashlib.sha256(header).hexdigest()}
     if not shards:
         raise ValueError(f"No safetensors checkpoint shards in {root}")
-    native = load_huanyu_native()
-    hf = importlib.import_module("transformers.models.qwen3_5_moe.modeling_qwen3_5_moe")
-    llm = importlib.import_module("vllm_omni.model_executor.models.minicpmo_5_0.minicpmo_5_0_omni_llm")
-    sources = {"native_huanyu": _file_identity(native.__file__),
-               "native_projector": _file_identity(llm.__file__), "hf_qwen35": _file_identity(hf.__file__)}
-    for name in ("processor.py", "audio_runtime.py", "vision_attention.py"):
-        sources[name] = _file_identity(Path(__file__).parent / name)
     image_cfg = processor.image_processor.to_dict()
     # JSON roundtrip rejects opaque runtime objects rather than stringifying them.
     return json.loads(_json({"format": FORMAT, "model_path": str(root), "metadata": metadata,
-                           "shards": shards, "sources": sources,
+                           "shards": shards,
                            "audio_preprocessor": processor.audio_preprocessor,
                            "image_processor": image_cfg, "audio_execution": "single_chunk_bf16_v1",
                            "vision_execution": "single_image_hf_bf16_eager_q128_v1"}))
+
+
+def _manifest_payload(contract):
+    return {"format": FORMAT, "contract_digest": hashlib.sha256(_json(contract).encode()).hexdigest(),
+            "contract": contract}
+
+
+def _manifest_integrity_ok(payload):
+    return (isinstance(payload, dict) and set(payload) == {"format", "contract_digest", "contract"}
+            and payload["format"] == FORMAT and isinstance(payload["contract"], dict)
+            and payload["contract_digest"] == hashlib.sha256(_json(payload["contract"]).encode()).hexdigest())
+
+
+def _manifest_matches(payload, contract):
+    # Python equality alone treats 1, True and 1.0 as equal. The cache identity
+    # uses canonical JSON and must retain those type differences.
+    return _manifest_integrity_ok(payload) and _json(payload) == _json(_manifest_payload(contract))
+
+
+def _source_compatible(payload, contract):
+    """Ignore only legacy source identities, preserving all other checks.
+
+    Validate the producer's original digest before ignoring sources. Entries
+    still refer to that digest, so callers must retain it when opening a cache.
+    """
+    if not _manifest_integrity_ok(payload) or not isinstance(contract, dict):
+        return False
+    saved = {key: value for key, value in payload["contract"].items() if key != "sources"}
+    current = {key: value for key, value in contract.items() if key != "sources"}
+    return _json(saved) == _json(current)
+
+
+def _manifest_differences(saved, current, path="manifest"):
+    if isinstance(saved, dict) and isinstance(current, dict):
+        for key in sorted(saved.keys() | current.keys()):
+            child = path + ("." + key if key.isidentifier() else "[" + _json(key) + "]")
+            if key not in saved:
+                yield child, "<missing>", current[key]
+            elif key not in current:
+                yield child, saved[key], "<missing>"
+            else:
+                yield from _manifest_differences(saved[key], current[key], child)
+    elif isinstance(saved, list) and isinstance(current, list):
+        for index in range(max(len(saved), len(current))):
+            child = f"{path}[{index}]"
+            if index >= len(saved):
+                yield child, "<missing>", current[index]
+            elif index >= len(current):
+                yield child, saved[index], "<missing>"
+            else:
+                yield from _manifest_differences(saved[index], current[index], child)
+    elif type(saved) is not type(current) or saved != current:
+        yield path, saved, current
+
+
+def _short_value(value):
+    if isinstance(value, dict):
+        return f"<object keys={len(value)}>"
+    if isinstance(value, list):
+        return f"<list length={len(value)}>"
+    text = _json(value)
+    return text if len(text) <= 180 else text[:177] + "..."
+
+
+def cache_contract_report(payload, contract, manifest, *, max_differences=16):
+    """Bounded, read-only explanation; reports identities, never tensor contents."""
+    if not 1 <= max_differences <= 200:
+        raise ValueError("max_differences must be in 1..200")
+    expected = _manifest_payload(contract)
+    valid = _manifest_integrity_ok(payload)
+    exact = _manifest_matches(payload, contract)
+    compatible = not exact and _source_compatible(payload, contract)
+    status = "exact" if exact else "compatible_without_source_hashes" if compatible else "mismatch"
+    saved_digest = payload.get("contract_digest", "<missing>") if isinstance(payload, dict) else "<invalid manifest>"
+    lines = [f"[huanyu-cache] status={status} manifest={manifest}",
+             f"[huanyu-cache] manifest_integrity={'valid' if valid else 'INVALID'} "
+             f"cached_digest={_short_value(saved_digest)} current_digest={expected['contract_digest']}"]
+    total = 0
+    for path, saved, current in _manifest_differences(payload, expected):
+        total += 1
+        if total <= max_differences:
+            lines.append(f"  {path}: cached={_short_value(saved)} current={_short_value(current)}")
+    lines.append(f"[huanyu-cache] differences={total} shown={min(total, max_differences)}")
+    if compatible:
+        lines.append("[huanyu-cache] Source fingerprints ignored; all non-source fields match. "
+                     "Reuse the producer digest for existing and newly published entries; "
+                     "the manifest and existing embeddings remain unchanged.")
+    elif not exact:
+        lines.append("[huanyu-cache] Cache unchanged. Check the listed fields against the cache producer; "
+                     "restore that compatible environment or recompute into a NEW directory after confirming changes. "
+                     "Do not edit manifest.json or bypass entry digests.")
+    return "\n".join(lines)
 
 
 def _publish(path, writer, validate_new=None):
@@ -192,13 +277,30 @@ class HuanyuEmbeddingCache:
 
                 payload = {"format": FORMAT, "contract_digest": self.contract_digest, "contract": self.contract}
                 _publish(manifest, lambda handle: handle.write((_json(payload) + "\n").encode()), validate_new)
-            for modality in ("audio", "vision"):
-                (self.root / modality).mkdir(exist_ok=True)
         if not manifest.is_file():
             raise FileNotFoundError(f"Huanyu cache manifest missing: {manifest}; precompute first")
         payload = json.loads(manifest.read_text(encoding="utf-8"))
-        if payload != {"format": FORMAT, "contract_digest": self.contract_digest, "contract": self.contract}:
-            raise ValueError("Huanyu cache contract differs from checkpoint/frontend/runtime; use a new cache directory")
+        if not _manifest_matches(payload, self.contract):
+            if _source_compatible(payload, self.contract):
+                # Entry .pt files bind the producer's digest. Never rewrite the
+                # manifest or retag entries when ignoring source identities.
+                # Resumed precomputation must use this same digest as well.
+                self.contract = payload["contract"]
+                self.contract_digest = payload["contract_digest"]
+                warnings.warn(
+                    f"[huanyu-cache] source fingerprints ignored; "
+                    f"reusing cache with producer digest={self.contract_digest}; manifest={manifest}",
+                    UserWarning, stacklevel=2,
+                )
+            else:
+                raise ValueError(
+                    "Huanyu cache contract differs from checkpoint/frontend/runtime\n"
+                    + cache_contract_report(payload, self.contract, manifest)
+                )
+        if create:
+            # A rejected existing cache must not even gain missing directories.
+            for modality in ("audio", "vision"):
+                (self.root / modality).mkdir(exist_ok=True)
 
     def path(self, modality, key):
         if modality not in ("audio", "vision") or len(key) != 64 or any(c not in "0123456789abcdef" for c in key):

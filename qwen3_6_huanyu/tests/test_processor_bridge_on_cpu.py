@@ -1,13 +1,14 @@
 """CPU checks for the Huanyu multimodal data contract, without model weights."""
 
 import importlib.util
+import json
 from pathlib import Path
 import re
 import sys
 import tempfile
 from types import ModuleType, SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 import torch
@@ -286,6 +287,128 @@ class HuanyuProcessorTests(unittest.TestCase):
         self.assertEqual(worker._compute_multi_modal_inputs(output, torch.tensor([[1000]])), "original")
         worker.processor = processor()
         self.assertIn("huanyu_audio_features", worker._compute_multi_modal_inputs(output, torch.tensor([[1000]])))
+
+
+class HuanyuProcessorCheckpointTests(unittest.TestCase):
+    @staticmethod
+    def serializable_processor():
+        class SavedTokenizer(Tokenizer):
+            def save_pretrained(self, directory, **kwargs):
+                path = Path(directory) / "tokenizer_config.json"
+                path.write_text(json.dumps({"chat_template": self.chat_template}), encoding="utf-8")
+                return (str(path),)
+
+            @classmethod
+            def from_pretrained(cls, directory, **kwargs):
+                obj = cls()
+                obj.chat_template = json.loads((Path(directory) / "tokenizer_config.json").read_text())["chat_template"]
+                return obj
+
+        class SavedVision:
+            def __init__(self, size=448):
+                self.size = size
+
+            def __call__(self, images, **kwargs):
+                return vision(images, **kwargs)
+
+            def save_pretrained(self, directory, **kwargs):
+                path = Path(directory) / "preprocessor_config.json"
+                path.write_text(json.dumps({"size": self.size}), encoding="utf-8")
+                return [str(path)]
+
+            @classmethod
+            def from_pretrained(cls, directory):
+                return cls(**json.loads((Path(directory) / "preprocessor_config.json").read_text()))
+
+        proc = processor()
+        proc.tokenizer = SavedTokenizer()
+        proc.tokenizer.chat_template = "current training template"
+        proc.image_processor = SavedVision()
+        proc.audio_preprocessor.update(
+            feature_type="fbank", n_fft=400, hop_length=160,
+            unit_duration_seconds=0.96, audio_token_rate=12.5, tokens_per_unit=12,
+        )
+        proc.config.audio_config = {
+            "model_type": "huanyu_conformer_0_6b", "input_feat_per_channel": 40,
+            "projector_downsample_rate": 2,
+        }
+        return proc
+
+    def test_checkpoint_metadata_roundtrip_through_existing_builder(self):
+        proc = self.serializable_processor()
+        waveform = np.zeros(16000, dtype=np.float32)
+        text = processor_module.IMAGE_PATTERN + " " + processor_module.AUDIO_PATTERN
+        before = proc(text, images=[object()], audios=[waveform])
+        fake_transformers = SimpleNamespace(
+            AutoConfig=SimpleNamespace(from_pretrained=Mock(return_value=proc.config)),
+            AutoTokenizer=type(proc.tokenizer),
+        )
+        runtime = importlib.import_module(f"{PACKAGE}.runtime_imports")
+        native = SimpleNamespace(HuanyuFbankFeatureExtractor=Mock(return_value=Frontend()))
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            target = Path(directory) / "actor" / "huggingface"
+            target.mkdir(parents=True)
+            # The manager has already saved the trained config. The processor
+            # must not replace it with the original model config it loaded.
+            config_path = target / "config.json"
+            config_bytes = b'{"huanyu_freeze_audio":false,"trained_config":true}\n'
+            config_path.write_bytes(config_bytes)
+            proc.embedding_cache = object()  # Runtime-only, not JSON serializable.
+            files = proc.save_pretrained(target)
+            self.assertTrue(all(Path(path).is_file() for path in files))
+            self.assertEqual(config_path.read_bytes(), config_bytes)
+            self.assertEqual(json.loads((target / "audio_preprocessor_config.json").read_text()), proc.audio_preprocessor)
+            self.assertEqual({path.name for path in target.iterdir()}, {
+                "config.json", "tokenizer_config.json", "preprocessor_config.json", "audio_preprocessor_config.json",
+            })
+            with patch.dict(sys.modules, {
+                "transformers": fake_transformers,
+                "transformers.models.qwen2_vl.image_processing_qwen2_vl": SimpleNamespace(
+                    Qwen2VLImageProcessor=type(proc.image_processor),
+                ),
+            }), patch.object(runtime, "load_huanyu_native", return_value=native), patch.object(
+                processor_module, "_bind_qwen_rope"
+            ):
+                rebuilt = processor_module.build_huanyu_processor(
+                    target, {}, install_bridge=False, use_cache=False,
+                )
+            self.assertEqual(rebuilt.tokenizer.chat_template, "current training template")
+            self.assertEqual(rebuilt.image_processor.size, 448)
+            self.assertEqual(rebuilt.audio_preprocessor, proc.audio_preprocessor)
+            self.assertIsNone(rebuilt.embedding_cache)
+            native.HuanyuFbankFeatureExtractor.assert_called_once_with(
+                feature_size=40, sampling_rate=16000, n_fft=400, hop_length=160,
+            )
+            after = rebuilt(text, images=[object()], audios=[waveform])
+            for key in before:
+                if key == "huanyu_audio_features":
+                    torch.testing.assert_close(after[key][0], before[key][0])
+                else:
+                    torch.testing.assert_close(after[key], before[key])
+
+    def test_component_write_failure_is_not_reported_as_success(self):
+        proc = self.serializable_processor()
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            with patch.object(proc.image_processor, "save_pretrained", side_effect=OSError("disk full")):
+                with self.assertRaisesRegex(OSError, "disk full"):
+                    proc.save_pretrained(directory)
+            self.assertFalse((Path(directory) / "audio_preprocessor_config.json").exists())
+
+    def test_saves_to_new_directory_and_keeps_audio_metadata(self):
+        proc = self.serializable_processor()
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            target = Path(directory) / "new" / "huggingface"
+            proc.save_pretrained(target, push_to_hub=False)
+            self.assertEqual(json.loads((target / "audio_preprocessor_config.json").read_text()), proc.audio_preprocessor)
+            self.assertFalse((target / "config.json").exists())
+
+    def test_incomplete_hub_upload_is_rejected_before_writing(self):
+        proc = self.serializable_processor()
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            target = Path(directory) / "not_written"
+            with self.assertRaisesRegex(ValueError, "local checkpoint"):
+                proc.save_pretrained(target, push_to_hub=True)
+            self.assertFalse(target.exists())
 
 
 if __name__ == "__main__":
