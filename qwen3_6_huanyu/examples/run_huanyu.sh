@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# Huanyu-only entry. Source env_export.sh and start Ray on all nodes beforehand.
+# Huanyu-only entry. Source env_export_huanyu.sh and start Ray on all nodes beforehand.
 # Existing backend owns batching, sampling, GenRM and training log tee.
 set -euo pipefail
 
-export PROJECT_ROOT="${PROJECT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+_HUANYU_EXAMPLE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export PROJECT_ROOT="${PROJECT_ROOT:-$(cd "${_HUANYU_EXAMPLE_DIR}/../.." && pwd)}"
 cd "${PROJECT_ROOT}"
+source "${_HUANYU_EXAMPLE_DIR}/run_output.sh" || exit $?
 
 # The driver and NEW Ray workers must import the same Huanyu-enabled checkout.
 # Exporting PYTHONPATH only in this shell does not establish the Ray job's env.
@@ -21,7 +23,7 @@ for _huanyu_path in "${_huanyu_path_entries[@]}"; do
     _huanyu_retained_path+="${_huanyu_retained_path:+:}${_huanyu_path}"
 done
 export PYTHONPATH="${HUANYU_VLLM_OMNI_ROOT}:${PWD}${_huanyu_retained_path:+:${_huanyu_retained_path}}"
-python3 -B verl_omni_ext/models/qwen3_6_huanyu/runtime_imports.py --check
+python3 -B "${_HUANYU_EXAMPLE_DIR}/check_native_runtime.py" --check
 # JSON quotes are passed as part of ONE argv element for Hydra to parse; no eval.
 _huanyu_ray_pythonpath="$(python3 -c 'import json, os; print(json.dumps(os.environ["PYTHONPATH"]))')"
 

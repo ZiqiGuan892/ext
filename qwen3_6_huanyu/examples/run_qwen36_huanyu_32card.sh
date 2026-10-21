@@ -24,7 +24,7 @@
 #   bash examples/qwen3_6_huanyu/run_qwen36_huanyu_32card.sh
 #
 # 起跑后等自检通过、看到一条训练 loss 后，核对 fp 生效证据（每进程一行）：
-#   grep "rollout-sampling.*frequency_penalty" run_qwen36_huanyu_gspo_npu.log
+#   grep "rollout-sampling.*frequency_penalty" <本次运行目录>/console.log
 #   diag 应看到 frequency_penalty←0.0；非默认惩罚仍由 sampling_params 日志列出。
 
 set -euo pipefail
@@ -77,13 +77,13 @@ echo "=== Huanyu MODEL_PATH=${MODEL_PATH} ==="
 echo "=== 32 卡全量包装：NUM_NPUS=${NUM_NPUS} NNODES=${NNODES} ROLLOUT_TP=${ROLLOUT_TP} REWARD_POOL_NPUS=${REWARD_POOL_NPUS} ==="
 echo "===   ROLLOUT_FREQUENCY_PENALTY=${ROLLOUT_FREQUENCY_PENALTY}  ROLLOUT_REPETITION_PENALTY=${ROLLOUT_REPETITION_PENALTY:-1.05} ==="
 
-# 真训练/自检/尺寸检查/日志 tee 全在下游脚本（pipeline_name=qwen3_6_whisper
+# 真训练/自检/尺寸检查/日志捕获全在下游脚本（pipeline_name=qwen3_6_whisper
 # 已由后端脚本设好，这里不重复传，避免 hydra 键冲突）。
 #
 # 入口是 OmniMix+GenRM 那层（目标跑法：GenRM 判官打分），不是裸后端 —— 它拿到
 # 本脚本 export 的 NUM_NPUS/NNODES/ROLLOUT_TP/REWARD_POOL_NPUS/fp 后，追加
-# _OMNI_MIX_ARGS + _REWARD_ARGS 再 exec 后端。日志仍是 run_qwen36_huanyu_gspo_npu.log
-# （后端 tee 的），所以上面那条 grep 证据行照样有效。
+# _OMNI_MIX_ARGS + _REWARD_ARGS 再 exec 后端。日志由 run_output.sh 保存到
+# ${PROJECT_ROOT}/runs/ 下独立运行目录中的 console.log，启动时打印完整路径。
 # 最后覆盖，确保下游默认值或传入参数不会重新打开长度预筛。
 exec bash "${PROJECT_ROOT}/examples/qwen3_6_huanyu/run_qwen36_huanyu_gspo_npu_omni_mix_genrm.sh" \
     "$@" data.filter_overlong_prompts=false

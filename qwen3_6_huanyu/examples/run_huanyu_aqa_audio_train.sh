@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Deploy this file AND check_aqa_audio_train.py to:
+# Copy the contents of this examples directory to:
 #   ${PROJECT_ROOT}/examples/qwen3_6_huanyu/
 # Source the environment and start Ray on all nodes before running this entry.
 # RM_ENABLE=1 retains the 32-card GenRM path; RM_ENABLE=0 uses 16 cards and rules.
@@ -9,6 +9,7 @@ _HUANYU_EXAMPLE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export PROJECT_ROOT="${PROJECT_ROOT:-$(cd "${_HUANYU_EXAMPLE_DIR}/../.." && pwd)}"
 cd "${PROJECT_ROOT}"
 _HUANYU_MODEL_DIR="${PROJECT_ROOT}/verl_omni_ext/models/qwen3_6_huanyu"
+source "${_HUANYU_EXAMPLE_DIR}/run_output.sh" || exit $?
 export RM_ENABLE="${RM_ENABLE:-1}"
 case "${RM_ENABLE}" in
     1)
@@ -45,7 +46,7 @@ case "${RM_ENABLE}" in
         ;;
     *) echo "[huanyu-aqa] FATAL: RM_ENABLE must be 0 or 1" >&2; exit 2 ;;
 esac
-for _huanyu_file in "${_HUANYU_MODEL_DIR}/runtime_imports.py" "${_HUANYU_BACKEND}" \
+for _huanyu_file in "${_HUANYU_EXAMPLE_DIR}/check_native_runtime.py" "${_HUANYU_BACKEND}" \
     "${_HUANYU_EXAMPLE_DIR}/check_aqa_audio_train.py"; do
     if [[ ! -f "${_huanyu_file}" ]]; then
         echo "[huanyu-aqa] FATAL: missing ${_huanyu_file}; deploy to PROJECT_ROOT/examples/qwen3_6_huanyu" >&2
@@ -123,7 +124,6 @@ fi
 export EXPERIMENT_NAME="${EXPERIMENT_NAME:-${_huanyu_experiment}}"
 export DEFAULT_LOCAL_DIR="${DEFAULT_LOCAL_DIR:-${PROJECT_ROOT}/runs/${PROJECT_NAME}/${EXPERIMENT_NAME}/checkpoints}"
 export TENSORBOARD_DIR="${TENSORBOARD_DIR:-${PROJECT_ROOT}/runs/${PROJECT_NAME}/${EXPERIMENT_NAME}/tensorboard}"
-export GENRM_DUMP_DIR="${GENRM_DUMP_DIR:-${PROJECT_ROOT}/runs/${PROJECT_NAME}/${EXPERIMENT_NAME}/genrm_dump}"
 export VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-false}"
 
 # Preserve the non-reward OmniMix settings when calling the base backend
@@ -188,12 +188,12 @@ for _huanyu_path in "${_huanyu_entries[@]}"; do
     _huanyu_retained_path+="${_huanyu_retained_path:+:}${_huanyu_path}"
 done
 export PYTHONPATH="${HUANYU_VLLM_OMNI_ROOT}:${PROJECT_ROOT}${_huanyu_retained_path:+:${_huanyu_retained_path}}"
-python3 -B "${_HUANYU_MODEL_DIR}/runtime_imports.py" --check --expected-root "${HUANYU_VLLM_OMNI_ROOT}"
+python3 -B "${_HUANYU_EXAMPLE_DIR}/check_native_runtime.py" --check --expected-root "${HUANYU_VLLM_OMNI_ROOT}"
 
 _huanyu_ray_args=()
 for _huanyu_env_key in PYTHONPATH HUANYU_VLLM_OMNI_ROOT HUANYU_FREEZE_AUDIO \
     HUANYU_AQA_AUDIO_TRAIN HUANYU_USE_PRECOMPUTE MINICPMO_USE_PRECOMPUTE \
-    MINICPMO_TUNE_AUDIO MINICPMO_TUNE_VISION Q36_BACKWARD_PREFETCH; do
+    MINICPMO_TUNE_AUDIO MINICPMO_TUNE_VISION Q36_BACKWARD_PREFETCH GENRM_DUMP_DIR; do
     _huanyu_env_json="$(python3 -c 'import json, os, sys; print(json.dumps(os.environ[sys.argv[1]]))' "${_huanyu_env_key}")"
     _huanyu_ray_args+=("++ray_kwargs.ray_init.runtime_env.env_vars.${_huanyu_env_key}=${_huanyu_env_json}")
 done

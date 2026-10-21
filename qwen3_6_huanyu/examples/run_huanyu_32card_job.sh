@@ -5,13 +5,14 @@
 # Never stops an existing Ray cluster or deletes an old checkout.
 set -euo pipefail
 
-export PROJECT_ROOT="${PROJECT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+_HUANYU_EXAMPLE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export PROJECT_ROOT="${PROJECT_ROOT:-$(cd "${_HUANYU_EXAMPLE_DIR}/../.." && pwd)}"
 cd "$PROJECT_ROOT"
 # The downstream training entry also invokes python3; keep installation and
 # probes in that same interpreter environment.
 _PYTHON=python3
-_HELPER="$PROJECT_ROOT/verl_omni_ext/models/qwen3_6_huanyu/job_bootstrap.py"
-_ENV_FILE="${HUANYU_ENV_FILE:-$PROJECT_ROOT/env_export_huanyu.sh}"
+_HELPER="${_HUANYU_EXAMPLE_DIR}/job_bootstrap.py"
+_ENV_FILE="${HUANYU_ENV_FILE:-${_HUANYU_EXAMPLE_DIR}/env_export_huanyu.sh}"
 _VLLM_SOURCE="${HUANYU_VLLM_SOURCE:-/opt/huawei/dataset/hfy_guiyang/vllm-omni-xy-qwen-vit}"
 _VLLM_TARGET=/vllm-workspace/vllm-omni
 _RANK="${VC_TASK_INDEX:-}"
@@ -40,7 +41,6 @@ if (( _PORT > 65535 || _DASHBOARD_PORT > 65535 || _PORT == _DASHBOARD_PORT )); t
     echo 'FATAL: Ray and dashboard ports must be distinct values in 1..65535' >&2
     exit 2
 fi
-[[ -f "$_HELPER" && -f "$_ENV_FILE" ]] || { echo "FATAL: missing Huanyu package or env file" >&2; exit 1; }
 
 # Platform jobs are non-interactive and may never read the image's .bashrc
 # jemalloc export. Set it before Python/pip and the Ascend setup scripts (which
@@ -87,6 +87,7 @@ huanyu_preload_allocator() {
     done
 }
 huanyu_preload_allocator
+[[ -f "$_HELPER" && -f "$_ENV_FILE" ]] || { echo "FATAL: missing Huanyu package or env file" >&2; exit 1; }
 echo "[huanyu-job] allocator before Python/env setup: LD_PRELOAD=$LD_PRELOAD"
 _IPS="$("$_PYTHON" -B "$_HELPER" resolve "${VC_WORKER_HOSTS:-}")"
 IFS=, read -r -a _NODE_IPS <<< "$_IPS"
@@ -157,7 +158,7 @@ export WANDB_MODE="${WANDB_MODE:-offline}"
     echo "FATAL: cache manifest not readable on rank $_RANK: $HUANYU_EMBED_CACHE_DIR/manifest.json" >&2
     exit 1
 }
-"$_PYTHON" -B "$PROJECT_ROOT/verl_omni_ext/models/qwen3_6_huanyu/runtime_imports.py" \
+"$_PYTHON" -B "${_HUANYU_EXAMPLE_DIR}/check_native_runtime.py" \
     --check --expected-root "$_VLLM_TARGET"
 echo '[huanyu-job] native import check exited successfully'
 "$_PYTHON" -B "$_HELPER" check-devices

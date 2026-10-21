@@ -116,7 +116,7 @@ def shell_path(path):
 @unittest.skipUnless(find_bash(), "Bash is required for launcher argv integration")
 class AudioTrainingLauncherTests(unittest.TestCase):
     def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory(prefix="huanyu_aqa_launcher_")
+        self.temporary = tempfile.TemporaryDirectory(prefix="huanyu aqa launcher ")
         self.addCleanup(self.temporary.cleanup)
         self.project = Path(self.temporary.name)
         self.examples = self.project / "examples" / "qwen3_6_huanyu"
@@ -125,6 +125,8 @@ class AudioTrainingLauncherTests(unittest.TestCase):
             "run_huanyu_aqa_audio_train.sh",
             "run_huanyu_aqa_audio_train_16card.sh",
             "check_aqa_audio_train.py",
+            "check_native_runtime.py",
+            "run_output.sh",
         ):
             shutil.copyfile(EXAMPLES / name, self.examples / name)
         self.model = self.project / "verl_omni_ext" / "models" / "qwen3_6_huanyu"
@@ -144,7 +146,11 @@ class AudioTrainingLauncherTests(unittest.TestCase):
         )
         for name in ("run_qwen36_huanyu_32card.sh", "run_qwen36_huanyu_gspo_npu.sh"):
             (self.examples / name).write_text(
-                "#!/usr/bin/env bash\npython3 - \"$@\" <<'PY'\n" + capture + "\nPY\n", encoding="utf-8"
+                '#!/usr/bin/env bash\n'
+                'source "${PROJECT_ROOT}/examples/qwen3_6_huanyu/run_output.sh" || exit $?\n'
+                'echo "backend stdout marker"\n'
+                'echo "backend stderr marker" >&2\n'
+                'python3 - "$@" <<\'PY\'\n' + capture + "\nPY\n", encoding="utf-8"
             )
         self.audio = self.project / "audio.wav"
         self.audio.write_bytes(b"audio")
@@ -234,6 +240,57 @@ class AudioTrainingLauncherTests(unittest.TestCase):
         self.assertEqual(capture["env"]["HUANYU_USE_PRECOMPUTE"], "0")
         self.assertEqual(actual["trainer.total_training_steps"], "null")
 
+    def test_run_outputs_are_unique_and_override_inherited_genrm_path(self):
+        previous_logs = {}
+        stale_dump = self.project / "genrm_dump"
+        for entry in ("run_huanyu_aqa_audio_train.sh", "run_huanyu_aqa_audio_train_16card.sh"):
+            for repeat in range(2):
+                with self.subTest(entry=entry, repeat=repeat):
+                    result = self.run_script(
+                        {"GENRM_DUMP_DIR": shell_path(stale_dump)}, entry=entry,
+                        arguments=('++ray_kwargs.ray_init.runtime_env.env_vars.GENRM_DUMP_DIR="stale"',),
+                    )
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    capture = json.loads(self.capture.read_text())
+                    env = capture["env"]
+                    actual = dict(item.lstrip("+").split("=", 1) for item in capture["argv"])
+                    # Git Bash converts exported paths for native Python on
+                    # Windows. Compare resolved paths, not their shell spelling.
+                    run = self.project / "runs" / env["HUANYU_RUN_DIR"].rsplit("/", 1)[-1]
+                    self.assertTrue(run.is_dir())
+                    self.assertEqual(Path(env["HUANYU_RUN_DIR"]).resolve(), run.resolve())
+                    self.assertEqual(Path(env["HUANYU_CONSOLE_LOG"]).resolve(), (run / "console.log").resolve())
+                    self.assertEqual(Path(env["GENRM_DUMP_DIR"]).resolve(), (run / "genrm_dump").resolve())
+                    self.assertTrue((run / "genrm_dump").is_dir())
+                    self.assertEqual(
+                        json.loads(actual["ray_kwargs.ray_init.runtime_env.env_vars.GENRM_DUMP_DIR"]),
+                        env["GENRM_DUMP_DIR"],
+                    )
+                    log = run / "console.log"
+                    self.assertNotIn(log, previous_logs)
+                    contents = log.read_text(encoding="utf-8")
+                    for marker in ("[huanyu-output] run_dir=", "[huanyu-aqa-check] OK", "backend stdout marker", "backend stderr marker"):
+                        self.assertIn(marker, contents)
+                    self.assertEqual(contents.count("[huanyu-output] run_dir="), 1)
+                    self.assertEqual(contents.count("backend stdout marker"), 1)
+                    previous_logs[log] = log.read_bytes()
+                    for previous, expected in previous_logs.items():
+                        self.assertEqual(previous.read_bytes(), expected)
+        self.assertEqual(len(list((self.project / "runs").iterdir())), 4)
+        self.assertFalse(stale_dump.exists())
+        self.assertFalse((self.project / "run_qwen36_huanyu_gspo_npu.log").exists())
+
+    def test_backend_failure_is_logged_and_retains_exit_code(self):
+        (self.examples / "run_qwen36_huanyu_32card.sh").write_text(
+            '#!/usr/bin/env bash\necho "backend failure marker" >&2\nexit 23\n', encoding="utf-8",
+        )
+        result = self.run_script()
+        self.assertEqual(result.returncode, 23, result.stdout + result.stderr)
+        logs = list((self.project / "runs").glob("*/console.log"))
+        self.assertEqual(len(logs), 1)
+        self.assertIn("backend failure marker", logs[0].read_text(encoding="utf-8"))
+        self.assertFalse(self.capture.exists())
+
     def test_16card_entry_disables_rm_pool_and_overrides_stale_reward_options(self):
         result = self.run_script(
             {"RM_ENABLE": "1", "REWARD_POOL_NPUS": "16", "NNODES": "2", "NUM_NPUS": "32"},
@@ -311,7 +368,7 @@ class AudioTrainingLauncherTests(unittest.TestCase):
 
     def test_no_rm_path_preserves_genrm_paths_non_reward_omnimix_settings(self):
         # Exercise the real OmniMix wrapper, stubbing only the heavy base backend.
-        source = ROOT / "deploy" / "examples" / "qwen3_6_huanyu"
+        source = EXAMPLES
         name = "run_qwen36_huanyu_gspo_npu_omni_mix_genrm.sh"
         (self.examples / name).write_text((source / name).read_text(encoding="utf-8"), encoding="utf-8")
         (self.examples / "run_qwen36_huanyu_32card.sh").write_text(
@@ -350,7 +407,7 @@ class AudioTrainingLauncherTests(unittest.TestCase):
             with self.subTest(updates=updates):
                 result = self.run_script(updates)
                 self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-                self.assertIn(error, result.stderr)
+                self.assertIn(error, result.stdout + result.stderr)
                 self.assertFalse(self.capture.exists())
 
     def test_invalid_validation_source_stops_before_backend(self):
@@ -359,8 +416,11 @@ class AudioTrainingLauncherTests(unittest.TestCase):
         pq.write_table(pa.Table.from_pylist([bad]), self.validation)
         result = self.run_script()
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("mixed sources", result.stderr)
+        self.assertIn("mixed sources", result.stdout + result.stderr)
         self.assertFalse(self.capture.exists())
+        logs = list((self.project / "runs").glob("*/console.log"))
+        self.assertEqual(len(logs), 1)
+        self.assertIn("mixed sources", logs[0].read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

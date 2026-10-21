@@ -34,16 +34,17 @@
 #     from verl_omni.pipelines.model_base import OmniModelBase; \
 #     print(OmniModelBase.get_class_by_name('MiniCPMO', 'thinker'))"
 # -----------------------------------------------------------------------------
-set -x
-
 # Direct launches bypass run_q36_job.sh, which installs the local entry points.
 # A source checkout on sys.path is insufficient: plugin discovery uses installed
 # distribution metadata. Install before the first Python/plugin import.
-export PROJECT_ROOT="${PROJECT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+_HUANYU_EXAMPLE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export PROJECT_ROOT="${PROJECT_ROOT:-$(cd "${_HUANYU_EXAMPLE_DIR}/../.." && pwd)}"
 EXT_ROOT="${PROJECT_ROOT}"
+source "${_HUANYU_EXAMPLE_DIR}/run_output.sh" || exit $?
+set -x
 # All Huanyu entry points converge here. Apply before Python/plugin imports,
 # and append the same settings last in the training argv below.
-source "${PROJECT_ROOT}/verl_omni_ext/models/qwen3_6_huanyu/graph_mode.sh" || exit $?
+source "${_HUANYU_EXAMPLE_DIR}/graph_mode.sh" || exit $?
 echo "[huanyu-graph] HUANYU_GRAPH_MODE=${HUANYU_GRAPH_MODE} actor/RM.enforce_eager=${HUANYU_ENFORCE_EAGER} VLLM_TORCH_COMPILE=${VLLM_TORCH_COMPILE} TORCH_COMPILE_DISABLE=${TORCH_COMPILE_DISABLE} NPU_GRAPH_CAPTURE_DISABLE=${NPU_GRAPH_CAPTURE_DISABLE}"
 export PYTHONPATH="${EXT_ROOT}${PYTHONPATH:+:$PYTHONPATH}"
 # Match the job launcher for shared mounts. setuptools-scm strips Git environment
@@ -825,7 +826,7 @@ echo "=== 自检通过 ==="
 #   4/6  actor_rollout_ref.model.trust_remote_code=True      （Qwen3.5 版是 False）
 #   5/6  ...rollout.engine_kwargs.vllm_omni.pipeline_name=minicpmo_5_0
 #                                                            （Qwen3.5 版是 qwen3_5_moe）
-#   6/6  末尾 tee 的日志文件名
+#   6/6  run_output.sh 将控制台输出保存到本次运行的 runs 子目录
 # 除这三行外，整条命令与 run_qwen35_moe_thinker_gspo_npu.sh 逐字相同 ——
 # 唯一的例外是 data 段末尾展开的两个数组：
 #   "${_CHAT_TEMPLATE_ARGS[@]}"  enable_thinking，见上方 §4 末尾那一大段
@@ -1050,5 +1051,4 @@ python3 -m verl_omni.trainer.main_omni \
     trainer.test_freq=10 \
     trainer.total_epochs=10 \
     "$@" \
-    "${HUANYU_GRAPH_ARGS[@]}" \
-    2>&1 | tee run_qwen36_huanyu_gspo_npu.log
+    "${HUANYU_GRAPH_ARGS[@]}"

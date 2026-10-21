@@ -11,7 +11,8 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-LAUNCHER = ROOT / "deploy/examples/qwen3_6_huanyu/run_huanyu_32card_job.sh"
+EXAMPLES = ROOT / "examples"
+LAUNCHER = EXAMPLES / "run_huanyu_32card_job.sh"
 
 
 def find_bash():
@@ -52,15 +53,16 @@ class HuanyuJobLauncherTests(unittest.TestCase):
         self.examples.mkdir(parents=True)
         self.entry = self.examples / LAUNCHER.name
         shutil.copyfile(LAUNCHER, self.entry)
+        shutil.copyfile(EXAMPLES / "check_native_runtime.py", self.examples / "check_native_runtime.py")
         self.package = self.project / "verl_omni_ext/models/qwen3_6_huanyu"
         self.package.mkdir(parents=True)
         (self.project / "pyproject.toml").write_text("# fixture only\n", encoding="utf-8")
-        (self.project / "env_export_huanyu.sh").write_text(
+        (self.examples / "env_export_huanyu.sh").write_text(
             '#!/usr/bin/env bash\n'
             'python3 "$HUANYU_TEST_COMMAND_STUB" env-source\n'
             'export HUANYU_TEST_ENV_SOURCED=1\n', encoding="utf-8",
         )
-        (self.package / "job_bootstrap.py").write_text(
+        (self.examples / "job_bootstrap.py").write_text(
             RECORDER + """
 operation = sys.argv[1]
 record("helper", sys.argv[1:])
@@ -225,11 +227,13 @@ if command not in ("ray", "git", "pip", "flock", "env-source"):
                 env[key] = value
         command = [find_bash(), shell_path(self.entry), *arguments]
         if os.name == "nt" and "LD_PRELOAD" in env:
-            # Linux accepts spaces as preload separators, MSYS's own startup
-            # loader does not. Set this input after Bash starts; the unmodified
-            # launcher normalizes it before its first external command.
+            # MSYS cannot preload a Linux-style mixed/duplicate list while
+            # forking the path-discovery subshells. Keep it as a shell variable
+            # until the real launcher normalizes and exports it. Linux tests
+            # retain the inherited environment; all recorded child processes
+            # below still receive the launcher's actual exported LD_PRELOAD.
             env["HUANYU_TEST_INITIAL_PRELOAD"] = env.pop("LD_PRELOAD")
-            command = [find_bash(), "-c", 'export LD_PRELOAD="$HUANYU_TEST_INITIAL_PRELOAD"; source "$@"',
+            command = [find_bash(), "-c", 'LD_PRELOAD="$HUANYU_TEST_INITIAL_PRELOAD"; export -n LD_PRELOAD; source "$@"',
                        "huanyu-fixture", shell_path(self.entry), *arguments]
         return subprocess.run(
             command,
@@ -341,7 +345,7 @@ if command not in ("ray", "git", "pip", "flock", "env-source"):
     def test_environment_source_cannot_remove_selected_allocator(self):
         other = self.project / "libafterenv.so"
         self.write_preload_fixture(other)
-        env_file = self.project / "env_export_huanyu.sh"
+        env_file = self.examples / "env_export_huanyu.sh"
         env_file.write_text(
             env_file.read_text(encoding="utf-8")
             + f"export LD_PRELOAD='{shell_path(other)}'\n",

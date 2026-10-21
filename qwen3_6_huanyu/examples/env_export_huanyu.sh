@@ -1,5 +1,6 @@
 #!/bin/bash
 set -ex
+_huanyu_env_example_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Huanyu 环境；在每个节点 ray start 前 source 本文件。
 # source 前 export PROJECT_ROOT 可选择原目录或 gzq 副本；未设置时使用原目录。
@@ -68,7 +69,8 @@ done
 export PYTHONPATH="${HUANYU_VLLM_OMNI_ROOT}:${_huanyu_ext_python_root}:/opt/huawei/algorithm/:/opt/huawei/dataset/ccb_data/code/package_install/verl${_huanyu_retained_pythonpath:+:${_huanyu_retained_pythonpath}}"
 echo "[huanyu env] ext Python root: ${_huanyu_ext_python_root}"
 echo "[huanyu env] vLLM-Omni Python root: ${HUANYU_VLLM_OMNI_ROOT}"
-_huanyu_graph_mode_script="${_huanyu_ext_python_root}/verl_omni_ext/models/qwen3_6_huanyu/graph_mode.sh"
+_huanyu_graph_mode_script="${_huanyu_env_example_dir}/graph_mode.sh"
+unset _huanyu_env_example_dir
 unset _huanyu_candidate _huanyu_ext_python_root
 unset _huanyu_retained_pythonpath _huanyu_python_entries _huanyu_path
 

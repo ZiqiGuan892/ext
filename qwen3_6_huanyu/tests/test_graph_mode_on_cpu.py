@@ -12,7 +12,8 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-BACKEND = ROOT / "deploy" / "examples" / "qwen3_6_huanyu" / "run_qwen36_huanyu_gspo_npu.sh"
+EXAMPLES = ROOT / "examples"
+BACKEND = EXAMPLES / "run_qwen36_huanyu_gspo_npu.sh"
 ENV_PREFIX = "ray_kwargs.ray_init.runtime_env.env_vars."
 GRAPH_ENV = (
     "HUANYU_GRAPH_MODE",
@@ -42,10 +43,11 @@ class HuanyuGraphModeTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory(prefix="huanyu graph test ")
         self.addCleanup(self.temporary.cleanup)
         self.project = Path(self.temporary.name)
-        self.model = self.project / "verl_omni_ext" / "models" / "qwen3_6_huanyu"
-        self.model.mkdir(parents=True)
-        self.helper = self.model / "graph_mode.sh"
-        shutil.copyfile(ROOT / "graph_mode.sh", self.helper)
+        self.examples = self.project / "examples" / "qwen3_6_huanyu"
+        self.examples.mkdir(parents=True)
+        self.helper = self.examples / "graph_mode.sh"
+        shutil.copyfile(EXAMPLES / "graph_mode.sh", self.helper)
+        shutil.copyfile(EXAMPLES / "run_output.sh", self.examples / "run_output.sh")
         self.capture = self.project / "capture.json"
         self.capture_script = self.project / "capture.py"
         self.capture_script.write_text(
@@ -84,7 +86,7 @@ class HuanyuGraphModeTests(unittest.TestCase):
 
     def run_shell(self, body, updates=None, arguments=()):
         self.capture.unlink(missing_ok=True)
-        script = self.project / "run test.sh"
+        script = self.examples / "run test.sh"
         script.write_text("#!/usr/bin/env bash\nset -euo pipefail\n" + body, encoding="utf-8")
         return subprocess.run(
             [find_bash(), shell_path(script), *arguments],
@@ -128,7 +130,7 @@ class HuanyuGraphModeTests(unittest.TestCase):
 
     def test_unset_mode_defaults_to_eager_and_overrides_inherited_graph_flags(self):
         result = self.run_shell(
-            'source "${PROJECT_ROOT}/verl_omni_ext/models/qwen3_6_huanyu/graph_mode.sh"\n'
+            'source "${PROJECT_ROOT}/examples/qwen3_6_huanyu/graph_mode.sh"\n'
             'python3 "${HUANYU_GRAPH_ARGS[@]}"\n'
         )
         capture = self.read_capture(result)
@@ -139,7 +141,7 @@ class HuanyuGraphModeTests(unittest.TestCase):
         for value, mode in (("true", 1), ("1", 1), ("false", 0), ("0", 0)):
             with self.subTest(value=value):
                 result = self.run_shell(
-                    'source "${PROJECT_ROOT}/verl_omni_ext/models/qwen3_6_huanyu/graph_mode.sh"\n'
+                    'source "${PROJECT_ROOT}/examples/qwen3_6_huanyu/graph_mode.sh"\n'
                     'python3 "${HUANYU_GRAPH_ARGS[@]}"\n',
                     updates={
                         "HUANYU_GRAPH_MODE": value,
@@ -154,10 +156,10 @@ class HuanyuGraphModeTests(unittest.TestCase):
         for first, last in (("1", "0"), ("0", "1")):
             with self.subTest(first=first, last=last):
                 result = self.run_shell(
-                    'source "${PROJECT_ROOT}/verl_omni_ext/models/qwen3_6_huanyu/graph_mode.sh"\n'
+                    'source "${PROJECT_ROOT}/examples/qwen3_6_huanyu/graph_mode.sh"\n'
                     f"export HUANYU_GRAPH_MODE={last}\n"
                     "huanyu_configure_graph_mode\n"
-                    'source "${PROJECT_ROOT}/verl_omni_ext/models/qwen3_6_huanyu/graph_mode.sh"\n'
+                    'source "${PROJECT_ROOT}/examples/qwen3_6_huanyu/graph_mode.sh"\n'
                     'python3 "${HUANYU_GRAPH_ARGS[@]}"\n',
                     updates={"HUANYU_GRAPH_MODE": first},
                 )
@@ -169,7 +171,7 @@ class HuanyuGraphModeTests(unittest.TestCase):
         for value in ("auto", "2", "True ", "invalid"):
             with self.subTest(value=value):
                 result = self.run_shell(
-                    'source "${PROJECT_ROOT}/verl_omni_ext/models/qwen3_6_huanyu/graph_mode.sh" || exit $?\n'
+                    'source "${PROJECT_ROOT}/examples/qwen3_6_huanyu/graph_mode.sh" || exit $?\n'
                     'python3 "${HUANYU_GRAPH_ARGS[@]}"\n',
                     updates={"HUANYU_GRAPH_MODE": value},
                 )
@@ -203,10 +205,10 @@ class HuanyuGraphModeTests(unittest.TestCase):
         start = re.search(r"^python3 -m verl_omni\.trainer\.main_omni\b", text, flags=re.MULTILINE)
         self.assertIsNotNone(start, "Cannot locate the backend's real training command")
         # The actual multi-line command is retained, including its final argv
-        # ordering and tee. Only expensive preflight/setup above it is omitted.
+        # ordering. Only expensive preflight/setup above it is omitted.
         training_command = text[start.start():]
         setup = (
-            'source "${PROJECT_ROOT}/verl_omni_ext/models/qwen3_6_huanyu/graph_mode.sh"\n'
+            'source "${PROJECT_ROOT}/examples/qwen3_6_huanyu/graph_mode.sh"\n'
             "_CHAT_TEMPLATE_ARGS=()\n"
             "_DATASET_ARGS=()\n"
             "TRAIN_FILE=train.parquet VAL_FILE=validation.parquet MODEL_PATH=model\n"
