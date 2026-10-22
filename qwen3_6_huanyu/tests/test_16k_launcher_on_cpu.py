@@ -47,10 +47,25 @@ class Huanyu16KLauncherTests(unittest.TestCase):
             "MAX_PROMPT_LENGTH", "MAX_RESPONSE_LENGTH", "ROLLOUT_PROMPT_LENGTH",
             "ROLLOUT_MAX_MODEL_LEN", "MAX_TOKEN_LEN_PER_GPU", "MINICPMO_MM_PROMPT_BUDGET",
             "EXPERIMENT_NAME", "HUANYU_GRAPH_MODE",
+            "ACTOR_OFFLOAD_POLICY", "PPO_MICRO_BATCH_SIZE_PER_GPU",
+            "MINICPMO_FSDP2_PIN_MEMORY", "Q36_BACKWARD_PREFETCH",
         )
         capture.write_text(
             capture.read_text(encoding="utf-8").replace(
                 "keys = (\n", f"keys = {extra_keys!r} + (\n", 1
+            ),
+            encoding="utf-8",
+        )
+        # Also capture settings before raylet starts on either node. A worker
+        # never invokes the trainer, so checking only train.json misses it.
+        stub = self.fixture.command_stub
+        stub.write_text(
+            stub.read_text(encoding="utf-8").replace(
+                'record(command, sys.argv[2:])',
+                'record(command, sys.argv[2:], memory_env={key: os.environ.get(key) '
+                'for key in ("ACTOR_OFFLOAD_POLICY", "PPO_MICRO_BATCH_SIZE_PER_GPU", '
+                '"MINICPMO_FSDP2_PIN_MEMORY", "Q36_BACKWARD_PREFETCH")})',
+                1,
             ),
             encoding="utf-8",
         )
@@ -89,14 +104,47 @@ class Huanyu16KLauncherTests(unittest.TestCase):
         self.assertEqual(media, str(prompt + 32))
         return actual
 
+    def assert_memory_profile(self, capture):
+        actual = effective_arguments(capture)
+        for key, expected in {
+            "actor_rollout_ref.actor.use_dynamic_bsz": "false",
+            "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu": "1",
+            "actor_rollout_ref.rollout.log_prob_use_dynamic_bsz": "false",
+            "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu": "1",
+            "actor_rollout_ref.ref.log_prob_use_dynamic_bsz": "false",
+            "actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu": "1",
+            "actor_rollout_ref.actor.fsdp_config.offload_policy": "true",
+            "actor_rollout_ref.actor.fsdp_config.forward_prefetch": "false",
+            "actor_rollout_ref.actor.fsdp_config.reshard_after_forward": "true",
+            "actor_rollout_ref.ref.fsdp_config.forward_prefetch": "false",
+            "actor_rollout_ref.model.enable_activation_offload": "false",
+            "actor_rollout_ref.model.override_config.huanyu_sync_each_microbatch": "true",
+        }.items():
+            self.assertEqual(actual[key].lower(), expected, key)
+        for key, expected in {
+            "ACTOR_OFFLOAD_POLICY": "true", "PPO_MICRO_BATCH_SIZE_PER_GPU": "1",
+            "MINICPMO_FSDP2_PIN_MEMORY": "0", "Q36_BACKWARD_PREFETCH": "off",
+        }.items():
+            self.assertEqual(capture["env"][key], expected, key)
+        for key, expected in {
+            "MINICPMO_FSDP2_PIN_MEMORY": "0", "Q36_BACKWARD_PREFETCH": "off",
+        }.items():
+            self.assertEqual(json.loads(actual[ENV_PREFIX + key]), expected, key)
+        # Older server engine schemas do not accept this new upstream field;
+        # the Huanyu model option installs the compatibility hook instead.
+        self.assertFalse(any("use_no_sync_for_gradient_accumulation" in key for key in actual))
+
     def test_default_head_replaces_stale_5k_budgets_and_keeps_frozen_cache(self):
         capture = self.launch({
             "HUANYU_JOB_MODE": "aqa_unfreeze",
             "MAX_PROMPT_LENGTH": "3072", "MAX_RESPONSE_LENGTH": "512",
             "ROLLOUT_PROMPT_LENGTH": "3104", "ROLLOUT_MAX_MODEL_LEN": "5248",
             "MAX_TOKEN_LEN_PER_GPU": "5248", "MINICPMO_MM_PROMPT_BUDGET": "3104",
+            "ACTOR_OFFLOAD_POLICY": "false", "PPO_MICRO_BATCH_SIZE_PER_GPU": "8",
+            "MINICPMO_FSDP2_PIN_MEMORY": "1", "Q36_BACKWARD_PREFETCH": "on",
         })
         actual = self.assert_lengths(capture)
+        self.assert_memory_profile(capture)
         self.assertEqual(actual["actor_rollout_ref.model.override_config.attn_implementation"], "sdpa")
         self.assertEqual(actual["actor_rollout_ref.rollout.max_num_seqs"], "32")
         self.assertEqual(actual["actor_rollout_ref.rollout.disable_log_stats"], "false")
@@ -136,7 +184,11 @@ class Huanyu16KLauncherTests(unittest.TestCase):
                         self.assertFalse(self.fixture.events(kind), kind)
 
     def test_worker_joins_without_running_training(self):
-        result = self.fixture.run_launcher({"VC_TASK_INDEX": "1"})
+        result = self.fixture.run_launcher({
+            "VC_TASK_INDEX": "1", "ACTOR_OFFLOAD_POLICY": "false",
+            "PPO_MICRO_BATCH_SIZE_PER_GPU": "8", "MINICPMO_FSDP2_PIN_MEMORY": "1",
+            "Q36_BACKWARD_PREFETCH": "on",
+        })
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertFalse(self.fixture.events("train"))
         self.assertFalse(self.fixture.capture_file.exists())
@@ -145,6 +197,10 @@ class Huanyu16KLauncherTests(unittest.TestCase):
         self.assertIn("--address=192.0.2.10:6925", args)
         self.assertIn("--block", args)
         self.assertNotIn("--head", args)
+        self.assertEqual(self.fixture.events("ray")[0]["memory_env"], {
+            "ACTOR_OFFLOAD_POLICY": "true", "PPO_MICRO_BATCH_SIZE_PER_GPU": "1",
+            "MINICPMO_FSDP2_PIN_MEMORY": "0", "Q36_BACKWARD_PREFETCH": "off",
+        })
 
     def test_external_entry_uses_project_backend_not_adjacent_script(self):
         # Both script location and cwd differ from PROJECT_ROOT. A sibling
@@ -214,15 +270,18 @@ class Huanyu16KLauncherTests(unittest.TestCase):
 
     def test_final_backend_preserves_16k_against_mix_defaults(self):
         self.use_real_training_composition()
-        actual = self.assert_lengths(self.launch())
+        capture = self.launch({
+            "ACTOR_OFFLOAD_POLICY": "false", "PPO_MICRO_BATCH_SIZE_PER_GPU": "8",
+            "ACTOR_USE_DYNAMIC_BSZ": "true", "REF_LOG_PROB_USE_DYNAMIC_BSZ": "true",
+            "ROLLOUT_LOG_PROB_USE_DYNAMIC_BSZ": "true",
+        })
+        actual = self.assert_lengths(capture)
+        self.assert_memory_profile(capture)
         for key, expected in {
             "actor_rollout_ref.model.override_config.attn_implementation": "sdpa",
             "actor_rollout_ref.rollout.max_num_seqs": "32",
             "actor_rollout_ref.rollout.disable_log_stats": "false",
             "actor_rollout_ref.model.enable_gradient_checkpointing": "true",
-            "actor_rollout_ref.actor.use_dynamic_bsz": "true",
-            "actor_rollout_ref.rollout.log_prob_use_dynamic_bsz": "true",
-            "actor_rollout_ref.ref.log_prob_use_dynamic_bsz": "true",
             "actor_rollout_ref.rollout.enable_chunked_prefill": "false",
             "actor_rollout_ref.model.use_remove_padding": "false",
             "actor_rollout_ref.actor.fsdp_config.model_dtype": "fp32",
@@ -233,6 +292,7 @@ class Huanyu16KLauncherTests(unittest.TestCase):
             "reward.reward_model.rollout.enforce_eager": "true",
             "actor_rollout_ref.rollout.n": "4",
             "actor_rollout_ref.actor.ppo_mini_batch_size": "32",
+            "data.train_batch_size": "32",
         }.items():
             self.assertEqual(actual[key].lower(), expected, key)
 
@@ -245,6 +305,10 @@ class Huanyu16KLauncherTests(unittest.TestCase):
                 "actor_rollout_ref.model.override_config.attn_implementation=eager",
                 "actor_rollout_ref.rollout.max_num_seqs=16",
                 "actor_rollout_ref.rollout.enforce_eager=true",
+                "actor_rollout_ref.actor.use_dynamic_bsz=true",
+                "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2",
+                "actor_rollout_ref.actor.fsdp_config.offload_policy=false",
+                "++actor_rollout_ref.model.override_config.huanyu_sync_each_microbatch=false",
                 "trainer.total_training_steps=2",
                 "trainer.experiment_name=long context comparison",
             ),
@@ -252,6 +316,10 @@ class Huanyu16KLauncherTests(unittest.TestCase):
         actual = self.assert_lengths(capture)
         self.assertEqual(actual["actor_rollout_ref.model.override_config.attn_implementation"], "eager")
         self.assertEqual(actual["actor_rollout_ref.rollout.max_num_seqs"], "16")
+        self.assertEqual(actual["actor_rollout_ref.actor.use_dynamic_bsz"], "true")
+        self.assertEqual(actual["actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu"], "2")
+        self.assertEqual(actual["actor_rollout_ref.actor.fsdp_config.offload_policy"], "false")
+        self.assertEqual(actual["actor_rollout_ref.model.override_config.huanyu_sync_each_microbatch"], "false")
         self.assertEqual(actual["trainer.total_training_steps"], "2")
         self.assertEqual(actual["trainer.experiment_name"], "long context comparison")
         self.assertEqual(actual["actor_rollout_ref.rollout.enforce_eager"], "false")

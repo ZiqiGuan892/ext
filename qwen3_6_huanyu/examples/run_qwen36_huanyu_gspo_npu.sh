@@ -489,18 +489,16 @@ TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-64}
 
 # PPO_MINI_BATCH_SIZE：4 表示每批做 16 次更新。
 # GSPO 的 clip_ratio 只有 3e-4/4e-4，off-policy 漂移会被 clip 大量截断，
-# 若观察到 clip fraction 接近 1，理论上该调大这个值 ——
-# **但在 16 卡上调不动**：它会同比放大每卡序列数，而下面
-# PPO_MICRO_BATCH_SIZE_PER_GPU 的注释解释了为什么每卡 >4 条时两头都是 OOM。
-# 真要调，先加卡。
+# 调大 mini-batch 会增加每卡序列数；长序列应结合静态 micro-batch、
+# 每 micro-batch 梯度同步和 FSDP2 CPU offload，不能只改一个 batch 参数。
 PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-4}
 
 ROLLOUT_N=${ROLLOUT_N:-8}
 
 # -----------------------------------------------------------------------------
-# PPO_MICRO_BATCH_SIZE_PER_GPU —— 必须让「每卡 micro-batch 数 == 1」，否则必 OOM
+# PPO_MICRO_BATCH_SIZE_PER_GPU —— 需同时核对梯度同步策略
 # -----------------------------------------------------------------------------
-# 这不是调优参数，是这一版 verl 的硬约束。原因在
+# 默认 no_sync 梯度累积路径有较大的未分片梯度峰值。原因在
 # verl/workers/engine/fsdp/transformer_impl.py:672-698 `_gradient_sync_context`：
 # 除最后一个 micro-batch 外，它对 FSDP2 调 set_requires_gradient_sync(False)，
 # 其 docstring 自己承认代价是 "temporarily retaining unsharded gradients until
@@ -515,6 +513,11 @@ ROLLOUT_N=${ROLLOUT_N:-8}
 #     × 40 层                            ≈ 120 GiB      <- 单卡只有 61.27 GiB
 # 注意 CPUOffloadPolicy 救不了：它只搬 reduce-scatter **之后**的分片梯度，
 # 这条路径压根没走到 reduce-scatter。
+# 16K 入口设置静态 micro_bsz=1，并通过 Huanyu 专用
+# override_config.huanyu_sync_each_microbatch=true 强制每次 backward 同步，
+# 因此不会走上述 no_sync 路径。未启用此选项的流程保持原行为。
+# 本段只打印按静态 batch 计算的数量；动态 batch 使用 token budget 分组，
+# 不受 PPO_MICRO_BATCH_SIZE_PER_GPU 限制。
 #
 # micro-batch 数 = 每卡 mini-batch 序列数 / PPO_MICRO_BATCH_SIZE_PER_GPU，其中
 #     每卡 mini-batch 序列数 = PPO_MINI_BATCH_SIZE × rollout.n / world_size
@@ -533,20 +536,15 @@ _NUM_MICRO_BATCHES=$(( _SEQS_PER_RANK / PPO_MICRO_BATCH_SIZE_PER_GPU ))
 echo "Actor batching: ${_SEQS_PER_RANK} seq/rank / micro_bsz=${PPO_MICRO_BATCH_SIZE_PER_GPU}" \
      "=> ${_NUM_MICRO_BATCHES} micro-batch(es)"
 if [ "${_NUM_MICRO_BATCHES}" -gt 1 ]; then
-    echo "WARNING: micro-batch 数 > 1，会触发未分片 fp32 梯度囤积（约 3.0 GiB/层 × 40 层）。" >&2
-    echo "         除非你清楚自己在做什么，否则 OOM 几乎是必然的。" >&2
+    echo "Actor batching: 多 micro-batch 在默认 no_sync 路径下可能保留完整梯度。" >&2
+    echo "               16K 入口已请求每 micro-batch 同步；以 [huanyu-memory] 运行日志确认为准。" >&2
 fi
 if [ "${_SEQS_PER_RANK}" -gt 4 ]; then
-    echo "WARNING: 每卡 ${_SEQS_PER_RANK} 条序列。这一版 verl 在 ${_WORLD_SIZE} 卡下**没有安全解**：" >&2
-    echo "         micro_bsz 设小 -> 多 micro-batch -> 未分片梯度囤积 OOM；" >&2
-    echo "         micro_bsz 设大 -> 单次前反传激活/logits 撑爆 -> 同样 OOM。" >&2
-    echo "         唯一出路是加卡（抬 NNODES）或减小 PPO_MINI_BATCH_SIZE / ROLLOUT_N。" >&2
+    echo "Actor batching: 每卡 ${_SEQS_PER_RANK} 条序列；长序列需限制每次前反传的序列数，" >&2
+    echo "               并避免 no_sync 的完整梯度累积。16K 入口使用静态 micro_bsz=1 + CPU offload。" >&2
 fi
-# 如果 ${_SEQS_PER_RANK} 条序列的激活放不下，正确的退让顺序是：
-#   1) 缩序列长度（见下面 §4.5）—— 首选，因为 logits 栈跟长度是线性的；
-#   2) PPO_MINI_BATCH_SIZE 减半（4->2），每卡降到 1 条 —— 代价是 optimizer step 数翻倍，
-#      GSPO 的 clip 3e-4/4e-4 对 off-policy 漂移很敏感，改完盯 clip fraction；
-#   3) 最后才是动 micro_bsz —— 因为动它就会重新引入上面那条囤积路径。
+# 16K 入口保留 mini-batch、rollout.n 和序列上限，仅拆分 micro-batch 并同步
+# 分片梯度。即使只有一条序列，词表 logits/梯度仍很大，需服务器实测峰值。
 
 # =============================================================================
 # §4.5 序列长度 —— 单次前反传显存的主导项
