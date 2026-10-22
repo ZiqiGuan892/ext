@@ -6,17 +6,12 @@
 #   rollout prompt: 3104 -> 14368
 #   rollout max_model_len / max_num_batched_tokens: 5248 -> 16512
 #   actor PPO / rollout-logprob / ref-logprob token budgets: 5248 -> 16512
-#   actor/ref/rollout-logprob: dynamic batching -> static microbatch=1
-#   actor FSDP2 CPU offload_policy: false -> true; reshard_after_forward=true
-#   Huanyu backward: synchronize/shard gradients after EVERY microbatch
-#   actor/ref forward_prefetch=false; backward_prefetch=off; CPU pin_memory=0
 #   MINICPMO_MM_PROMPT_BUDGET: 3104 -> 14368 (also passed to Ray workers)
 #   rollout max_num_seqs: 64 -> 32
 #   rollout disable_log_stats: true -> false (enable throughput/cache stats)
 #   default experiment: huanyu_sampleall_cache_32card -> huanyu_16k_sampleall_cache_32card
-# Gradient checkpointing stays enabled. Global/mini batch, TP, sampling, GSPO,
-# FP32 master weights, GDN precision, frozen cache and GenRM are retained.
-# CPU offload trades throughput for headroom; activation offload stays disabled.
+# Gradient checkpointing and dynamic batching stay enabled. TP, sampling,
+# GSPO, FP32 master weights, GDN precision, frozen cache and GenRM are retained.
 #
 # Set PROJECT_ROOT to the absolute training-project path. This 16K script may
 # live anywhere; its backend always comes from PROJECT_ROOT/examples/qwen3_6_huanyu.
@@ -74,19 +69,7 @@ export MAX_PROMPT_LENGTH="$((16384 - MAX_RESPONSE_LENGTH))"
 export ROLLOUT_PROMPT_LENGTH="$((MAX_PROMPT_LENGTH + 32))"
 export ROLLOUT_MAX_MODEL_LEN=16512 MAX_TOKEN_LEN_PER_GPU=16512
 export MINICPMO_MM_PROMPT_BUDGET="$ROLLOUT_PROMPT_LENGTH"
-export PPO_MICRO_BATCH_SIZE_PER_GPU=1 ACTOR_OFFLOAD_POLICY=true
-export MINICPMO_FSDP2_PIN_MEMORY=0 Q36_BACKWARD_PREFETCH=off
 export EXPERIMENT_NAME="${EXPERIMENT_NAME:-huanyu_16k_sampleall_cache_32card}"
-
-# Huanyu uses padded [B,S] training inputs. Dynamic batching budgets effective
-# tokens, not B*max(S), and ignores ppo_micro_batch_size_per_gpu. Static size 1
-# prevents padding inflation without shortening a single trajectory. The
-# opt-in Huanyu sync guard prevents unsharded gradients from accumulating over
-# those microbatches, including verl versions without the newer config field.
-# CPUOffloadPolicy removes resident shard/gradient/Adam-state pressure during
-# backward; optimizer_offload alone reloads Adam states at train-mode entry.
-# Keep activation offload disabled: this server previously failed in its
-# activation tensor_pop path, and it changes the checkpoint implementation.
 
 # Preserve the existing batch size, rollout.n, TP, master dtype, GDN, GenRM,
 # cache validation and graph-mode policy. Chunked prefill remains off until
@@ -95,7 +78,6 @@ export EXPERIMENT_NAME="${EXPERIMENT_NAME:-huanyu_16k_sampleall_cache_32card}"
 # a server-side smoke test. This launcher does not change GDN precision.
 echo "[huanyu-16k] prompt=$MAX_PROMPT_LENGTH response=$MAX_RESPONSE_LENGTH total=16384 engine=$ROLLOUT_MAX_MODEL_LEN media_budget=$MINICPMO_MM_PROMPT_BUDGET"
 echo "[huanyu-16k] train_attention=$_HUANYU_16K_ATTN token_budget/gpu=$MAX_TOKEN_LEN_PER_GPU rollout_max_num_seqs=$_HUANYU_16K_SEQS graph_mode=${HUANYU_GRAPH_MODE:-0}"
-echo '[huanyu-16k] memory: static_microbatch=1 sync_each_microbatch=true fsdp2_cpu_offload=true activation_offload=false; global/mini batch and rollout.n unchanged'
 
 exec bash "$_HUANYU_16K_JOB" \
     "data.max_prompt_length=$MAX_PROMPT_LENGTH" \
@@ -108,23 +90,12 @@ exec bash "$_HUANYU_16K_JOB" \
     "actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=$MAX_TOKEN_LEN_PER_GPU" \
     "actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=$MAX_TOKEN_LEN_PER_GPU" \
     "actor_rollout_ref.model.override_config.attn_implementation=$_HUANYU_16K_ATTN" \
-    ++actor_rollout_ref.model.override_config.huanyu_sync_each_microbatch=true \
     actor_rollout_ref.model.enable_gradient_checkpointing=true \
-    actor_rollout_ref.model.enable_activation_offload=false \
-    actor_rollout_ref.actor.use_dynamic_bsz=false \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
-    actor_rollout_ref.actor.fsdp_config.offload_policy=true \
-    actor_rollout_ref.actor.fsdp_config.forward_prefetch=false \
-    actor_rollout_ref.actor.fsdp_config.reshard_after_forward=true \
-    actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=false \
-    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
-    actor_rollout_ref.ref.log_prob_use_dynamic_bsz=false \
-    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
-    actor_rollout_ref.ref.fsdp_config.forward_prefetch=false \
+    actor_rollout_ref.actor.use_dynamic_bsz=true \
+    actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=true \
+    actor_rollout_ref.ref.log_prob_use_dynamic_bsz=true \
     "actor_rollout_ref.rollout.max_num_seqs=$_HUANYU_16K_SEQS" \
     actor_rollout_ref.rollout.enable_chunked_prefill=false \
     actor_rollout_ref.rollout.disable_log_stats=false \
     "++ray_kwargs.ray_init.runtime_env.env_vars.MINICPMO_MM_PROMPT_BUDGET=\"${MINICPMO_MM_PROMPT_BUDGET}\"" \
-    '++ray_kwargs.ray_init.runtime_env.env_vars.MINICPMO_FSDP2_PIN_MEMORY="0"' \
-    '++ray_kwargs.ray_init.runtime_env.env_vars.Q36_BACKWARD_PREFETCH="off"' \
     "$@"
