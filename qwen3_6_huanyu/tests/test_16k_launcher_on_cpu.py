@@ -91,6 +91,7 @@ class Huanyu16KLauncherTests(unittest.TestCase):
 
     def test_default_head_replaces_stale_5k_budgets_and_keeps_frozen_cache(self):
         capture = self.launch({
+            "HUANYU_JOB_MODE": "aqa_unfreeze",
             "MAX_PROMPT_LENGTH": "3072", "MAX_RESPONSE_LENGTH": "512",
             "ROLLOUT_PROMPT_LENGTH": "3104", "ROLLOUT_MAX_MODEL_LEN": "5248",
             "MAX_TOKEN_LEN_PER_GPU": "5248", "MINICPMO_MM_PROMPT_BUDGET": "3104",

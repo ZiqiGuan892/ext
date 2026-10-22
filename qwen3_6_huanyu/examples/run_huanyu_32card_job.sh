@@ -2,6 +2,7 @@
 # Run on BOTH nodes. VC_TASK_INDEX=0 starts training; 1 only joins Ray.
 # Deploy to ${PROJECT_ROOT}/examples/qwen3_6_huanyu/ with the Huanyu package.
 # Defaults: frozen Huanyu, 35B sampleall, precomputed q128 cache, actor16 + RM16.
+# HUANYU_JOB_MODE=aqa_unfreeze selects online AQA training via its own entry.
 # Never stops an existing Ray cluster or deletes an old checkout.
 set -euo pipefail
 
@@ -20,6 +21,16 @@ _WAIT="${RAY_CLUSTER_WAIT_TIMEOUT:-900}"
 _INTERVAL="${RAY_CLUSTER_POLL_INTERVAL:-5}"
 _PORT="${RAY_PORT:-6925}"
 _DASHBOARD_PORT="${RAY_DASHBOARD_PORT:-8960}"
+_JOB_MODE="${HUANYU_JOB_MODE:-frozen_cache}"
+case "$_JOB_MODE" in
+    frozen_cache) _TRAIN_ENTRY=run_huanyu.sh ;;
+    aqa_unfreeze) _TRAIN_ENTRY=run_huanyu_aqa_audio_train.sh ;;
+    *) echo 'FATAL: HUANYU_JOB_MODE must be frozen_cache or aqa_unfreeze' >&2; exit 2 ;;
+esac
+[[ -f "$PROJECT_ROOT/examples/qwen3_6_huanyu/$_TRAIN_ENTRY" ]] || {
+    echo "FATAL: missing training entry $PROJECT_ROOT/examples/qwen3_6_huanyu/$_TRAIN_ENTRY" >&2
+    exit 1
+}
 for _command in "$_PYTHON" ray git pgrep flock timeout; do
     command -v "$_command" >/dev/null || { echo "FATAL: missing command $_command" >&2; exit 1; }
 done
@@ -145,19 +156,33 @@ export RAY_ADDRESS="$_MASTER_IP:$_PORT"
 export RAY_USAGE_STATS_ENABLED=0 PYTHONUNBUFFERED=1 HYDRA_FULL_ERROR=1
 export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
 export HUANYU_VLLM_OMNI_ROOT="$_VLLM_TARGET"
-export HUANYU_USE_PRECOMPUTE=1 HUANYU_FREEZE_AUDIO=true
-export HUANYU_EMBED_CACHE_DIR="${HUANYU_EMBED_CACHE_DIR:-/opt/huawei/dataset/ccb_data/data/omni/embed_cache_huanyu_sampleall_q128}"
-export MINICPMO_USE_PRECOMPUTE=0 MINICPMO_TUNE_AUDIO=0 MINICPMO_TUNE_VISION=0
-export HUANYU_AQA_AUDIO_TRAIN=0
+export MINICPMO_USE_PRECOMPUTE=0 MINICPMO_TUNE_VISION=0
+case "$_JOB_MODE" in
+    frozen_cache)
+        export HUANYU_USE_PRECOMPUTE=1 HUANYU_FREEZE_AUDIO=true
+        export HUANYU_EMBED_CACHE_DIR="${HUANYU_EMBED_CACHE_DIR:-/opt/huawei/dataset/ccb_data/data/omni/embed_cache_huanyu_sampleall_q128}"
+        export MINICPMO_TUNE_AUDIO=0 HUANYU_AQA_AUDIO_TRAIN=0
+        [[ -r "$HUANYU_EMBED_CACHE_DIR/manifest.json" ]] || {
+            echo "FATAL: cache manifest not readable on rank $_RANK: $HUANYU_EMBED_CACHE_DIR/manifest.json" >&2
+            exit 1
+        }
+        ;;
+    aqa_unfreeze)
+        # Apply before Ray starts on BOTH nodes, after the site environment.
+        # Empty the cache path as well as disabling it, including runtime_env
+        # below for workers launched by an already-running frozen-cache raylet.
+        export HUANYU_USE_PRECOMPUTE=0 HUANYU_FREEZE_AUDIO=false
+        export HUANYU_EMBED_CACHE_DIR=""
+        export MINICPMO_TUNE_AUDIO=1 HUANYU_AQA_AUDIO_TRAIN=1
+        export Q36_BACKWARD_PREFETCH=off
+        ;;
+esac
 export DEBUG_MODE=0 DEBUG_SAMPLES=0
 export NPUS_PER_NODE=16 NNODES=1 NUM_NPUS=16 REWARD_POOL_NPUS=16 ROLLOUT_TP=4
 export RM_ENABLE=1 RM_NNODES=1 RM_N_GPUS_PER_NODE=16 RM_TP=4 RM_SPLIT_NODES=1
 export NUM_GPUS_ACTOR_ROLLOUT_REWARD=16
 export WANDB_MODE="${WANDB_MODE:-offline}"
-[[ -r "$HUANYU_EMBED_CACHE_DIR/manifest.json" ]] || {
-    echo "FATAL: cache manifest not readable on rank $_RANK: $HUANYU_EMBED_CACHE_DIR/manifest.json" >&2
-    exit 1
-}
+echo "[huanyu-job] mode=$_JOB_MODE freeze_audio=$HUANYU_FREEZE_AUDIO precompute=$HUANYU_USE_PRECOMPUTE train_entry=$_TRAIN_ENTRY"
 "$_PYTHON" -B "${_HUANYU_EXAMPLE_DIR}/check_native_runtime.py" \
     --check --expected-root "$_VLLM_TARGET"
 echo '[huanyu-job] native import check exited successfully'
@@ -192,10 +217,10 @@ if (( _RANK == 0 )); then
         _value="$("$_PYTHON" -c 'import json, os, sys; print(json.dumps(os.environ[sys.argv[1]]))' "$_key")"
         _RUNTIME_ARGS+=("++ray_kwargs.ray_init.runtime_env.env_vars.${_key}=${_value}")
     done
-    echo '[huanyu-job] both nodes ready (16 + 16 NPU); head starting frozen-cache Huanyu training'
-    bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/run_huanyu.sh" \
+    echo "[huanyu-job] both nodes ready (16 + 16 NPU); head starting $_JOB_MODE Huanyu training"
+    bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/$_TRAIN_ENTRY" \
         "${_TRAIN_ARGS[@]}" \
-        ++actor_rollout_ref.model.override_config.huanyu_freeze_audio=true \
+        "++actor_rollout_ref.model.override_config.huanyu_freeze_audio=${HUANYU_FREEZE_AUDIO}" \
         "${_RUNTIME_ARGS[@]}"
 else
     timeout --foreground "${_WAIT}s" "$_PYTHON" -B "$_HELPER" wait-head \

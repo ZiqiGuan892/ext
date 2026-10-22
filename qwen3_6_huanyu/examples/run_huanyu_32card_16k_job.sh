@@ -35,6 +35,7 @@ if [[ -z "${PROJECT_ROOT:-}" || "$PROJECT_ROOT" != /* ]]; then
     exit 2
 fi
 export PROJECT_ROOT
+export HUANYU_JOB_MODE=frozen_cache
 _HUANYU_16K_JOB="${PROJECT_ROOT}/examples/qwen3_6_huanyu/run_huanyu_32card_job.sh"
 _HUANYU_16K_RESPONSE="${HUANYU_16K_RESPONSE_LENGTH:-2048}"
 _HUANYU_16K_ATTN="${HUANYU_16K_ATTN_IMPLEMENTATION:-sdpa}"
