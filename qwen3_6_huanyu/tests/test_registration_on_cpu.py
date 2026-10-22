@@ -64,6 +64,9 @@ class RegistrationTests(unittest.TestCase):
         entropy = ModuleType(f"{PACKAGE}.entropy")
         self.install_entropy = Mock()
         entropy.install_huanyu_entropy_chunking = self.install_entropy
+        sync_policy = ModuleType(f"{PACKAGE}.microbatch_sync")
+        self.install_sync = Mock()
+        sync_policy.install_huanyu_microbatch_sync = self.install_sync
         visual = ModuleType("verl_omni_ext.models.qwen3_6_whisper.forward")
         self.visual_patch = Mock()
         visual.patch_visual_fsdp_unshard = self.visual_patch
@@ -73,6 +76,7 @@ class RegistrationTests(unittest.TestCase):
             audio_runtime.__name__: audio_runtime,
             forward.__name__: forward,
             entropy.__name__: entropy,
+            sync_policy.__name__: sync_policy,
             visual.__name__: visual,
         })
         self.modules_patch.start()
@@ -135,6 +139,7 @@ class RegistrationTests(unittest.TestCase):
     def test_valid_model_uses_huanyu_loader_freezes_audio_and_installs_new_forward(self):
         result = self.adapter.configure_model(self.model, self.config)
         self.install_entropy.assert_called_once_with()
+        self.install_sync.assert_not_called()
         self.assertIs(result, self.model)
         self.base_configure.assert_called_once_with(self.model, self.config)
         self.attach.assert_called_once_with(self.model, self.config)
@@ -243,6 +248,23 @@ class RegistrationTests(unittest.TestCase):
     def test_entropy_installation_failure_is_not_silently_ignored(self):
         self.install_entropy.side_effect = RuntimeError("entropy utility missing")
         with self.assertRaisesRegex(RuntimeError, "entropy utility missing"):
+            self.adapter.configure_model(self.model, self.config)
+
+    def test_16k_config_installs_per_microbatch_sync_for_this_model(self):
+        self.model.config.huanyu_sync_each_microbatch = True
+        self.adapter.configure_model(self.model, self.config)
+        self.install_sync.assert_called_once_with(self.model)
+
+    def test_microbatch_sync_requires_a_boolean_hf_override(self):
+        self.model.config.huanyu_sync_each_microbatch = "false"
+        with self.assertRaisesRegex(ValueError, "huanyu_sync_each_microbatch must be a boolean"):
+            self.adapter.configure_model(self.model, self.config)
+        self.install_sync.assert_not_called()
+
+    def test_microbatch_sync_installation_failure_stops_configuration(self):
+        self.model.config.huanyu_sync_each_microbatch = True
+        self.install_sync.side_effect = RuntimeError("unsupported engine synchronization")
+        with self.assertRaisesRegex(RuntimeError, "unsupported engine synchronization"):
             self.adapter.configure_model(self.model, self.config)
 
     def test_text_and_audio_model_without_visual_still_installs_entropy(self):
