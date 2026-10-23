@@ -61,6 +61,9 @@ class RegistrationTests(unittest.TestCase):
         forward = ModuleType(f"{PACKAGE}.forward")
         self.install_forward = Mock()
         forward.install_huanyu_forward = self.install_forward
+        precision = ModuleType(f"{PACKAGE}.precision")
+        self.install_precision = Mock()
+        precision.install_huanyu_actor_precision = self.install_precision
         entropy = ModuleType(f"{PACKAGE}.entropy")
         self.install_entropy = Mock()
         entropy.install_huanyu_entropy_chunking = self.install_entropy
@@ -75,6 +78,7 @@ class RegistrationTests(unittest.TestCase):
             base.__name__: base,
             audio_runtime.__name__: audio_runtime,
             forward.__name__: forward,
+            precision.__name__: precision,
             entropy.__name__: entropy,
             sync_policy.__name__: sync_policy,
             visual.__name__: visual,
@@ -139,6 +143,7 @@ class RegistrationTests(unittest.TestCase):
     def test_valid_model_uses_huanyu_loader_freezes_audio_and_installs_new_forward(self):
         result = self.adapter.configure_model(self.model, self.config)
         self.install_entropy.assert_called_once_with()
+        self.install_precision.assert_called_once_with(self.model)
         self.install_sync.assert_not_called()
         self.assertIs(result, self.model)
         self.base_configure.assert_called_once_with(self.model, self.config)
@@ -173,6 +178,7 @@ class RegistrationTests(unittest.TestCase):
     def test_explicit_unfreeze_enables_both_audio_modules_before_optimizer(self):
         self.config.override_config = {"huanyu_freeze_audio": False}
         self.adapter.configure_model(self.model, self.config)
+        self.install_precision.assert_called_once_with(self.model)
         self.assertFalse(self.model.config.huanyu_freeze_audio)
         for part in (self.model.model.audio_encoder, self.model.model.audio_projection):
             self.assertTrue(all(parameter.requires_grad for parameter in part.parameters()))

@@ -47,6 +47,7 @@ class HuanyuGraphModeTests(unittest.TestCase):
         self.examples.mkdir(parents=True)
         self.helper = self.examples / "graph_mode.sh"
         shutil.copyfile(EXAMPLES / "graph_mode.sh", self.helper)
+        shutil.copyfile(EXAMPLES / "precision_mode.sh", self.examples / "precision_mode.sh")
         shutil.copyfile(EXAMPLES / "run_output.sh", self.examples / "run_output.sh")
         self.capture = self.project / "capture.json"
         self.capture_script = self.project / "capture.py"
@@ -209,6 +210,7 @@ class HuanyuGraphModeTests(unittest.TestCase):
         training_command = text[start.start():]
         setup = (
             'source "${PROJECT_ROOT}/examples/qwen3_6_huanyu/graph_mode.sh"\n'
+            'source "${PROJECT_ROOT}/examples/qwen3_6_huanyu/precision_mode.sh" "$@"\n'
             "_CHAT_TEMPLATE_ARGS=()\n"
             "_DATASET_ARGS=()\n"
             "TRAIN_FILE=train.parquet VAL_FILE=validation.parquet MODEL_PATH=model\n"

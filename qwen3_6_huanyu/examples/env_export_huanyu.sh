@@ -1,6 +1,9 @@
 #!/bin/bash
 set -ex
 _huanyu_env_example_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${_huanyu_env_example_dir}/precision_mode.sh" || {
+    return 2 2>/dev/null || exit 2
+}
 
 # Huanyu 环境；在每个节点 ray start 前 source 本文件。
 # source 前 export PROJECT_ROOT 可选择原目录或 gzq 副本；未设置时使用原目录。

@@ -372,7 +372,11 @@ class AudioTrainingLauncherTests(unittest.TestCase):
         name = "run_qwen36_huanyu_gspo_npu_omni_mix_genrm.sh"
         (self.examples / name).write_text((source / name).read_text(encoding="utf-8"), encoding="utf-8")
         (self.examples / "run_qwen36_huanyu_32card.sh").write_text(
-            '#!/usr/bin/env bash\nexec bash "$(dirname "$0")/'
+            '#!/usr/bin/env bash\n'
+            # This stub replaces the upper pool owner as well as its path
+            # checks. Supply the same pool contract to the real lower wrapper.
+            'export RM_TP=4 RM_N_GPUS_PER_NODE=16 RM_NNODES=1 RM_SPLIT_NODES=1\n'
+            'exec bash "$(dirname "$0")/'
             + name + '" "$@"\n', encoding="utf-8",
         )
         result = self.run_script({"RM_ENABLE": "1"})

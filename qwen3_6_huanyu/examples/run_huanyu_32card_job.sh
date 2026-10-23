@@ -3,6 +3,10 @@
 # Deploy to ${PROJECT_ROOT}/examples/qwen3_6_huanyu/ with the Huanyu package.
 # Defaults: frozen Huanyu, 35B sampleall, precomputed q128 cache, actor16 + RM16.
 # HUANYU_JOB_MODE=aqa_unfreeze selects online AQA training via its own entry.
+# Precision defaults: FP32/autocast-isolated training GDN, slot-local FP32
+# rollout GDN, layerwise IPC reload, logical KV zeroing and isolated vision.
+# Apply the same policy before Ray on BOTH nodes and explicitly in runtime_env
+# for training. Optional slow arithmetic references remain off by default.
 # Never stops an existing Ray cluster or deletes an old checkout.
 set -euo pipefail
 
@@ -14,6 +18,7 @@ cd "$PROJECT_ROOT"
 _PYTHON=python3
 _HELPER="${_HUANYU_EXAMPLE_DIR}/job_bootstrap.py"
 _ENV_FILE="${HUANYU_ENV_FILE:-${_HUANYU_EXAMPLE_DIR}/env_export_huanyu.sh}"
+_PRECISION_FILE="${_HUANYU_EXAMPLE_DIR}/precision_mode.sh"
 _VLLM_SOURCE="${HUANYU_VLLM_SOURCE:-/opt/huawei/dataset/hfy_guiyang/vllm-omni-xy-qwen-vit}"
 _VLLM_TARGET=/vllm-workspace/vllm-omni
 _RANK="${VC_TASK_INDEX:-}"
@@ -143,7 +148,9 @@ huanyu_preload_allocator() {
     done
 }
 huanyu_preload_allocator
-[[ -f "$_HELPER" && -f "$_ENV_FILE" ]] || { echo "FATAL: missing Huanyu package or env file" >&2; exit 1; }
+[[ -f "$_HELPER" && -f "$_ENV_FILE" && -f "$_PRECISION_FILE" ]] || {
+    echo "FATAL: missing Huanyu package, env file or precision_mode.sh" >&2; exit 1;
+}
 echo "[huanyu-job] allocator before Python/env setup: LD_PRELOAD=$LD_PRELOAD"
 _IPS="$("$_PYTHON" -B "$_HELPER" resolve "${VC_WORKER_HOSTS:-}")"
 IFS=, read -r -a _NODE_IPS <<< "$_IPS"
@@ -159,6 +166,15 @@ for _arg in "$@"; do
         --*=*) echo "[huanyu-job] ignoring scheduler argument ${_arg%%=*}" ;;
         *) _TRAIN_ARGS+=("$_arg") ;;
     esac
+done
+
+# Own the numerical policy at this entry, even with an older/custom site env.
+# Preserve explicit caller opt-outs for controlled comparisons; a site env
+# must not silently replace either those values or the corrected defaults.
+source "$_PRECISION_FILE" "${_TRAIN_ARGS[@]}" || exit $?
+declare -A _HUANYU_PRECISION_CONFIG=()
+for _key in "${HUANYU_PRECISION_KEYS[@]}"; do
+    _HUANYU_PRECISION_CONFIG["$_key"]="${!_key}"
 done
 
 export EXPERIMENT_NAME="${EXPERIMENT_NAME:-huanyu_sampleall_cache_32card}"
@@ -230,6 +246,14 @@ export REWARD_POOL_NPUS=$((RM_N_GPUS_PER_NODE * RM_NNODES))
 export NPUS_PER_NODE=16 RM_ENABLE=1
 export NUM_GPUS_ACTOR_ROLLOUT_REWARD=16
 export WANDB_MODE="${WANDB_MODE:-offline}"
+for _key in "${!_HUANYU_PRECISION_CONFIG[@]}"; do
+    export "$_key=${_HUANYU_PRECISION_CONFIG[$_key]}"
+done
+# Source our helper again after site settings and the final pool/cache mode.
+# This also prevents an older env file from selecting the Whisper engine hook.
+source "$_PRECISION_FILE" "${_TRAIN_ARGS[@]}" || exit $?
+echo "[huanyu-job] precision before Ray: train_GDN=${MINICPMO_HUANYU_GDN_FP32_TRAINING} rollout_GDN=${MINICPMO_GDN_FP32_REFERENCE} reload=${MINICPMO_HUANYU_LAYERWISE_RELOAD} KV_zero=${MINICPMO_HYBRID_BLOCK_ZERO_REFERENCE} isolate_media=${MINICPMO_ISOLATE_MEDIA_ENCODERS} actual_TP=${MINICPMO_HUANYU_ROLLOUT_TP}"
+echo "[huanyu-job] inference hooks: ${VLLM_OMNI_EXTERNAL_MODULES}"
 echo "[huanyu-job] mode=$_JOB_MODE freeze_audio=$HUANYU_FREEZE_AUDIO precompute=$HUANYU_USE_PRECOMPUTE train_entry=$_TRAIN_ENTRY"
 echo "[huanyu-job] physical=16x2 actor=${NUM_NPUS}x${NNODES} rollout_TP=$ROLLOUT_TP RM=${RM_N_GPUS_PER_NODE}x${RM_NNODES} RM_TP=$RM_TP requested=$((NUM_NPUS * NNODES + REWARD_POOL_NPUS))"
 "$_PYTHON" -B "${_HUANYU_EXAMPLE_DIR}/check_native_runtime.py" \
@@ -270,7 +294,7 @@ if (( _RANK == 0 )); then
     bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/$_TRAIN_ENTRY" \
         "${_TRAIN_ARGS[@]}" \
         "++actor_rollout_ref.model.override_config.huanyu_freeze_audio=${HUANYU_FREEZE_AUDIO}" \
-        "${_RUNTIME_ARGS[@]}"
+        "${_RUNTIME_ARGS[@]}" "${HUANYU_PRECISION_ARGS[@]}"
 else
     timeout --foreground "${_WAIT}s" "$_PYTHON" -B "$_HELPER" wait-head \
         --address "$RAY_ADDRESS" --timeout "$_WAIT" --interval "$_INTERVAL"

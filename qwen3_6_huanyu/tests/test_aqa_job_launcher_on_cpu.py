@@ -87,7 +87,7 @@ class AqaJobLauncherTests(unittest.TestCase):
         examples = self.fixture.examples
         for name in (
             "run_huanyu_aqa_audio_train.sh", "check_aqa_audio_train.py", "run_output.sh",
-            "graph_mode.sh", "run_qwen36_huanyu_gspo_npu_omni_mix_genrm.sh",
+            "graph_mode.sh", "precision_mode.sh", "run_qwen36_huanyu_gspo_npu_omni_mix_genrm.sh",
         ):
             shutil.copyfile(EXAMPLES / name, examples / name)
         # The intermediate 32-card wrapper checks the real server's model path.
@@ -104,6 +104,7 @@ class AqaJobLauncherTests(unittest.TestCase):
         (examples / "run_qwen36_huanyu_gspo_npu.sh").write_text(
             '#!/usr/bin/env bash\nset -euo pipefail\n'
             'source "${PROJECT_ROOT}/examples/qwen3_6_huanyu/graph_mode.sh"\n'
+            'source "${PROJECT_ROOT}/examples/qwen3_6_huanyu/precision_mode.sh" "$@"\n'
             '_CHAT_TEMPLATE_ARGS=()\n_DATASET_ARGS=()\nROLLOUT_NUM_WORKERS=4\n'
             + backend[command.start():], encoding="utf-8", newline="\n",
         )

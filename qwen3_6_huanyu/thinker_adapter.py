@@ -102,6 +102,7 @@ class Qwen36HuanyuThinkerAdapter(OmniModelBase):
         )
         from .entropy import install_huanyu_entropy_chunking
         from .forward import install_huanyu_forward
+        from .precision import install_huanyu_actor_precision
 
         validate_huanyu_config(module.config)
         if _value(model_config, "use_remove_padding", True):
@@ -147,6 +148,7 @@ class Qwen36HuanyuThinkerAdapter(OmniModelBase):
         else:
             configure_trainable_audio(module, checkpoint_chunks=resolve_audio_checkpointing(model_config))
             cache_args = dict(encode_audio=encode_trainable_huanyu_audio, require_audio_only=True)
+        install_huanyu_actor_precision(module)
         install_huanyu_forward(module, **token_ids, **cache_args)
         # old_log_prob may call the unchunked verl utility despite the engine
         # chunk flags. Install here, after Huanyu validation/loading succeeds.

@@ -223,6 +223,7 @@ class Huanyu16KLauncherTests(unittest.TestCase):
         mix = "run_qwen36_huanyu_gspo_npu_omni_mix_genrm.sh"
         shutil.copyfile(EXAMPLES / mix, examples / mix)
         shutil.copyfile(EXAMPLES / "graph_mode.sh", examples / "graph_mode.sh")
+        shutil.copyfile(EXAMPLES / "precision_mode.sh", examples / "precision_mode.sh")
         source = (EXAMPLES / "run_huanyu.sh").read_text(encoding="utf-8")
         start = source.index('exec bash "${PROJECT_ROOT}/examples/qwen3_6_huanyu/')
         # Retain the real Huanyu entry's final protected overrides. The middle
@@ -241,6 +242,7 @@ class Huanyu16KLauncherTests(unittest.TestCase):
         (examples / "run_qwen36_huanyu_gspo_npu.sh").write_text(
             '#!/usr/bin/env bash\nset -euo pipefail\n'
             'source "${PROJECT_ROOT}/examples/qwen3_6_huanyu/graph_mode.sh"\n'
+            'source "${PROJECT_ROOT}/examples/qwen3_6_huanyu/precision_mode.sh" "$@"\n'
             '_CHAT_TEMPLATE_ARGS=()\n_DATASET_ARGS=()\n'
             'DEFAULT_LOCAL_DIR="${PROJECT_ROOT}/checkpoints"\n'
             + workers.group(0) + "\n"

@@ -45,6 +45,7 @@ set -x
 # All Huanyu entry points converge here. Apply before Python/plugin imports,
 # and append the same settings last in the training argv below.
 source "${_HUANYU_EXAMPLE_DIR}/graph_mode.sh" || exit $?
+source "${_HUANYU_EXAMPLE_DIR}/precision_mode.sh" "$@" || exit $?
 echo "[huanyu-graph] HUANYU_GRAPH_MODE=${HUANYU_GRAPH_MODE} actor/RM.enforce_eager=${HUANYU_ENFORCE_EAGER} VLLM_TORCH_COMPILE=${VLLM_TORCH_COMPILE} TORCH_COMPILE_DISABLE=${TORCH_COMPILE_DISABLE} NPU_GRAPH_CAPTURE_DISABLE=${NPU_GRAPH_CAPTURE_DISABLE}"
 export PYTHONPATH="${EXT_ROOT}${PYTHONPATH:+:$PYTHONPATH}"
 # Match the job launcher for shared mounts. setuptools-scm strips Git environment
@@ -64,7 +65,7 @@ export CPATH=/usr/include${CPATH:+:$CPATH}
 export VLLM_ASCEND_ENABLE_NZ=0
 # 改动 A/B/C：加载链三件套（verl_omni 上游注册 + out-of-tree 包 + GP-004 vllm-omni 侧）
 export VERL_USE_EXTERNAL_MODULES=verl_omni,verl_omni_ext
-export VLLM_OMNI_EXTERNAL_MODULES=verl_omni_ext.models.qwen3_6_whisper.vllm_omni
+# precision_mode.sh selects the Huanyu worker hooks and shared pipeline registry.
 export VERL_OMNI_EXT_PATCH_STRICT=1       # L2 补丁未打上直接 raise（改动 C）
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export VLLM_USE_V1=0
@@ -936,6 +937,9 @@ echo "=== 自检通过 ==="
 # 命令在注释前就结束，后面所有覆盖被静默丢弃 —— 2026-10-12 02:0x 实测：`output_mode=ar`
 # 被丢 ⇒ ARStrategy 退化成 DiffusionStrategy ⇒ `ConfigKeyError: Key 'hf_config_path'
 # not in 'DiffusionModelConfig'`，每轮 4 分钟就死）。同类说明只能写在命令**之前或之后**。
+# Refresh after all environment defaults and append last for reused Raylets.
+huanyu_configure_precision_mode "$@" || exit $?
+echo "[huanyu-precision] training_GDN=${MINICPMO_HUANYU_GDN_FP32_TRAINING} rollout_GDN=${MINICPMO_GDN_FP32_REFERENCE} layerwise_reload=${MINICPMO_HUANYU_LAYERWISE_RELOAD} actual_TP=${MINICPMO_HUANYU_ROLLOUT_TP} cache=${HUANYU_USE_PRECOMPUTE}"
 python3 -m verl_omni.trainer.main_omni \
     trainer.device=npu \
     \
@@ -1051,4 +1055,5 @@ python3 -m verl_omni.trainer.main_omni \
     trainer.test_freq=10 \
     trainer.total_epochs=10 \
     "$@" \
-    "${HUANYU_GRAPH_ARGS[@]}"
+    "${HUANYU_GRAPH_ARGS[@]}" \
+    "${HUANYU_PRECISION_ARGS[@]}"

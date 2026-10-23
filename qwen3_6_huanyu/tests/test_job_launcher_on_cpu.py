@@ -34,7 +34,17 @@ from pathlib import Path
 import sys
 
 def record(kind, args, **extra):
-    item = dict(kind=kind, args=args, preload=os.environ.get("LD_PRELOAD"), **extra)
+    precision_names = (
+        "MINICPMO_HUANYU_GDN_FP32_TRAINING", "MINICPMO_GDN_FP32_REFERENCE",
+        "MINICPMO_HUANYU_LAYERWISE_RELOAD", "MINICPMO_HYBRID_BLOCK_ZERO_REFERENCE",
+        "MINICPMO_ISOLATE_MEDIA_ENCODERS", "MINICPMO_STABLE_LINEAR",
+        "MINICPMO_GDN_PREFILL_REFERENCE", "MINICPMO_MOE_TP_REFERENCE",
+        "MINICPMO_ROW_TP_REFERENCE", "MINICPMO_HUANYU_ROLLOUT_TP",
+        "VLLM_OMNI_EXTERNAL_MODULES", "HUANYU_USE_PRECOMPUTE",
+        "HCCL_OP_EXPANSION_MODE", "HCCL_DETERMINISTIC",
+    )
+    item = dict(kind=kind, args=args, preload=os.environ.get("LD_PRELOAD"),
+                precision={key: os.environ.get(key) for key in precision_names}, **extra)
     with Path(os.environ["HUANYU_TEST_EVENTS"]).open("a", encoding="utf-8") as stream:
         stream.write(json.dumps(item) + "\\n")
 """
@@ -53,6 +63,7 @@ class HuanyuJobLauncherTests(unittest.TestCase):
         self.examples.mkdir(parents=True)
         self.entry = self.examples / LAUNCHER.name
         shutil.copyfile(LAUNCHER, self.entry)
+        shutil.copyfile(EXAMPLES / "precision_mode.sh", self.examples / "precision_mode.sh")
         shutil.copyfile(EXAMPLES / "check_native_runtime.py", self.examples / "check_native_runtime.py")
         self.package = self.project / "verl_omni_ext/models/qwen3_6_huanyu"
         self.package.mkdir(parents=True)
@@ -252,6 +263,23 @@ if command not in ("ray", "git", "pip", "flock", "env-source"):
     def assert_success(self, result):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def assert_precision_defaults(self, event):
+        for key in (
+            "MINICPMO_HUANYU_GDN_FP32_TRAINING", "MINICPMO_GDN_FP32_REFERENCE",
+            "MINICPMO_HUANYU_LAYERWISE_RELOAD", "MINICPMO_HYBRID_BLOCK_ZERO_REFERENCE",
+            "MINICPMO_ISOLATE_MEDIA_ENCODERS",
+        ):
+            self.assertEqual(event["precision"][key], "1", event)
+        for key in (
+            "MINICPMO_STABLE_LINEAR", "MINICPMO_GDN_PREFILL_REFERENCE",
+            "MINICPMO_MOE_TP_REFERENCE", "MINICPMO_ROW_TP_REFERENCE",
+        ):
+            self.assertEqual(event["precision"][key], "0", event)
+        self.assertEqual(event["precision"]["VLLM_OMNI_EXTERNAL_MODULES"],
+                         "verl_omni_ext.models.qwen3_6_huanyu.vllm_omni", event)
+        self.assertEqual(event["precision"]["MINICPMO_HUANYU_ROLLOUT_TP"], "4", event)
+        self.assertEqual(event["precision"]["HUANYU_USE_PRECOMPUTE"], "1", event)
+
     def test_head_starts_ray_then_waits_before_starting_training_once(self):
         result = self.run_launcher()
         self.assert_success(result)
@@ -273,6 +301,9 @@ if command not in ("ray", "git", "pip", "flock", "env-source"):
             "install", "--no-build-isolation", "--no-deps", "-e",
         ])
         self.assertEqual(len(self.events("runtime")), 1)
+        for kind in ("runtime", "ray", "train"):
+            for event in self.events(kind):
+                self.assert_precision_defaults(event)
 
     def test_worker_joins_head_with_block_and_never_runs_training(self):
         result = self.run_launcher({"VC_TASK_INDEX": "1"})
@@ -286,6 +317,76 @@ if command not in ("ray", "git", "pip", "flock", "env-source"):
         self.assertTrue(any(event["args"][0] == "wait-head" for event in self.events("helper")))
         self.assertFalse(self.events("train"))
         self.assertFalse(self.capture_file.exists())
+        for kind in ("runtime", "ray"):
+            for event in self.events(kind):
+                self.assert_precision_defaults(event)
+
+    def test_site_env_cannot_override_precision_defaults_or_explicit_opt_out(self):
+        env_file = self.examples / "env_export_huanyu.sh"
+        env_file.write_text(
+            env_file.read_text(encoding="utf-8")
+            + "export MINICPMO_GDN_FP32_REFERENCE=1\n"
+            + "export MINICPMO_HUANYU_GDN_FP32_TRAINING=0\n"
+            + "export MINICPMO_HUANYU_LAYERWISE_RELOAD=0\n"
+            + "export MINICPMO_STABLE_LINEAR=0\n"
+            + "export MINICPMO_GDN_PREFILL_REFERENCE=1\n"
+            + "export VLLM_OMNI_EXTERNAL_MODULES=verl_omni_ext.models.qwen3_6_whisper.vllm_omni\n",
+            encoding="utf-8",
+        )
+        result = self.run_launcher({
+            "MINICPMO_GDN_FP32_REFERENCE": "0", "MINICPMO_STABLE_LINEAR": "1",
+        })
+        self.assert_success(result)
+        expected = {
+            "MINICPMO_GDN_FP32_REFERENCE": "0",
+            "MINICPMO_HUANYU_GDN_FP32_TRAINING": "1",
+            "MINICPMO_HUANYU_LAYERWISE_RELOAD": "1",
+            "MINICPMO_STABLE_LINEAR": "1",
+            "MINICPMO_GDN_PREFILL_REFERENCE": "0",
+            "VLLM_OMNI_EXTERNAL_MODULES": "verl_omni_ext.models.qwen3_6_huanyu.vllm_omni",
+        }
+        actual = dict(arg.lstrip("+").split("=", 1)
+                      for arg in json.loads(self.capture_file.read_text())["argv"])
+        for key, value in expected.items():
+            for kind in ("runtime", "ray", "train"):
+                for event in self.events(kind):
+                    self.assertEqual(event["precision"][key], value, event)
+            self.assertEqual(json.loads(actual[
+                "ray_kwargs.ray_init.runtime_env.env_vars." + key
+            ]), value)
+
+    def test_reused_ray_gets_actual_tp_cache_and_late_hccl_as_quoted_runtime_strings(self):
+        env_file = self.examples / "env_export_huanyu.sh"
+        env_file.write_text(
+            env_file.read_text(encoding="utf-8")
+            + "export HCCL_OP_EXPANSION_MODE=AIV HCCL_DETERMINISTIC=true\n"
+            + "export ROLLOUT_TP=4 HUANYU_USE_PRECOMPUTE=0\n",
+            encoding="utf-8",
+        )
+        result = self.run_launcher(
+            {"HUANYU_TEST_RAY_LIVE": "1"},
+            arguments=("actor_rollout_ref.rollout.tensor_model_parallel_size=8",),
+        )
+        self.assert_success(result)
+        self.assertFalse(self.events("ray"))
+        capture = json.loads(self.capture_file.read_text())
+        actual = dict(arg.lstrip("+").split("=", 1) for arg in capture["argv"])
+        expected = {
+            "MINICPMO_HUANYU_ROLLOUT_TP": "8", "HUANYU_USE_PRECOMPUTE": "1",
+            "HCCL_OP_EXPANSION_MODE": "AIV", "HCCL_DETERMINISTIC": "true",
+            "MINICPMO_HUANYU_GDN_FP32_TRAINING": "1",
+            "MINICPMO_GDN_FP32_REFERENCE": "1", "MINICPMO_HUANYU_LAYERWISE_RELOAD": "1",
+            "MINICPMO_HYBRID_BLOCK_ZERO_REFERENCE": "1", "MINICPMO_ISOLATE_MEDIA_ENCODERS": "1",
+            "MINICPMO_STABLE_LINEAR": "0",
+            "VLLM_OMNI_EXTERNAL_MODULES": "verl_omni_ext.models.qwen3_6_huanyu.vllm_omni",
+        }
+        for key, value in expected.items():
+            self.assertEqual(json.loads(actual[
+                "ray_kwargs.ray_init.runtime_env.env_vars." + key
+            ]), value)
+            for kind in ("runtime", "train"):
+                for event in self.events(kind):
+                    self.assertEqual(event["precision"][key], value, event)
 
     def test_allocator_precedes_first_python_probe_pip_env_source_and_ray(self):
         result = self.run_launcher()
