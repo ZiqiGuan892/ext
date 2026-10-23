@@ -22,6 +22,14 @@ MODE_ENV = {
     "MINICPMO_TUNE_AUDIO": "1", "MINICPMO_TUNE_VISION": "0",
     "HUANYU_EMBED_CACHE_DIR": "", "Q36_BACKWARD_PREFETCH": "off",
 }
+PRECISION_ENV = {
+    "MINICPMO_HUANYU_GDN_FP32_TRAINING": "1", "MINICPMO_GDN_FP32_REFERENCE": "1",
+    "MINICPMO_HUANYU_LAYERWISE_RELOAD": "1", "MINICPMO_HYBRID_BLOCK_ZERO_REFERENCE": "1",
+    "MINICPMO_ISOLATE_MEDIA_ENCODERS": "1", "MINICPMO_STABLE_LINEAR": "0",
+    "MINICPMO_GDN_PREFILL_REFERENCE": "0", "MINICPMO_MOE_TP_REFERENCE": "0",
+    "MINICPMO_ROW_TP_REFERENCE": "0", "MINICPMO_HUANYU_ROLLOUT_TP": "4",
+    "VLLM_OMNI_EXTERNAL_MODULES": "verl_omni_ext.models.qwen3_6_huanyu.engine_hooks",
+}
 
 # Import fixture helpers by path, without importing the optional model package.
 _spec = importlib.util.spec_from_file_location(
@@ -80,6 +88,13 @@ class AqaJobLauncherTests(unittest.TestCase):
                 'record(command, sys.argv[2:], env=dict(os.environ))',
             ), encoding="utf-8",
         )
+        native = self.fixture.package / "runtime_imports.py"
+        native.write_text(
+            native.read_text(encoding="utf-8").replace(
+                'record("runtime", sys.argv[1:])',
+                'record("runtime", sys.argv[1:], env=dict(os.environ))',
+            ), encoding="utf-8",
+        )
         self.use_real_training_composition()
 
     def use_real_training_composition(self):
@@ -127,15 +142,21 @@ class AqaJobLauncherTests(unittest.TestCase):
     def assert_online_environment(self, env):
         for key, value in MODE_ENV.items():
             self.assertEqual(env[key], value, key)
+
         for key, value in {
             "HUANYU_JOB_MODE": "aqa_unfreeze", "NNODES": "1", "NUM_NPUS": "16",
             "REWARD_POOL_NPUS": "16", "RM_ENABLE": "1",
         }.items():
             self.assertEqual(env[key], value, key)
 
+    def assert_precision_environment(self, env, overrides=None):
+        for key, value in dict(PRECISION_ENV, **(overrides or {})).items():
+            self.assertEqual(env[key], value, key)
+
     def test_head_uses_aqa_online_static_training_and_genrm_with_5k_budget(self):
         capture = self.launch({"TOTAL_TRAINING_STEPS": "2"})
         self.assert_online_environment(capture["env"])
+        self.assert_precision_environment(capture["env"])
         actual = effective_arguments(capture)
         expected = {
             "data.train_files": self.train.as_posix(),
@@ -144,6 +165,9 @@ class AqaJobLauncherTests(unittest.TestCase):
             "actor_rollout_ref.model.architecture": "Qwen36HuanyuForTraining",
             "actor_rollout_ref.model.override_config.huanyu_freeze_audio": "false",
             "actor_rollout_ref.model.use_remove_padding": "false",
+            "actor_rollout_ref.actor.fsdp_config.model_dtype": "fp32",
+            "actor_rollout_ref.rollout.engine_kwargs.vllm_omni.pipeline_name": "qwen3_6_huanyu",
+            "actor_rollout_ref.rollout.enable_prefix_caching": "false",
             "data.max_prompt_length": "3072", "data.max_response_length": "2048",
             "actor_rollout_ref.rollout.prompt_length": "3072",
             "actor_rollout_ref.rollout.response_length": "2048",
@@ -167,7 +191,7 @@ class AqaJobLauncherTests(unittest.TestCase):
         for key, value in expected.items():
             observed = actual[key].lower() if value in ("true", "false") else actual[key]
             self.assertEqual(observed, value, key)
-        for key, value in MODE_ENV.items():
+        for key, value in dict(MODE_ENV, **PRECISION_ENV).items():
             self.assertEqual(json.loads(actual[ENV_PREFIX + key]), value, key)
         self.assertEqual(json.loads(actual[ENV_PREFIX + "MINICPMO_MM_PROMPT_BUDGET"]), "3072")
         self.assertNotIn("audio_encoder", actual["actor_rollout_ref.model.exclude_modules"])
@@ -175,6 +199,9 @@ class AqaJobLauncherTests(unittest.TestCase):
         self.assertEqual(capture["env"]["EXPERIMENT_NAME"], "huanyu_aqa_unfreeze_5k_32card")
         self.assertIn("--head", self.fixture.events("ray")[0]["args"])
         self.assertEqual(len(self.fixture.events("train")), 1)
+        for event in self.fixture.events("runtime") + self.fixture.events("ray"):
+            self.assert_online_environment(event["env"])
+            self.assert_precision_environment(event["env"])
 
     def test_external_entry_overrides_inherited_frozen_sampleall_and_16k_settings(self):
         temporary = tempfile.TemporaryDirectory(prefix=".external_aqa_", dir=ROOT / "tests")
@@ -222,6 +249,37 @@ class AqaJobLauncherTests(unittest.TestCase):
         self.assertIn("--block", ray[0]["args"])
         self.assertNotIn("--head", ray[0]["args"])
         self.assert_online_environment(ray[0]["env"])
+        self.assert_precision_environment(ray[0]["env"])
+        for event in self.fixture.events("runtime"):
+            self.assert_online_environment(event["env"])
+            self.assert_precision_environment(event["env"])
+
+    def test_precision_policy_survives_site_env_and_reaches_existing_ray(self):
+        env_file = self.fixture.examples / "env_export_huanyu.sh"
+        with env_file.open("a", encoding="utf-8") as stream:
+            stream.write(
+                "export MINICPMO_HUANYU_GDN_FP32_TRAINING=0 MINICPMO_HUANYU_LAYERWISE_RELOAD=0\n"
+                "export MINICPMO_GDN_FP32_REFERENCE=1 MINICPMO_STABLE_LINEAR=1\n"
+                "export VLLM_OMNI_EXTERNAL_MODULES=old.whisper.entry ROLLOUT_TP=8\n"
+            )
+        explicit = {"MINICPMO_GDN_FP32_REFERENCE": "0", "MINICPMO_MOE_TP_REFERENCE": "4"}
+        capture = self.launch(dict(explicit, HUANYU_TEST_RAY_LIVE="1", ROLLOUT_TP="8"), (
+            "actor_rollout_ref.rollout.tensor_model_parallel_size=8",
+            '++ray_kwargs.ray_init.runtime_env.env_vars.MINICPMO_HUANYU_LAYERWISE_RELOAD="0"',
+            "actor_rollout_ref.rollout.enable_prefix_caching=true",
+        ))
+        self.assert_online_environment(capture["env"])
+        self.assert_precision_environment(capture["env"], explicit)
+        actual = effective_arguments(capture)
+        self.assertEqual(actual["actor_rollout_ref.rollout.tensor_model_parallel_size"], "4")
+        self.assertEqual(actual["actor_rollout_ref.rollout.enable_prefix_caching"], "false")
+        for key, value in dict(PRECISION_ENV, **explicit).items():
+            self.assertEqual(json.loads(actual[ENV_PREFIX + key]), value, key)
+        self.assertTrue(self.fixture.events("runtime"))
+        for event in self.fixture.events("runtime") + self.fixture.events("ray"):
+            self.assert_online_environment(event["env"])
+            self.assert_precision_environment(event["env"], explicit)
+        self.assertFalse(any("start" in event["args"] for event in self.fixture.events("ray")))
 
     def test_invalid_aqa_data_stops_before_training(self):
         mixed = dict(self.row, extra_info={"raw_source": "vaqa"})

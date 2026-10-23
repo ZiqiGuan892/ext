@@ -16,6 +16,17 @@ import pyarrow.parquet as pq
 
 ROOT = Path(__file__).resolve().parents[1]
 EXAMPLES = ROOT / "examples"
+PRECISION_ENV = {
+    "MINICPMO_HUANYU_GDN_FP32_TRAINING": "1", "MINICPMO_GDN_FP32_REFERENCE": "1",
+    "MINICPMO_HUANYU_LAYERWISE_RELOAD": "1", "MINICPMO_HYBRID_BLOCK_ZERO_REFERENCE": "1",
+    "MINICPMO_ISOLATE_MEDIA_ENCODERS": "1", "MINICPMO_STABLE_LINEAR": "0",
+    "MINICPMO_GDN_PREFILL_REFERENCE": "0", "MINICPMO_MOE_TP_REFERENCE": "0",
+    "MINICPMO_ROW_TP_REFERENCE": "0", "MINICPMO_HUANYU_ROLLOUT_TP": "4",
+    "VLLM_OMNI_EXTERNAL_MODULES": "verl_omni_ext.models.qwen3_6_huanyu.engine_hooks",
+    "HUANYU_USE_PRECOMPUTE": "0", "MINICPMO_USE_PRECOMPUTE": "0",
+    "HUANYU_EMBED_CACHE_DIR": "", "HUANYU_FREEZE_AUDIO": "false",
+    "MINICPMO_TUNE_AUDIO": "1", "MINICPMO_TUNE_VISION": "0",
+}
 SPEC = importlib.util.spec_from_file_location("huanyu_aqa_preflight", EXAMPLES / "check_aqa_audio_train.py")
 checker = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(checker)
@@ -127,11 +138,17 @@ class AudioTrainingLauncherTests(unittest.TestCase):
             "check_aqa_audio_train.py",
             "check_native_runtime.py",
             "run_output.sh",
+            "precision_mode.sh",
         ):
             shutil.copyfile(EXAMPLES / name, self.examples / name)
         self.model = self.project / "verl_omni_ext" / "models" / "qwen3_6_huanyu"
         self.model.mkdir(parents=True)
-        (self.model / "runtime_imports.py").write_text("pass\n")
+        self.native_capture = self.project / "native_environment.json"
+        (self.model / "runtime_imports.py").write_text(
+            "import json, os, pathlib\n"
+            "pathlib.Path(os.environ['HUANYU_TEST_NATIVE_CAPTURE']).write_text(json.dumps(dict(os.environ)))\n",
+            encoding="utf-8",
+        )
         shutil.copyfile(ROOT / "rule_based_reward.py", self.model / "rule_based_reward.py")
         self.bin = self.project / "bin"
         self.bin.mkdir()
@@ -169,8 +186,10 @@ class AudioTrainingLauncherTests(unittest.TestCase):
             VAL_FILE=shell_path(self.validation),
             HUANYU_TEST_PYTHON=sys.executable,
             HUANYU_TEST_CAPTURE=str(self.capture),
+            HUANYU_TEST_NATIVE_CAPTURE=str(self.native_capture),
             PATH=str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
             HUANYU_USE_PRECOMPUTE="1",
+            HUANYU_EMBED_CACHE_DIR="/stale/frozen_cache",
             MINICPMO_USE_PRECOMPUTE="1",
             MINICPMO_TUNE_VISION="1",
             TRAIN_BATCH_SIZE="4",
@@ -196,6 +215,7 @@ class AudioTrainingLauncherTests(unittest.TestCase):
             "actor_rollout_ref.actor.fsdp_config.ulysses_sequence_parallel_size=4",
             "trainer.n_gpus_per_node=8",
             "actor_rollout_ref.rollout.tensor_model_parallel_size=8",
+            "actor_rollout_ref.rollout.enable_prefix_caching=true",
         ))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         capture = json.loads(self.capture.read_text())
@@ -212,6 +232,7 @@ class AudioTrainingLauncherTests(unittest.TestCase):
         self.assertEqual(actual["actor_rollout_ref.ref.log_prob_use_dynamic_bsz"], "false")
         self.assertEqual(actual["actor_rollout_ref.rollout.engine_kwargs.vllm_omni.mm_processor_cache_gb"], "0")
         self.assertEqual(actual["actor_rollout_ref.rollout.tensor_model_parallel_size"], "4")
+        self.assertEqual(actual["actor_rollout_ref.rollout.enable_prefix_caching"], "false")
         self.assertEqual(actual["trainer.n_gpus_per_node"], "16")
         self.assertEqual(actual["trainer.nnodes"], "1")
         self.assertEqual(actual["reward.reward_model.n_gpus_per_node"], "16")
@@ -229,6 +250,40 @@ class AudioTrainingLauncherTests(unittest.TestCase):
         ):
             self.assertEqual(capture["env"][key], value)
             self.assertEqual(json.loads(actual["ray_kwargs.ray_init.runtime_env.env_vars." + key]), value)
+
+    def test_precision_defaults_before_native_probe_and_runtime_env_for_both_rewards(self):
+        for reward in ("1", "0"):
+            with self.subTest(reward=reward):
+                result = self.run_script({"RM_ENABLE": reward})
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                capture = json.loads(self.capture.read_text())
+                native = json.loads(self.native_capture.read_text())
+                actual = dict(item.lstrip("+").split("=", 1) for item in capture["argv"])
+                for key, value in PRECISION_ENV.items():
+                    self.assertEqual(native[key], value, key)
+                    self.assertEqual(capture["env"][key], value, key)
+                    self.assertEqual(
+                        json.loads(actual["ray_kwargs.ray_init.runtime_env.env_vars." + key]), value, key,
+                    )
+                self.assertEqual(actual["actor_rollout_ref.model.use_remove_padding"], "false")
+                self.assertEqual(actual["actor_rollout_ref.rollout.engine_kwargs.vllm_omni.pipeline_name"], "qwen3_6_huanyu")
+                self.assertEqual(actual["actor_rollout_ref.rollout.enable_prefix_caching"], "false")
+                self.assertEqual(actual["actor_rollout_ref.rollout.engine_kwargs.vllm_omni.mm_processor_cache_gb"], "0")
+
+    def test_caller_precision_optout_reaches_native_and_workers_with_effective_tp4(self):
+        explicit = {"MINICPMO_HUANYU_GDN_FP32_TRAINING": "0", "MINICPMO_MOE_TP_REFERENCE": "4"}
+        result = self.run_script(explicit, (
+            "actor_rollout_ref.rollout.tensor_model_parallel_size=8",
+            '++ray_kwargs.ray_init.runtime_env.env_vars.MINICPMO_HUANYU_GDN_FP32_TRAINING="1"',
+        ))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        capture = json.loads(self.capture.read_text())
+        native = json.loads(self.native_capture.read_text())
+        actual = dict(item.lstrip("+").split("=", 1) for item in capture["argv"])
+        for key, value in dict(PRECISION_ENV, **explicit).items():
+            self.assertEqual(native[key], value, key)
+            self.assertEqual(capture["env"][key], value, key)
+            self.assertEqual(json.loads(actual["ray_kwargs.ray_init.runtime_env.env_vars." + key]), value, key)
 
     def test_frozen_online_control_and_unlimited_steps(self):
         result = self.run_script({"HUANYU_FREEZE_AUDIO": "true", "TOTAL_TRAINING_STEPS": "-1"})

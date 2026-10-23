@@ -47,7 +47,7 @@ case "${RM_ENABLE}" in
     *) echo "[huanyu-aqa] FATAL: RM_ENABLE must be 0 or 1" >&2; exit 2 ;;
 esac
 for _huanyu_file in "${_HUANYU_EXAMPLE_DIR}/check_native_runtime.py" "${_HUANYU_BACKEND}" \
-    "${_HUANYU_EXAMPLE_DIR}/check_aqa_audio_train.py"; do
+    "${_HUANYU_EXAMPLE_DIR}/check_aqa_audio_train.py" "${_HUANYU_EXAMPLE_DIR}/precision_mode.sh"; do
     if [[ ! -f "${_huanyu_file}" ]]; then
         echo "[huanyu-aqa] FATAL: missing ${_huanyu_file}; deploy to PROJECT_ROOT/examples/qwen3_6_huanyu" >&2
         exit 2
@@ -64,6 +64,7 @@ case "${HUANYU_FREEZE_AUDIO}" in
 esac
 export HUANYU_AQA_AUDIO_TRAIN=1
 export HUANYU_USE_PRECOMPUTE=0
+export HUANYU_EMBED_CACHE_DIR=""
 export MINICPMO_USE_PRECOMPUTE=0
 export MINICPMO_TUNE_VISION=0
 export Q36_BACKWARD_PREFETCH=off
@@ -170,6 +171,13 @@ if [[ "${RM_ENABLE}" == 0 ]]; then
     )
 fi
 
+# The direct AQA entry (including RM_ENABLE=0) must establish the same policy
+# before its first native import. Do not rely only on the final backend or a
+# previously started Raylet. TP4 below is also enforced in the final overrides.
+source "${_HUANYU_EXAMPLE_DIR}/precision_mode.sh" "$@" \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=4 || exit $?
+echo "[huanyu-aqa] precision train_GDN=$MINICPMO_HUANYU_GDN_FP32_TRAINING rollout_GDN=$MINICPMO_GDN_FP32_REFERENCE reload=$MINICPMO_HUANYU_LAYERWISE_RELOAD KV_zero=$MINICPMO_HYBRID_BLOCK_ZERO_REFERENCE hooks=$VLLM_OMNI_EXTERNAL_MODULES"
+
 # Check all rows without decoding audio; a validation split containing mixed
 # OmniMix rows must not enter this mode even when val_before_train=false.
 python3 -B "${_HUANYU_EXAMPLE_DIR}/check_aqa_audio_train.py" \
@@ -192,7 +200,7 @@ python3 -B "${_HUANYU_EXAMPLE_DIR}/check_native_runtime.py" --check --expected-r
 
 _huanyu_ray_args=()
 for _huanyu_env_key in PYTHONPATH HUANYU_VLLM_OMNI_ROOT HUANYU_FREEZE_AUDIO \
-    HUANYU_AQA_AUDIO_TRAIN HUANYU_USE_PRECOMPUTE MINICPMO_USE_PRECOMPUTE \
+    HUANYU_AQA_AUDIO_TRAIN HUANYU_USE_PRECOMPUTE HUANYU_EMBED_CACHE_DIR MINICPMO_USE_PRECOMPUTE \
     MINICPMO_TUNE_AUDIO MINICPMO_TUNE_VISION Q36_BACKWARD_PREFETCH GENRM_DUMP_DIR; do
     _huanyu_env_json="$(python3 -c 'import json, os, sys; print(json.dumps(os.environ[sys.argv[1]]))' "${_huanyu_env_key}")"
     _huanyu_ray_args+=("++ray_kwargs.ray_init.runtime_env.env_vars.${_huanyu_env_key}=${_huanyu_env_json}")
@@ -247,10 +255,11 @@ exec bash "${_HUANYU_BACKEND}" "${_huanyu_backend_defaults[@]}" "$@" \
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=false \
     actor_rollout_ref.rollout.n="${ROLLOUT_N}" \
     actor_rollout_ref.rollout.tensor_model_parallel_size=4 \
+    actor_rollout_ref.rollout.enable_prefix_caching=false \
     ++actor_rollout_ref.rollout.engine_kwargs.vllm_omni.pipeline_name=qwen3_6_huanyu \
     ++actor_rollout_ref.rollout.engine_kwargs.vllm_omni.mm_processor_cache_gb=0 \
     "${_huanyu_reward_args[@]}" \
     trainer.n_gpus_per_node=16 \
     trainer.nnodes=1 \
     trainer.total_training_steps="${_huanyu_steps}" \
-    "${_huanyu_ray_args[@]}"
+    "${_huanyu_ray_args[@]}" "${HUANYU_PRECISION_ARGS[@]}"
