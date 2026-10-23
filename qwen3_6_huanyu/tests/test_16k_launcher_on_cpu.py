@@ -47,6 +47,9 @@ class Huanyu16KLauncherTests(unittest.TestCase):
             "MAX_PROMPT_LENGTH", "MAX_RESPONSE_LENGTH", "ROLLOUT_PROMPT_LENGTH",
             "ROLLOUT_MAX_MODEL_LEN", "MAX_TOKEN_LEN_PER_GPU", "MINICPMO_MM_PROMPT_BUDGET",
             "EXPERIMENT_NAME", "HUANYU_GRAPH_MODE",
+            "HUANYU_16K_POOL_LAYOUT", "RM_N_GPUS_PER_NODE", "RM_NNODES", "RM_SPLIT_NODES",
+            "ROLLOUT_TP", "RM_TP", "TRAIN_BATCH_SIZE", "PPO_MINI_BATCH_SIZE", "ROLLOUT_N",
+            "NPUS_PER_NODE",
         )
         capture.write_text(
             capture.read_text(encoding="utf-8").replace(
@@ -95,6 +98,8 @@ class Huanyu16KLauncherTests(unittest.TestCase):
             "MAX_PROMPT_LENGTH": "3072", "MAX_RESPONSE_LENGTH": "512",
             "ROLLOUT_PROMPT_LENGTH": "3104", "ROLLOUT_MAX_MODEL_LEN": "5248",
             "MAX_TOKEN_LEN_PER_GPU": "5248", "MINICPMO_MM_PROMPT_BUDGET": "3104",
+            "NUM_NPUS": "12", "NNODES": "2", "RM_N_GPUS_PER_NODE": "4",
+            "RM_NNODES": "2", "REWARD_POOL_NPUS": "8", "RM_SPLIT_NODES": "0",
         })
         actual = self.assert_lengths(capture)
         self.assertEqual(actual["actor_rollout_ref.model.override_config.attn_implementation"], "sdpa")
@@ -105,6 +110,9 @@ class Huanyu16KLauncherTests(unittest.TestCase):
             "HUANYU_FREEZE_AUDIO": "true", "HUANYU_USE_PRECOMPUTE": "1",
             "MINICPMO_TUNE_AUDIO": "0", "NNODES": "1", "NUM_NPUS": "16",
             "REWARD_POOL_NPUS": "16", "RM_ENABLE": "1",
+            "HUANYU_16K_POOL_LAYOUT": "16+16", "RM_N_GPUS_PER_NODE": "16",
+            "RM_NNODES": "1", "RM_SPLIT_NODES": "1", "ROLLOUT_TP": "4", "RM_TP": "4",
+            "TRAIN_BATCH_SIZE": "32", "PPO_MINI_BATCH_SIZE": "32", "ROLLOUT_N": "4",
         }.items():
             self.assertEqual(capture["env"][key], expected, key)
         self.assertEqual(len(self.fixture.events("train")), 1)
@@ -135,6 +143,29 @@ class Huanyu16KLauncherTests(unittest.TestCase):
                     for kind in ("helper", "pip", "ray", "train"):
                         self.assertFalse(self.fixture.events(kind), kind)
 
+    def test_invalid_pool_tp_or_batch_stops_before_setup(self):
+        invalid = (
+            {"HUANYU_16K_POOL_LAYOUT": "24/8"},
+            {"HUANYU_16K_POOL_LAYOUT": "32+0"},
+            {"ROLLOUT_TP": "0"},
+            {"ROLLOUT_TP": "04"},
+            {"ROLLOUT_TP": "abc"},
+            {"ROLLOUT_TP": "8"},
+            {"RM_TP": "0"},
+            {"RM_TP": "8"},
+            {"TRAIN_BATCH_SIZE": "0"},
+            {"TRAIN_BATCH_SIZE": "32"},
+            {"PPO_MINI_BATCH_SIZE": "32"},
+            {"PPO_MINI_BATCH_SIZE": "18"},
+            {"ROLLOUT_N": "0"},
+        )
+        for updates in invalid:
+            with self.subTest(updates=updates):
+                result = self.fixture.run_launcher({"HUANYU_16K_POOL_LAYOUT": "24+8", **updates})
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                for kind in ("helper", "pip", "env-source", "ray", "train"):
+                    self.assertFalse(self.fixture.events(kind), kind)
+
     def test_worker_joins_without_running_training(self):
         result = self.fixture.run_launcher({"VC_TASK_INDEX": "1"})
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -142,6 +173,18 @@ class Huanyu16KLauncherTests(unittest.TestCase):
         self.assertFalse(self.fixture.capture_file.exists())
         self.assertEqual(len(self.fixture.events("ray")), 1)
         args = self.fixture.events("ray")[0]["args"]
+        self.assertIn("--address=192.0.2.10:6925", args)
+        self.assertIn("--block", args)
+        self.assertNotIn("--head", args)
+
+    def test_24_plus_8_worker_keeps_physical_16_cards_and_only_joins_ray(self):
+        result = self.fixture.run_launcher({"VC_TASK_INDEX": "1", "HUANYU_16K_POOL_LAYOUT": "24+8"})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(self.fixture.events("train"))
+        self.assertFalse(self.fixture.capture_file.exists())
+        self.assertEqual(len(self.fixture.events("ray")), 1)
+        args = self.fixture.events("ray")[0]["args"]
+        self.assertIn('--resources={"NPU": 16}', args)
         self.assertIn("--address=192.0.2.10:6925", args)
         self.assertIn("--block", args)
         self.assertNotIn("--head", args)
@@ -193,11 +236,14 @@ class Huanyu16KLauncherTests(unittest.TestCase):
         backend = (EXAMPLES / "run_qwen36_huanyu_gspo_npu.sh").read_text(encoding="utf-8")
         command = re.search(r"^python3 -m verl_omni\.trainer\.main_omni\b", backend, re.MULTILINE)
         self.assertIsNotNone(command, "Backend training command not found")
+        workers = re.search(r"^ROLLOUT_NUM_WORKERS=.*$", backend, re.MULTILINE)
+        self.assertIsNotNone(workers, "Backend rollout replica calculation not found")
         (examples / "run_qwen36_huanyu_gspo_npu.sh").write_text(
             '#!/usr/bin/env bash\nset -euo pipefail\n'
             'source "${PROJECT_ROOT}/examples/qwen3_6_huanyu/graph_mode.sh"\n'
             '_CHAT_TEMPLATE_ARGS=()\n_DATASET_ARGS=()\n'
-            'ROLLOUT_NUM_WORKERS=4\nDEFAULT_LOCAL_DIR="${PROJECT_ROOT}/checkpoints"\n'
+            'DEFAULT_LOCAL_DIR="${PROJECT_ROOT}/checkpoints"\n'
+            + workers.group(0) + "\n"
             + backend[command.start():],
             encoding="utf-8", newline="\n",
         )
@@ -232,9 +278,68 @@ class Huanyu16KLauncherTests(unittest.TestCase):
             "actor_rollout_ref.rollout.enforce_eager": "true",
             "reward.reward_model.rollout.enforce_eager": "true",
             "actor_rollout_ref.rollout.n": "4",
+            "actor_rollout_ref.rollout.agent.num_workers": "4",
+            "trainer.n_gpus_per_node": "16",
+            "trainer.nnodes": "1",
+            "reward.reward_model.n_gpus_per_node": "16",
+            "reward.reward_model.nnodes": "1",
+            "reward.reward_model.rollout.tensor_model_parallel_size": "4",
+            "data.train_batch_size": "32",
             "actor_rollout_ref.actor.ppo_mini_batch_size": "32",
         }.items():
             self.assertEqual(actual[key].lower(), expected, key)
+
+    def assert_24_plus_8_backend(self, capture, rollout_tp=4, rm_tp=4, train_batch=24, mini_batch=24):
+        actual = self.assert_lengths(capture)
+        for key, expected in {
+            "HUANYU_16K_POOL_LAYOUT": "24+8", "NUM_NPUS": "12", "NNODES": "2",
+            "RM_N_GPUS_PER_NODE": "4", "RM_NNODES": "2", "REWARD_POOL_NPUS": "8",
+            "RM_SPLIT_NODES": "0", "NPUS_PER_NODE": "16",
+            "ROLLOUT_TP": str(rollout_tp), "RM_TP": str(rm_tp),
+            "TRAIN_BATCH_SIZE": str(train_batch), "PPO_MINI_BATCH_SIZE": str(mini_batch),
+            "ROLLOUT_N": "4",
+        }.items():
+            self.assertEqual(capture["env"][key], expected, key)
+        for key, expected in {
+            "trainer.n_gpus_per_node": "12", "trainer.nnodes": "2",
+            "reward.reward_model.n_gpus_per_node": "4", "reward.reward_model.nnodes": "2",
+            "actor_rollout_ref.rollout.tensor_model_parallel_size": str(rollout_tp),
+            "reward.reward_model.rollout.tensor_model_parallel_size": str(rm_tp),
+            "actor_rollout_ref.rollout.agent.num_workers": str(24 // rollout_tp),
+            "actor_rollout_ref.rollout.n": "4", "data.train_batch_size": str(train_batch),
+            "actor_rollout_ref.actor.ppo_mini_batch_size": str(mini_batch),
+            "actor_rollout_ref.actor.ulysses_sequence_parallel_size": "1",
+            "actor_rollout_ref.actor.fsdp_config.ulysses_sequence_parallel_size": "1",
+            "actor_rollout_ref.actor.fsdp_config.fsdp_size": "-1",
+            "actor_rollout_ref.ref.ulysses_sequence_parallel_size": "1",
+            "actor_rollout_ref.ref.fsdp_config.ulysses_sequence_parallel_size": "1",
+            "actor_rollout_ref.ref.fsdp_config.fsdp_size": "-1",
+        }.items():
+            self.assertEqual(actual[key], expected, key)
+        reward_world = int(actual["reward.reward_model.n_gpus_per_node"]) * int(actual["reward.reward_model.nnodes"])
+        reward_tp = int(actual["reward.reward_model.rollout.tensor_model_parallel_size"])
+        self.assertEqual(reward_world // reward_tp, 8 // rm_tp)
+        self.assertIn('--resources={"NPU": 16}', self.fixture.events("ray")[0]["args"])
+        self.assertEqual(len(self.fixture.events("train")), 1)
+
+    def test_opt_in_24_plus_8_reaches_final_backend(self):
+        self.use_real_training_composition()
+        capture = self.launch({"HUANYU_16K_POOL_LAYOUT": "24+8"})
+        self.assert_24_plus_8_backend(capture)
+
+    def test_24_plus_8_preserves_upper_pool_and_tp_through_site_environment(self):
+        self.use_real_training_composition()
+        env_file = self.fixture.examples / "env_export_huanyu.sh"
+        with env_file.open("a", encoding="utf-8", newline="\n") as stream:
+            stream.write(
+                "export NUM_NPUS=16 NNODES=1 RM_N_GPUS_PER_NODE=16 RM_NNODES=1\n"
+                "export REWARD_POOL_NPUS=16 RM_SPLIT_NODES=1 ROLLOUT_TP=8 RM_TP=8\n"
+            )
+        capture = self.launch({
+            "HUANYU_16K_POOL_LAYOUT": "24+8", "ROLLOUT_TP": "2", "RM_TP": "2",
+            "TRAIN_BATCH_SIZE": "48", "PPO_MINI_BATCH_SIZE": "24",
+        })
+        self.assert_24_plus_8_backend(capture, rollout_tp=2, rm_tp=2, train_batch=48)
 
     def test_user_hydra_overrides_survive_but_graph_selector_keeps_authority(self):
         self.use_real_training_composition()

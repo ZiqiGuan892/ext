@@ -61,10 +61,14 @@ unset _huanyu_vllm_omni_root _huanyu_retained_pythonpath _huanyu_python_entries 
 export MODEL_PATH=/opt/huawei/dataset/downloaded_models/Qwen3.6-35B-A3B-huanyu06b-iter2000-omni4b-hf-huanyu7tokens
 
 # ---------------------------------------------------------------- 2) 尺寸口径
-export NUM_NPUS="${NUM_NPUS:-16}"        # global pool（actor/rollout）卡数
-export NNODES="${NNODES:-1}"             # 单机必显式 1，防平台 MA_NUM_HOSTS 顶大
-export ROLLOUT_TP="${ROLLOUT_TP:-4}"     # rollout TP，16/4 = 4 worker
-export REWARD_POOL_NPUS="${REWARD_POOL_NPUS:-16}"   # genrm 判官 pool，与 reward.reward_model.n_gpus_per_node 对齐
+# Direct-entry defaults only. An upper job/profile can supply every value;
+# never reset an explicit 12x2 actor / 4x2 RM allocation to 16+16.
+export NUM_NPUS="${NUM_NPUS:-16}"        # actor/rollout NPUs per pool node
+export NNODES="${NNODES:-1}"
+export ROLLOUT_TP="${ROLLOUT_TP:-4}"
+export RM_N_GPUS_PER_NODE="${RM_N_GPUS_PER_NODE:-16}" RM_NNODES="${RM_NNODES:-1}"
+export RM_TP="${RM_TP:-4}" RM_SPLIT_NODES="${RM_SPLIT_NODES:-1}"
+export REWARD_POOL_NPUS=$((RM_N_GPUS_PER_NODE * RM_NNODES))
 
 # ---------------------------------------------------------------- 3) 采样
 # fp=0.5 会把反复使用的日期、汉字和公式 token 持续扣分。在修复 FP32 GDN

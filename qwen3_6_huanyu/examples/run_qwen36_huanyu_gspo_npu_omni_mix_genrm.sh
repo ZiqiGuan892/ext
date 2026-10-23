@@ -29,13 +29,16 @@ export RM_ENABLE=1
 export RM_MODEL_PATH=${RM_MODEL_PATH:-"/opt/huawei/dataset/downloaded_models/Qwen3.5-35B-A3B"}
 
 
-export NNODES=1
-export NUM_NPUS=16
-export ROLLOUT_TP=4
-export RM_TP=4
-export RM_N_GPUS_PER_NODE=16
-export RM_NNODES=1
-export RM_SPLIT_NODES=1
+# Resource sizes come from the upper entry. This layer only composes GenRM
+# arguments; it must not silently replace a caller's pool topology.
+: "${NNODES:?Set NNODES in the upper launch script}"
+: "${NUM_NPUS:?Set NUM_NPUS in the upper launch script}"
+: "${ROLLOUT_TP:?Set ROLLOUT_TP in the upper launch script}"
+: "${RM_TP:?Set RM_TP in the upper launch script}"
+: "${RM_N_GPUS_PER_NODE:?Set RM_N_GPUS_PER_NODE in the upper launch script}"
+: "${RM_NNODES:?Set RM_NNODES in the upper launch script}"
+: "${RM_SPLIT_NODES:?Set RM_SPLIT_NODES in the upper launch script}"
+export REWARD_POOL_NPUS=$((RM_N_GPUS_PER_NODE * RM_NNODES))
 export RM_GPU_MEM_UTIL=${RM_GPU_MEM_UTIL:-0.7}
 export RM_RESPONSE_LENGTH=${RM_RESPONSE_LENGTH:-1024}
 # The judge receives question + full reference + generated answer. Actor prompt
@@ -142,7 +145,7 @@ print(f'[debug] mini parquet: {${DEBUG_SAMPLES}} train + {max(1, ${DEBUG_SAMPLES
         #   PPO_MINI_BATCH_SIZE 被 ROLLOUT_TP(4) 整除
         # 推荐值: 16, 32, 64（= 16 的倍数）
         # 4 条数据太小: TRAIN_BATCH_SIZE=32 > 4 会报错
-        _WS=${NUM_NPUS}
+        _WS=$((NUM_NPUS * NNODES))
         _TP=${ROLLOUT_TP}
         # 确保 batch <= samples, batch 被 TP 整除, batch*N 被 WS 整除
         _bs=${DEBUG_SAMPLES}
@@ -264,7 +267,7 @@ if [[ "${RM_ENABLE}" == "1" ]]; then
         exit 2
     fi
     echo "[genrm] RM_ENABLE=1, judge=${_RM_NPUS}NPU (TP=${RM_TP}, replicas=$((_RM_NPUS / RM_TP)))"
-    echo "[genrm] RM_SPLIT_NODES=${RM_SPLIT_NODES} (1=judge 在独立节点)"
+    echo "[genrm] actor_pool=${NUM_NPUS}x${NNODES} reward_pool=${RM_N_GPUS_PER_NODE}x${RM_NNODES}; RM_SPLIT_NODES=${RM_SPLIT_NODES} (layout label only; actual placement comes from the pool sizes)"
 fi
 
 echo "=== Qwen3.6-Huanyu OmniMix GenRM ==="

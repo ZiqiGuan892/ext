@@ -393,7 +393,7 @@ if [ $((NUM_NPUS % ROLLOUT_TP)) -ne 0 ]; then
     echo "       rollout.agent.num_workers (replica count) would be wrong."
     exit 1
 fi
-ROLLOUT_NUM_WORKERS=$((NUM_NPUS / ROLLOUT_TP))
+ROLLOUT_NUM_WORKERS=$((NUM_NPUS * NNODES / ROLLOUT_TP))
 echo "Cluster: NUM_NPUS=${NUM_NPUS} (detected ${_DETECTED_NPUS}) NNODES=${NNODES}" \
      "ROLLOUT_TP=${ROLLOUT_TP} replicas=${ROLLOUT_NUM_WORKERS} IF=${SOCKET_IFNAME}"
 

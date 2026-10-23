@@ -22,6 +22,51 @@ _INTERVAL="${RAY_CLUSTER_POLL_INTERVAL:-5}"
 _PORT="${RAY_PORT:-6925}"
 _DASHBOARD_PORT="${RAY_DASHBOARD_PORT:-8960}"
 _JOB_MODE="${HUANYU_JOB_MODE:-frozen_cache}"
+# Defaults for direct invocation; a profile such as the 16K wrapper supplies
+# these first. Snapshot before sourcing the site env so it cannot replace the
+# caller's pool sizes. Physical Ray capacity remains 16 NPUs on each node.
+declare -A _HUANYU_POOL_CONFIG=(
+    [NUM_NPUS]="${NUM_NPUS:-16}" [NNODES]="${NNODES:-1}"
+    [ROLLOUT_TP]="${ROLLOUT_TP:-4}" [RM_TP]="${RM_TP:-4}"
+    [RM_N_GPUS_PER_NODE]="${RM_N_GPUS_PER_NODE:-16}" [RM_NNODES]="${RM_NNODES:-1}"
+    [RM_SPLIT_NODES]="${RM_SPLIT_NODES:-1}"
+)
+for _key in NUM_NPUS NNODES ROLLOUT_TP RM_TP RM_N_GPUS_PER_NODE RM_NNODES; do
+    if [[ ! "${_HUANYU_POOL_CONFIG[$_key]}" =~ ^[1-9][0-9]?$ ]]; then
+        echo "FATAL: $_key must be a positive integer (without leading zeroes)" >&2
+        exit 2
+    fi
+done
+_ACTOR_PER_NODE=${_HUANYU_POOL_CONFIG[NUM_NPUS]}
+_ACTOR_NODES=${_HUANYU_POOL_CONFIG[NNODES]}
+_RM_PER_NODE=${_HUANYU_POOL_CONFIG[RM_N_GPUS_PER_NODE]}
+_RM_NODES=${_HUANYU_POOL_CONFIG[RM_NNODES]}
+if (( _ACTOR_PER_NODE > 16 || _RM_PER_NODE > 16 || _ACTOR_NODES > 2 || _RM_NODES > 2 ||
+      _ACTOR_PER_NODE * _ACTOR_NODES + _RM_PER_NODE * _RM_NODES != 32 ||
+      _ACTOR_PER_NODE % ${_HUANYU_POOL_CONFIG[ROLLOUT_TP]} != 0 ||
+      _RM_PER_NODE % ${_HUANYU_POOL_CONFIG[RM_TP]} != 0 )); then
+    echo 'FATAL: pool sizes must total 32 on two 16-card nodes; each per-node pool must be divisible by its TP' >&2
+    exit 2
+fi
+# Each per-node pool is STRICT_PACK. Check it can be packed into two physical
+# nodes; checking only the 32-card total would accept impossible [12,12]+[8].
+_POOLS_FIT=0
+for (( _a=0; _a<=_ACTOR_NODES; _a++ )); do
+    for (( _r=0; _r<=_RM_NODES; _r++ )); do
+        if (( _a * _ACTOR_PER_NODE + _r * _RM_PER_NODE == 16 )); then
+            _POOLS_FIT=1
+        fi
+    done
+done
+if (( ! _POOLS_FIT )); then
+    echo 'FATAL: per-node pools cannot fit on two 16-card nodes; for actor24 + RM8 use actor12x2 and RM4x2' >&2
+    exit 2
+fi
+if [[ "$_JOB_MODE" == aqa_unfreeze ]] &&
+    (( _ACTOR_PER_NODE != 16 || _ACTOR_NODES != 1 || _RM_PER_NODE != 16 || _RM_NODES != 1 )); then
+    echo 'FATAL: the online AQA entry still requires actor16 + RM16; configurable pools apply to the frozen entry' >&2
+    exit 2
+fi
 case "$_JOB_MODE" in
     frozen_cache) _TRAIN_ENTRY=run_huanyu.sh ;;
     aqa_unfreeze) _TRAIN_ENTRY=run_huanyu_aqa_audio_train.sh ;;
@@ -178,11 +223,15 @@ case "$_JOB_MODE" in
         ;;
 esac
 export DEBUG_MODE=0 DEBUG_SAMPLES=0
-export NPUS_PER_NODE=16 NNODES=1 NUM_NPUS=16 REWARD_POOL_NPUS=16 ROLLOUT_TP=4
-export RM_ENABLE=1 RM_NNODES=1 RM_N_GPUS_PER_NODE=16 RM_TP=4 RM_SPLIT_NODES=1
+for _key in "${!_HUANYU_POOL_CONFIG[@]}"; do
+    export "$_key=${_HUANYU_POOL_CONFIG[$_key]}"
+done
+export REWARD_POOL_NPUS=$((RM_N_GPUS_PER_NODE * RM_NNODES))
+export NPUS_PER_NODE=16 RM_ENABLE=1
 export NUM_GPUS_ACTOR_ROLLOUT_REWARD=16
 export WANDB_MODE="${WANDB_MODE:-offline}"
 echo "[huanyu-job] mode=$_JOB_MODE freeze_audio=$HUANYU_FREEZE_AUDIO precompute=$HUANYU_USE_PRECOMPUTE train_entry=$_TRAIN_ENTRY"
+echo "[huanyu-job] physical=16x2 actor=${NUM_NPUS}x${NNODES} rollout_TP=$ROLLOUT_TP RM=${RM_N_GPUS_PER_NODE}x${RM_NNODES} RM_TP=$RM_TP requested=$((NUM_NPUS * NNODES + REWARD_POOL_NPUS))"
 "$_PYTHON" -B "${_HUANYU_EXAMPLE_DIR}/check_native_runtime.py" \
     --check --expected-root "$_VLLM_TARGET"
 echo '[huanyu-job] native import check exited successfully'
