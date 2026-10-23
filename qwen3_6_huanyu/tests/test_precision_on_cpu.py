@@ -148,6 +148,118 @@ class PrecisionTests(unittest.TestCase):
         self.assertIs(layer.linear_attn.chunk_gated_delta_rule, native)
         self.assertEqual(layer.layer_type, "already-set")
 
+    def test_padded_cu_seqlens_none_matches_legacy_call_outputs_state_and_audio_gradients(self):
+        torch.manual_seed(41)
+        actor = model()
+        calls = []
+
+        # This older reference intentionally has no cu_seqlens or **kwargs.
+        # A small recurrence exercises the matmuls and final-state autograd
+        # contract, without importing Transformers or the native FLA stack.
+        def reference(query, key, value, g, beta, chunk_size=64, initial_state=None,
+                      output_final_state=False, use_qk_l2norm_in_kernel=False):
+            calls.append((chunk_size, initial_state, output_final_state,
+                          use_qk_l2norm_in_kernel, torch.is_autocast_enabled("cpu")))
+            if use_qk_l2norm_in_kernel:
+                query, key = F.normalize(query.float(), dim=-1), F.normalize(key.float(), dim=-1)
+            state = initial_state.float()
+            outputs = []
+            for q, k, v, decay, weight in zip(query, key, value, g, beta):
+                state = state * decay.exp() + weight * k.unsqueeze(1) @ v.float().unsqueeze(0)
+                outputs.append(q @ state)
+            return torch.stack(outputs), state if output_final_state else None
+
+        reference.__name__ = "torch_chunk_gated_delta_rule"
+        reference.__module__ = torch_chunk_gated_delta_rule.__module__
+        actor.model.language_model.layers[0].linear_attn.chunk_gated_delta_rule = reference
+        precision.install_huanyu_actor_precision(actor)
+        kernel = actor.model.language_model.layers[0].linear_attn.chunk_gated_delta_rule
+        signature = inspect.signature(kernel)
+        self.assertIsNone(signature.parameters["cu_seqlens"].default)
+        self.assertNotIn(inspect.Parameter.VAR_KEYWORD, [p.kind for p in signature.parameters.values()])
+
+        audio = torch.randn(3, 3, requires_grad=True)
+        query, key = torch.randn(3, 3), torch.randn(3, 3)
+        initial = torch.randn(3, 3, requires_grad=True)
+        options = dict(g=torch.full((3,), -0.2), beta=torch.full((3,), 0.4), chunk_size=2,
+                       initial_state=initial, output_final_state=True, use_qk_l2norm_in_kernel=True)
+        parameters = tuple(actor.model.audio_encoder.parameters()) + tuple(actor.model.audio_projection.parameters())
+
+        def run(function, kwargs, autocast):
+            encoded = actor.model.audio_projection(actor.model.audio_encoder(audio))
+            with torch.autocast("cpu", dtype=torch.bfloat16, enabled=autocast):
+                output, final_state = function(query, key, encoded, **kwargs)
+            grads = torch.autograd.grad(output.square().sum() + final_state.square().sum(),
+                                        (audio, initial) + parameters)
+            return output, final_state, grads
+
+        expected_output, expected_state, expected_grads = run(reference, options, False)
+        for kwargs in (options, dict(options, cu_seqlens=None)):
+            with self.subTest(explicit_none="cu_seqlens" in kwargs):
+                output, final_state, grads = run(kernel, kwargs, True)
+                self.assertEqual(output.dtype, torch.float32)
+                self.assertEqual(final_state.dtype, torch.float32)
+                torch.testing.assert_close(output, expected_output)
+                torch.testing.assert_close(final_state, expected_state)
+                for actual, expected in zip(grads, expected_grads):
+                    self.assertTrue(torch.isfinite(actual).all())
+                    self.assertGreater(actual.abs().sum().item(), 0)
+                    torch.testing.assert_close(actual, expected)
+                chunk_size, state, final_flag, normalize, autocast_enabled = calls[-1]
+                self.assertEqual(chunk_size, 2)
+                self.assertIs(state, initial)
+                self.assertTrue(final_flag)
+                self.assertTrue(normalize)
+                self.assertFalse(autocast_enabled)
+
+    def test_actual_packed_boundaries_are_rejected_before_reference_execution(self):
+        actor = model()
+        reference = Mock(__name__="torch_chunk_gated_delta_rule",
+                         __module__=torch_chunk_gated_delta_rule.__module__)
+        actor.model.language_model.layers[0].linear_attn.chunk_gated_delta_rule = reference
+        precision.install_huanyu_actor_precision(actor)
+        kernel = actor.model.language_model.layers[0].linear_attn.chunk_gated_delta_rule
+        tensor = torch.ones(3, 3)
+        for boundaries in (torch.tensor([0, 1, 3], dtype=torch.int32), torch.empty(0, dtype=torch.int32)):
+            with self.subTest(boundaries=boundaries.tolist()):
+                with self.assertRaisesRegex(ValueError, "use_remove_padding=false.*boundaries cannot be ignored"):
+                    kernel(tensor, tensor, tensor, g=None, beta=None, cu_seqlens=boundaries)
+        reference.assert_not_called()
+
+    def test_reference_errors_propagate_and_restore_autocast(self):
+        actor = model()
+
+        def reference(*args, **kwargs):
+            self.assertFalse(torch.is_autocast_enabled("cpu"))
+            raise RuntimeError("reference execution failed")
+
+        reference.__name__ = "torch_chunk_gated_delta_rule"
+        reference.__module__ = torch_chunk_gated_delta_rule.__module__
+        actor.model.language_model.layers[0].linear_attn.chunk_gated_delta_rule = reference
+        precision.install_huanyu_actor_precision(actor)
+        kernel = actor.model.language_model.layers[0].linear_attn.chunk_gated_delta_rule
+        tensor = torch.ones(3, 3)
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            with self.assertRaisesRegex(RuntimeError, "reference execution failed"):
+                kernel(tensor, tensor, tensor, g=None, beta=None, cu_seqlens=None)
+            self.assertTrue(torch.is_autocast_enabled("cpu"))
+
+    def test_native_fla_keeps_nonempty_packed_boundaries(self):
+        actor = model()
+        boundaries = torch.tensor([0, 1, 3], dtype=torch.int32)
+
+        def native(*args, cu_seqlens=None, **kwargs):
+            self.assertIs(cu_seqlens, boundaries)
+            return "native output"
+
+        native.__name__ = "chunk_gated_delta_rule"
+        native.__module__ = "fla.ops.gated_delta_rule"
+        actor.model.language_model.layers[0].linear_attn.chunk_gated_delta_rule = native
+        precision.install_huanyu_actor_precision(actor)
+        kernel = actor.model.language_model.layers[0].linear_attn.chunk_gated_delta_rule
+        self.assertIs(kernel, native)
+        self.assertEqual(kernel(cu_seqlens=boundaries), "native output")
+
     def test_core_optout_preserves_kernel(self):
         actor = model()
         with patch.dict(os.environ, {"MINICPMO_HUANYU_GDN_FP32_TRAINING": "0",

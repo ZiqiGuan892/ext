@@ -1,15 +1,16 @@
-"""HF torch GDN guard ported from Whisper's packed module, without packed forward."""
+"""FP32 HF torch GDN guard for Huanyu's padded training forward."""
 
 import torch
 
 
 def isolate_torch_gdn_fallbacks(module):
-    """Do not advertise **kwargs as varlen support for HF's torch fallback.
+    """Keep HF's padded-call API while isolating the torch fallback from autocast.
 
-    HF accepts arbitrary kwargs but its torch_chunk_gated_delta_rule ignores
-    cu_seqlens. verl detects **kwargs as support and otherwise fails to split
-    samples. An explicit signature selects verl's existing per-sequence path.
-    Real FLA kernels keep their native cu_seqlens support.
+    Newer HF forwards pass cu_seqlens=None even for padded inputs. Accept that
+    argument without forwarding it to older reference kernels. Actual packed
+    boundaries must never be dropped: Huanyu requires use_remove_padding=false
+    and this guard does not implement a packed forward. Real FLA kernels keep
+    their native implementation and cu_seqlens support.
     """
     count = 0
     for layer in module.model.language_model.layers:
@@ -22,7 +23,13 @@ def isolate_torch_gdn_fallbacks(module):
         def wrap(reference):
             def torch_delta_rule(query, key, value, g, beta, chunk_size=64,
                                  initial_state=None, output_final_state=False,
-                                 use_qk_l2norm_in_kernel=False):
+                                 use_qk_l2norm_in_kernel=False, cu_seqlens=None):
+                if cu_seqlens is not None:
+                    raise ValueError(
+                        "Huanyu's FP32 torch GDN guard supports padded inputs only "
+                        "(cu_seqlens=None). Keep actor_rollout_ref.model.use_remove_padding=false; "
+                        "packed sequence boundaries cannot be ignored."
+                    )
                 # FSDP wraps the model in BF16 autocast. Explicit .float() calls
                 # inside HF's reference do not prevent autocast from reducing
                 # its state-update matmuls back to BF16. Keep the reference's
