@@ -2,7 +2,9 @@
 
 import importlib.util
 import os
+import shutil
 import socket
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -194,6 +196,121 @@ class RuntimeImportsTests(unittest.TestCase):
         self.assertIn("expected_native_file=", str(raised.exception))
         self.assertIsInstance(raised.exception.__cause__, ModuleNotFoundError)
         self.assert_selection_unchanged()
+
+    def test_cli_directory_is_temporarily_excluded_and_path_order_restored(self):
+        self.write_native()
+        selected_path = [str(ROOT), *self.original_path, str(ROOT / ".")]
+        with patch.object(sys, "path", selected_path):
+            original_import = runtime_imports.importlib.import_module
+
+            def checked_import(name):
+                self.assertFalse(any(Path(entry or os.curdir).resolve() == ROOT for entry in sys.path))
+                return original_import(name)
+
+            with patch.object(runtime_imports.importlib, "import_module", side_effect=checked_import):
+                native = runtime_imports.load_huanyu_native(self.checkout)
+            self.assertEqual(sys.path, [str(ROOT), *self.original_path, str(ROOT / ".")])
+            self.assertIs(sys.path, selected_path)
+            self.assertEqual(Path(native.__file__), self.native_path)
+        self.assert_selection_unchanged()
+
+    def test_cli_directory_path_is_restored_when_native_import_fails(self):
+        selected_path = [str(ROOT), *self.original_path]
+        with patch.object(sys, "path", selected_path):
+            with self.assertRaisesRegex(RuntimeError, "does not expose the Huanyu module"):
+                runtime_imports.load_huanyu_native(self.checkout)
+            self.assertEqual(sys.path, [str(ROOT), *self.original_path])
+            self.assertIs(sys.path, selected_path)
+        self.assert_selection_unchanged()
+
+
+class RuntimeImportsCLITests(unittest.TestCase):
+    """Real Python import ordering, including a stale file after cp deployment."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(dir=Path(__file__).parent)
+        self.addCleanup(temporary.cleanup)
+        self.directory = Path(temporary.name)
+        self.project = self.directory / "deployed-project"
+        self.huanyu = self.project / "verl_omni_ext/models/qwen3_6_huanyu"
+        self.huanyu.mkdir(parents=True)
+        self.runtime = self.huanyu / "runtime_imports.py"
+        shutil.copyfile(ROOT / "runtime_imports.py", self.runtime)
+        # Neither this old hook module nor the ext initializer may be imported by
+        # an environment check, even if the package root is on PYTHONPATH.
+        (self.huanyu / "vllm_omni.py").write_text(
+            "raise AssertionError('STALE_HUANYU_HOOK_IMPORTED')\n", encoding="utf-8"
+        )
+        (self.project / "verl_omni_ext/__init__.py").write_text(
+            "raise AssertionError('EXT_INITIALIZER_IMPORTED')\n", encoding="utf-8"
+        )
+        self.example = self.project / "examples/qwen3_6_huanyu/check_native_runtime.py"
+        self.example.parent.mkdir(parents=True)
+        shutil.copyfile(ROOT / "examples/check_native_runtime.py", self.example)
+        self.checkout = self.directory / "selected-checkout"
+        self.native_path = self.write_checkout(self.checkout)
+
+    @staticmethod
+    def write_checkout(checkout):
+        parts = PARENT_MODULE.split(".")
+        for count in range(1, len(parts) + 1):
+            package = checkout.joinpath(*parts[:count])
+            package.mkdir(parents=True, exist_ok=True)
+            (package / "__init__.py").write_text("", encoding="utf-8")
+        native = checkout.joinpath(*NATIVE_MODULE.split(".")).with_suffix(".py")
+        native.write_text(VALID_NATIVE, encoding="utf-8")
+        return native
+
+    def run_check(self, entrypoint, *, checkout=None, expected_root=None):
+        environment = os.environ.copy()
+        environment.update(
+            PROJECT_ROOT=str(self.project),
+            HUANYU_VLLM_OMNI_ROOT=str(expected_root or self.checkout),
+            # Match an old deployed directory left on sys.path as well as the
+            # direct script directory that Python inserts ahead of PYTHONPATH.
+            PYTHONPATH=os.pathsep.join((str(self.huanyu), str(checkout or self.checkout), str(self.project))),
+            PYTHONUTF8="1",
+        )
+        return subprocess.run(
+            [sys.executable, "-B", "-S", str(entrypoint), "--check", "--expected-root", str(expected_root or self.checkout)],
+            cwd=self.huanyu,
+            env=environment,
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+
+    def assert_valid_native_selected(self, result):
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, output)
+        self.assertIn("[huanyu-runtime] OK", result.stdout)
+        self.assertIn(f"native_source={self.native_path.resolve()}", result.stdout)
+        self.assertNotIn("STALE_HUANYU_HOOK_IMPORTED", output)
+        self.assertNotIn("EXT_INITIALIZER_IMPORTED", output)
+        self.assertFalse(list(self.directory.rglob("__pycache__")))
+
+    def test_direct_cli_ignores_stale_sibling_and_loads_selected_checkout(self):
+        self.assert_valid_native_selected(self.run_check(self.runtime))
+
+    def test_runpy_job_check_uses_project_root_without_ext_initialization(self):
+        self.assert_valid_native_selected(self.run_check(self.example))
+
+    def test_wrong_real_checkout_is_rejected_instead_of_force_selected(self):
+        wrong_checkout = self.directory / "wrong-checkout"
+        wrong_native = self.write_checkout(wrong_checkout)
+        wrong_native.write_text("raise AssertionError('WRONG_NATIVE_IMPORTED')\n", encoding="utf-8")
+        for entrypoint in (self.runtime, self.example):
+            with self.subTest(entrypoint=entrypoint.name):
+                result = self.run_check(entrypoint, checkout=wrong_checkout)
+                output = result.stdout + result.stderr
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Huanyu vLLM-Omni source mismatch", output)
+                self.assertIn(str(wrong_checkout / "vllm_omni/__init__.py"), output)
+                self.assertNotIn("WRONG_NATIVE_IMPORTED", output)
+                self.assertNotIn("STALE_HUANYU_HOOK_IMPORTED", output)
+                self.assertNotIn("EXT_INITIALIZER_IMPORTED", output)
 
 
 if __name__ == "__main__":

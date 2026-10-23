@@ -276,7 +276,7 @@ if command not in ("ray", "git", "pip", "flock", "env-source"):
         ):
             self.assertEqual(event["precision"][key], "0", event)
         self.assertEqual(event["precision"]["VLLM_OMNI_EXTERNAL_MODULES"],
-                         "verl_omni_ext.models.qwen3_6_huanyu.vllm_omni", event)
+                         "verl_omni_ext.models.qwen3_6_huanyu.engine_hooks", event)
         self.assertEqual(event["precision"]["MINICPMO_HUANYU_ROLLOUT_TP"], "4", event)
         self.assertEqual(event["precision"]["HUANYU_USE_PRECOMPUTE"], "1", event)
 
@@ -343,7 +343,7 @@ if command not in ("ray", "git", "pip", "flock", "env-source"):
             "MINICPMO_HUANYU_LAYERWISE_RELOAD": "1",
             "MINICPMO_STABLE_LINEAR": "1",
             "MINICPMO_GDN_PREFILL_REFERENCE": "0",
-            "VLLM_OMNI_EXTERNAL_MODULES": "verl_omni_ext.models.qwen3_6_huanyu.vllm_omni",
+            "VLLM_OMNI_EXTERNAL_MODULES": "verl_omni_ext.models.qwen3_6_huanyu.engine_hooks",
         }
         actual = dict(arg.lstrip("+").split("=", 1)
                       for arg in json.loads(self.capture_file.read_text())["argv"])
@@ -378,7 +378,7 @@ if command not in ("ray", "git", "pip", "flock", "env-source"):
             "MINICPMO_GDN_FP32_REFERENCE": "1", "MINICPMO_HUANYU_LAYERWISE_RELOAD": "1",
             "MINICPMO_HYBRID_BLOCK_ZERO_REFERENCE": "1", "MINICPMO_ISOLATE_MEDIA_ENCODERS": "1",
             "MINICPMO_STABLE_LINEAR": "0",
-            "VLLM_OMNI_EXTERNAL_MODULES": "verl_omni_ext.models.qwen3_6_huanyu.vllm_omni",
+            "VLLM_OMNI_EXTERNAL_MODULES": "verl_omni_ext.models.qwen3_6_huanyu.engine_hooks",
         }
         for key, value in expected.items():
             self.assertEqual(json.loads(actual[

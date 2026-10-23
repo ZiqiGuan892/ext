@@ -1,10 +1,14 @@
 """Check the native Huanyu dependency in the process that actually uses it.
 
 This file also runs directly, without importing the ext package or loading model
-weights. It never patches sys.path or replaces an already imported vLLM module.
+weights. During native imports it excludes only its own CLI directory, which
+may contain a stale vllm_omni.py from an earlier deployment. It restores the
+search path afterwards, never chooses another checkout, and never replaces
+an already imported vLLM module.
 """
 
 import argparse
+from contextlib import contextmanager
 import importlib
 import os
 from pathlib import Path
@@ -17,6 +21,29 @@ REQUIRED_SYMBOLS = (
     "HuanyuFbankFeatureExtractor", "HuanyuAudioEncoder", "huanyu_project_and_fold",
 )
 DEFAULT_ROOT = "/vllm-workspace/vllm-omni"
+
+
+@contextmanager
+def _without_cli_directory():
+    """Do not treat files next to this CLI as top-level dependency packages.
+
+    ``python /path/to/runtime_imports.py`` prepends its directory before PYTHONPATH.
+    An old sibling vllm_omni.py therefore wins over the correctly selected checkout.
+    Package-relative imports still use __path__; only the flat CLI directory is
+    excluded. Preserve the order of all actual checkout paths and restore it even
+    if an import fails.
+    """
+    directory = Path(__file__).resolve().parent
+    original = list(sys.path)
+    filtered = [entry for entry in original if Path(entry or os.curdir).resolve() != directory]
+    if filtered == original:
+        yield
+        return
+    sys.path[:] = filtered
+    try:
+        yield
+    finally:
+        sys.path[:] = original
 
 
 def _origin(module):
@@ -56,9 +83,10 @@ def load_huanyu_native(expected_root=None):
     """Import the real implementation, with actionable per-worker diagnostics."""
     expected_root = expected_root or os.environ.get("HUANYU_VLLM_OMNI_ROOT")
     try:
-        package = importlib.import_module("vllm_omni")
-        _check_origin(package, expected_root)
-        native = importlib.import_module(NATIVE_MODULE)
+        with _without_cli_directory():
+            package = importlib.import_module("vllm_omni")
+            _check_origin(package, expected_root)
+            native = importlib.import_module(NATIVE_MODULE)
     except ModuleNotFoundError as exc:
         missing_native = bool(exc.name) and (
             exc.name == NATIVE_MODULE or NATIVE_MODULE.startswith(exc.name + ".")

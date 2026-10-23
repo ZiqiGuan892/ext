@@ -1,4 +1,8 @@
-"""Explicit inference-worker entry point for Huanyu precision and IPC hooks."""
+"""Explicit inference-worker entry point for Huanyu precision and IPC hooks.
+
+Keep this filename distinct from the dependency package ``vllm_omni``:
+direct Huanyu CLI scripts put this directory first on Python's import path.
+"""
 
 # Keep the existing native model and pipeline registration, then apply the
 # Huanyu-specific hooks. No shared source files or checkpoint configs are edited.

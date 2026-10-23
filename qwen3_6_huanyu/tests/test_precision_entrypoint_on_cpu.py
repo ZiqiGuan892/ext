@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 PACKAGE = "verl_omni_ext.models.qwen3_6_huanyu"
-ENTRY = PACKAGE + ".vllm_omni"
+ENTRY = PACKAGE + ".engine_hooks"
 INSTALLERS = (
     ("rollout_precision", "install_huanyu_rollout_precision"),
     ("cache_precision", "install_huanyu_cache_precision"),
@@ -85,7 +85,7 @@ class PrecisionEntrypointTests(unittest.TestCase):
     def test_real_entry_registers_whisper_pipeline_before_all_three_hooks(self):
         with fake_registrations() as (events, installed):
             entry = importlib.import_module(ENTRY)
-            self.assertEqual(Path(entry.__file__).resolve(), ROOT / "vllm_omni.py")
+            self.assertEqual(Path(entry.__file__).resolve(), ROOT / "engine_hooks.py")
             self.assertEqual(events, [
                 "whisper-registration", "rollout_precision", "installed:rollout_precision",
                 "cache_precision", "installed:cache_precision", "weight_reload", "installed:weight_reload",

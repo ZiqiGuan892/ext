@@ -60,7 +60,7 @@ huanyu_configure_precision_mode() {
         esac
         export "$_key=$_value"
     done
-    export VLLM_OMNI_EXTERNAL_MODULES=verl_omni_ext.models.qwen3_6_huanyu.vllm_omni
+    export VLLM_OMNI_EXTERNAL_MODULES=verl_omni_ext.models.qwen3_6_huanyu.engine_hooks
     export HUANYU_USE_PRECOMPUTE="${HUANYU_USE_PRECOMPUTE:-0}"
     case "$HUANYU_USE_PRECOMPUTE" in
         0|1) ;;

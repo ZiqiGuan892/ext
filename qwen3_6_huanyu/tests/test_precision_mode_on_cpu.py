@@ -61,7 +61,7 @@ class PrecisionModeTests(unittest.TestCase):
         for key in OPTIONAL:
             self.assertEqual(capture["env"][key], "0", key)
         self.assertEqual(capture["env"]["MINICPMO_HUANYU_ROLLOUT_TP"], "4")
-        self.assertEqual(capture["env"]["VLLM_OMNI_EXTERNAL_MODULES"], "verl_omni_ext.models.qwen3_6_huanyu.vllm_omni")
+        self.assertEqual(capture["env"]["VLLM_OMNI_EXTERNAL_MODULES"], "verl_omni_ext.models.qwen3_6_huanyu.engine_hooks")
         for key, value in self.overrides(capture).items():
             decoded = json.loads(value)
             self.assertIsInstance(decoded, str, key)
@@ -151,7 +151,7 @@ class PrecisionModeTests(unittest.TestCase):
                 self.assertEqual(json.loads(values[PREFIX + "HUANYU_USE_PRECOMPUTE"]), cache)
                 self.assertEqual(json.loads(values[PREFIX + "HCCL_OP_EXPANSION_MODE"]), "AIV")
                 self.assertEqual(json.loads(values[PREFIX + "VLLM_OMNI_EXTERNAL_MODULES"]),
-                                 "verl_omni_ext.models.qwen3_6_huanyu.vllm_omni")
+                                 "verl_omni_ext.models.qwen3_6_huanyu.engine_hooks")
                 self.assertEqual(values["actor_rollout_ref.model.override_config.huanyu_freeze_audio"], frozen)
                 self.assertEqual(values["reward.reward_model.enable"], rm)
 
