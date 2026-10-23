@@ -52,7 +52,7 @@ for _huanyu_path in "${_huanyu_python_entries[@]}"; do
     _huanyu_retained_pythonpath="${_huanyu_retained_pythonpath:+${_huanyu_retained_pythonpath}:}${_huanyu_path}"
 done
 export PYTHONPATH="${_huanyu_vllm_omni_root}${_huanyu_retained_pythonpath:+:${_huanyu_retained_pythonpath}}"
-export FILTER_OVERLONG=false
+export FILTER_OVERLONG="${FILTER_OVERLONG:-false}"
 echo "[huanyu config] vLLM-Omni Python root: ${_huanyu_vllm_omni_root}; FILTER_OVERLONG=${FILTER_OVERLONG}"
 unset _huanyu_vllm_omni_root _huanyu_retained_pythonpath _huanyu_python_entries _huanyu_path
 
@@ -88,6 +88,6 @@ echo "===   ROLLOUT_FREQUENCY_PENALTY=${ROLLOUT_FREQUENCY_PENALTY}  ROLLOUT_REPE
 # 本脚本 export 的 NUM_NPUS/NNODES/ROLLOUT_TP/REWARD_POOL_NPUS/fp 后，追加
 # _OMNI_MIX_ARGS + _REWARD_ARGS 再 exec 后端。日志由 run_output.sh 保存到
 # ${PROJECT_ROOT}/runs/ 下独立运行目录中的 console.log，启动时打印完整路径。
-# 最后覆盖，确保下游默认值或传入参数不会重新打开长度预筛。
+# 旧入口仍默认关闭预筛；上层配置或显式 Hydra 参数可以启用预筛。
 exec bash "${PROJECT_ROOT}/examples/qwen3_6_huanyu/run_qwen36_huanyu_gspo_npu_omni_mix_genrm.sh" \
-    "$@" data.filter_overlong_prompts=false
+    "data.filter_overlong_prompts=${FILTER_OVERLONG}" "$@"

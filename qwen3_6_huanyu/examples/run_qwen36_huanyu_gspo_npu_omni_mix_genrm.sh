@@ -83,8 +83,8 @@ export ACTOR_OFFLOAD_POLICY=${ACTOR_OFFLOAD_POLICY:-false}
 export MINICPMO_DISABLE_MM_DEDUP=1
 
 # ---- 模型 dtype（代码1 经验：actor fp32，ref bfloat16）----
-export ACTOR_MODEL_DTYPE=fp32
-export REF_MODEL_DTYPE=bfloat16
+export ACTOR_MODEL_DTYPE="${ACTOR_MODEL_DTYPE:-fp32}"
+export REF_MODEL_DTYPE="${REF_MODEL_DTYPE:-bfloat16}"
 
 # ---- OmniMix 数据集使用自定义 dataset class ----
 export MINICPMO_USE_CUSTOM_DATASET=1

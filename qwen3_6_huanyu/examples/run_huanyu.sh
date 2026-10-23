@@ -31,11 +31,11 @@ export MODEL_PATH="${MODEL_PATH:-/opt/huawei/dataset/hfy-model-gy/downloaded_mod
 export TRAIN_FILE="${TRAIN_FILE:-/opt/huawei/dataset/infra_data/data/train.parquet}"
 export VAL_FILE="${VAL_FILE:-/opt/huawei/dataset/infra_data/data/validation.parquet}"
 export RM_MODEL_PATH="${RM_MODEL_PATH:-/opt/huawei/dataset/hfy-model-gy/downloaded_models/Qwen3.5-35B-A3B}"
-export FILTER_OVERLONG=false
+export FILTER_OVERLONG="${FILTER_OVERLONG:-false}"
 export MINICPMO_USE_PRECOMPUTE=0
 export MINICPMO_TUNE_AUDIO=0
 
-echo '[huanyu] adapter=Qwen36HuanyuForTraining dataset=Qwen36HuanyuOmniRLHFDataset pipeline=qwen3_6_huanyu; online frozen audio; length filter off'
+echo "[huanyu] adapter=Qwen36HuanyuForTraining dataset=Qwen36HuanyuOmniRLHFDataset pipeline=qwen3_6_huanyu; freeze_audio=${HUANYU_FREEZE_AUDIO:-true} precompute=${HUANYU_USE_PRECOMPUTE:-0} length_filter=${FILTER_OVERLONG}"
 
 # Keep HF config.architectures intact. architecture below selects only the
 # verl training adapter; the RM retains its independent Qwen3.5 registration.

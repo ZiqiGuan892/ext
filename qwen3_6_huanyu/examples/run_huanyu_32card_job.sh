@@ -181,6 +181,23 @@ for _arg in "$@"; do
     esac
 done
 
+# The opt-in Whisper comparison entry owns these shell-side settings as well
+# as its final Hydra arguments. Older site env files must not change preflight
+# lengths/batches or sampling defaults before that command is composed.
+declare -A _HUANYU_PROFILE_CONFIG=()
+if [[ "${HUANYU_JOB_PROFILE:-}" == whisper_aligned ]]; then
+    for _key in TRAIN_BATCH_SIZE PPO_MINI_BATCH_SIZE PPO_MICRO_BATCH_SIZE_PER_GPU \
+        ROLLOUT_N ACTOR_MODEL_DTYPE REF_MODEL_DTYPE ACTOR_OFFLOAD_POLICY \
+        ACTOR_FORWARD_PREFETCH ACTIVATION_OFFLOAD FILTER_OVERLONG \
+        MAX_PROMPT_LENGTH MAX_RESPONSE_LENGTH ROLLOUT_PROMPT_LENGTH \
+        ROLLOUT_MAX_MODEL_LEN MAX_TOKEN_LEN_PER_GPU MINICPMO_MM_PROMPT_BUDGET \
+        ROLLOUT_TEMPERATURE ROLLOUT_TOP_P ROLLOUT_TOP_K ROLLOUT_REPETITION_PENALTY \
+        ROLLOUT_FREQUENCY_PENALTY ROLLOUT_PRESENCE_PENALTY ROLLOUT_LOGPROBS_MODE \
+        ROLLOUT_GPU_MEM_UTIL HUANYU_GRAPH_MODE EXPERIMENT_NAME; do
+        if [[ -v "$_key" ]]; then _HUANYU_PROFILE_CONFIG["$_key"]="${!_key}"; fi
+    done
+fi
+
 # Own the numerical policy at this entry, even with an older/custom site env.
 # The default full profile overrides stale per-kernel opt-outs. custom keeps
 # explicit caller values for comparisons; site env must not replace the policy.
@@ -224,6 +241,9 @@ set +x
 set -euo pipefail
 for _key in "${!_HUANYU_PATH_CONFIG[@]}"; do
     export "$_key=${_HUANYU_PATH_CONFIG[$_key]}"
+done
+for _key in "${!_HUANYU_PROFILE_CONFIG[@]}"; do
+    export "$_key=${_HUANYU_PROFILE_CONFIG[$_key]}"
 done
 cd "$PROJECT_ROOT"
 huanyu_preload_allocator
