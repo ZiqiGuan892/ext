@@ -23,13 +23,22 @@ MODE_ENV = {
     "HUANYU_EMBED_CACHE_DIR": "", "Q36_BACKWARD_PREFETCH": "off",
 }
 PRECISION_ENV = {
+    "HUANYU_PRECISION_PROFILE": "full", "MINICPMO_FSDP2_PIN_MEMORY": "0",
     "MINICPMO_HUANYU_GDN_FP32_TRAINING": "1", "MINICPMO_GDN_FP32_REFERENCE": "1",
     "MINICPMO_HUANYU_LAYERWISE_RELOAD": "1", "MINICPMO_HYBRID_BLOCK_ZERO_REFERENCE": "1",
-    "MINICPMO_ISOLATE_MEDIA_ENCODERS": "1", "MINICPMO_STABLE_LINEAR": "0",
-    "MINICPMO_GDN_PREFILL_REFERENCE": "0", "MINICPMO_MOE_TP_REFERENCE": "0",
+    "MINICPMO_ISOLATE_MEDIA_ENCODERS": "1", "MINICPMO_STABLE_LINEAR": "1",
+    "MINICPMO_GDN_PREFILL_REFERENCE": "1", "MINICPMO_MOE_TP_REFERENCE": "0",
+    "MINICPMO_GDN_CACHE_BARRIER": "1", "MINICPMO_GDN_L2NORM_REFERENCE": "1",
+    "MINICPMO_GDN_CONV_REFERENCE": "1", "MINICPMO_GDN_GATING_REFERENCE": "1",
+    "MINICPMO_PRIVATE_HYBRID_CACHE": "1",
     "MINICPMO_ROW_TP_REFERENCE": "0", "MINICPMO_HUANYU_ROLLOUT_TP": "4",
     "VLLM_OMNI_EXTERNAL_MODULES": "verl_omni_ext.models.qwen3_6_huanyu.engine_hooks",
 }
+CUSTOM_PRECISION_ENV = dict(PRECISION_ENV, HUANYU_PRECISION_PROFILE="custom", **dict.fromkeys((
+    "MINICPMO_STABLE_LINEAR", "MINICPMO_GDN_PREFILL_REFERENCE", "MINICPMO_GDN_CACHE_BARRIER",
+    "MINICPMO_GDN_L2NORM_REFERENCE", "MINICPMO_GDN_CONV_REFERENCE", "MINICPMO_GDN_GATING_REFERENCE",
+    "MINICPMO_PRIVATE_HYBRID_CACHE",
+), "0"))
 
 # Import fixture helpers by path, without importing the optional model package.
 _spec = importlib.util.spec_from_file_location(
@@ -159,8 +168,10 @@ class AqaJobLauncherTests(unittest.TestCase):
         self.assert_precision_environment(capture["env"])
         actual = effective_arguments(capture)
         expected = {
-            "data.train_files": self.train.as_posix(),
-            "data.val_files": self.validation.as_posix(),
+            "data.train_files": _job.shell_path(self.train),
+            "data.val_files": _job.shell_path(self.validation),
+            "actor_rollout_ref.model.path": _job.DEFAULT_MODEL_PATH,
+            "reward.reward_model.model_path": _job.DEFAULT_RM_MODEL_PATH,
             "data.custom_cls.path": "pkg://verl_omni_ext.models.qwen3_6_huanyu.dataset",
             "actor_rollout_ref.model.architecture": "Qwen36HuanyuForTraining",
             "actor_rollout_ref.model.override_config.huanyu_freeze_audio": "false",
@@ -222,8 +233,8 @@ class AqaJobLauncherTests(unittest.TestCase):
         })
         self.assert_online_environment(capture["env"])
         actual = effective_arguments(capture)
-        self.assertEqual(actual["data.train_files"], self.train.as_posix())
-        self.assertEqual(actual["data.val_files"], self.validation.as_posix())
+        self.assertEqual(actual["data.train_files"], _job.shell_path(self.train))
+        self.assertEqual(actual["data.val_files"], _job.shell_path(self.validation))
         self.assertEqual(actual["data.max_prompt_length"], "3072")
         self.assertEqual(actual["data.max_response_length"], "2048")
         self.assertEqual(actual["actor_rollout_ref.rollout.max_model_len"], "5248")
@@ -262,7 +273,7 @@ class AqaJobLauncherTests(unittest.TestCase):
                 "export MINICPMO_GDN_FP32_REFERENCE=1 MINICPMO_STABLE_LINEAR=1\n"
                 "export VLLM_OMNI_EXTERNAL_MODULES=old.whisper.entry ROLLOUT_TP=8\n"
             )
-        explicit = {"MINICPMO_GDN_FP32_REFERENCE": "0", "MINICPMO_MOE_TP_REFERENCE": "4"}
+        explicit = dict(CUSTOM_PRECISION_ENV, MINICPMO_GDN_FP32_REFERENCE="0", MINICPMO_MOE_TP_REFERENCE="4")
         capture = self.launch(dict(explicit, HUANYU_TEST_RAY_LIVE="1", ROLLOUT_TP="8"), (
             "actor_rollout_ref.rollout.tensor_model_parallel_size=8",
             '++ray_kwargs.ray_init.runtime_env.env_vars.MINICPMO_HUANYU_LAYERWISE_RELOAD="0"',
@@ -297,8 +308,14 @@ class AqaJobLauncherTests(unittest.TestCase):
         for kind in ("helper", "pip", "ray", "train"):
             self.assertFalse(self.fixture.events(kind), kind)
 
-    def test_explicit_absolute_project_root_is_required(self):
-        for root in (None, "relative/project", _job.shell_path(self.fixture.project / "missing")):
+    def test_default_root_is_selected_and_invalid_explicit_roots_stop_before_setup(self):
+        # If the deployment happens to exist, reject the profile before the
+        # backend can start; this check only observes root selection.
+        result = self.fixture.run_launcher({"PROJECT_ROOT": None, "HUANYU_PRECISION_PROFILE": "invalid"}, trace=True)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"PROJECT_ROOT={_job.DEFAULT_PROJECT_ROOT}", result.stderr)
+        self.assertIn(f"{_job.DEFAULT_PROJECT_ROOT}/examples/qwen3_6_huanyu/run_huanyu_32card_job.sh", result.stderr)
+        for root in ("relative/project", _job.shell_path(self.fixture.project / "missing")):
             with self.subTest(root=root):
                 result = self.fixture.run_launcher({"PROJECT_ROOT": root})
                 self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)

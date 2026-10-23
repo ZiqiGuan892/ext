@@ -18,15 +18,20 @@ CORE = (
     "MINICPMO_HUANYU_LAYERWISE_RELOAD", "MINICPMO_HYBRID_BLOCK_ZERO_REFERENCE",
     "MINICPMO_ISOLATE_MEDIA_ENCODERS",
 )
-OPTIONAL = (
+FULL = (
     "MINICPMO_GDN_CACHE_BARRIER", "MINICPMO_GDN_PREFILL_REFERENCE", "MINICPMO_GDN_L2NORM_REFERENCE",
-    "MINICPMO_GDN_CONV_REFERENCE", "MINICPMO_GDN_GATING_REFERENCE", "MINICPMO_HF_NORM_REFERENCE",
-    "MINICPMO_HF_ROUTER_REFERENCE", "MINICPMO_HF_TEXT_ROPE_REFERENCE", "MINICPMO_STABLE_LINEAR",
-    "MINICPMO_MOE_MATCH_ROLLOUT", "MINICPMO_ISOLATE_FULL_ATTENTION", "MINICPMO_PRIVATE_HYBRID_CACHE",
+    "MINICPMO_GDN_CONV_REFERENCE", "MINICPMO_GDN_GATING_REFERENCE", "MINICPMO_STABLE_LINEAR",
+    "MINICPMO_PRIVATE_HYBRID_CACHE",
+)
+OPTIONAL = (
+    "MINICPMO_HF_NORM_REFERENCE", "MINICPMO_HF_ROUTER_REFERENCE", "MINICPMO_HF_TEXT_ROPE_REFERENCE",
+    "MINICPMO_MOE_MATCH_ROLLOUT", "MINICPMO_ISOLATE_FULL_ATTENTION",
     "MINICPMO_VISION_POSITION_REFERENCE", "MINICPMO_NATIVE_VISION_REFERENCE",
     "MINICPMO_MOE_TP_REFERENCE", "MINICPMO_ROW_TP_REFERENCE",
 )
 PREFIX = fixture_module.ENV_PREFIX
+WORKER_KEY = "actor_rollout_ref.rollout.engine_kwargs.vllm_omni.worker_extension_cls"
+WORKER_CLASS = "verl_omni_ext.models.qwen3_6_huanyu.worker_extension.HuanyuColocateWorkerExtension"
 SOURCE = 'source "${PROJECT_ROOT}/examples/qwen3_6_huanyu/precision_mode.sh" "$@" || exit $?\n'
 
 
@@ -36,7 +41,8 @@ class PrecisionModeTests(unittest.TestCase):
         self.fixture = fixture_module.HuanyuGraphModeTests(methodName="test_unset_mode_defaults_to_eager_and_overrides_inherited_graph_flags")
         self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
-        keys = CORE + OPTIONAL + ("MINICPMO_HUANYU_ROLLOUT_TP", "VLLM_OMNI_EXTERNAL_MODULES",
+        keys = CORE + FULL + OPTIONAL + ("HUANYU_PRECISION_PROFILE", "MINICPMO_FSDP2_PIN_MEMORY",
+                                   "MINICPMO_HUANYU_ROLLOUT_TP", "VLLM_OMNI_EXTERNAL_MODULES",
                                    "HUANYU_USE_PRECOMPUTE", "HCCL_OP_EXPANSION_MODE", "HCCL_DETERMINISTIC", "ROLLOUT_TP")
         self.fixture.capture_script.write_text(
             "import json, os, pathlib, sys\n"
@@ -54,28 +60,60 @@ class PrecisionModeTests(unittest.TestCase):
     def overrides(capture):
         return dict(arg.lstrip("+").split("=", 1) for arg in capture["argv"] if "=" in arg)
 
-    def test_core_defaults_enabled_and_optional_references_off(self):
+    def test_full_defaults_enable_complete_policy_without_unrelated_references(self):
         capture = self.capture()
-        for key in CORE:
+        for key in CORE + FULL:
             self.assertEqual(capture["env"][key], "1", key)
         for key in OPTIONAL:
             self.assertEqual(capture["env"][key], "0", key)
+        self.assertEqual(capture["env"]["HUANYU_PRECISION_PROFILE"], "full")
+        self.assertEqual(capture["env"]["MINICPMO_FSDP2_PIN_MEMORY"], "0")
         self.assertEqual(capture["env"]["MINICPMO_HUANYU_ROLLOUT_TP"], "4")
         self.assertEqual(capture["env"]["VLLM_OMNI_EXTERNAL_MODULES"], "verl_omni_ext.models.qwen3_6_huanyu.engine_hooks")
         for key, value in self.overrides(capture).items():
+            if not key.startswith(PREFIX):
+                continue
             decoded = json.loads(value)
             self.assertIsInstance(decoded, str, key)
             expected = capture["env"][key.removeprefix(PREFIX)] or ""
             self.assertEqual(decoded, expected, key)
 
     def test_explicit_optout_and_optional_switches_survive_repeated_source(self):
-        updates = {CORE[0]: "0", "MINICPMO_STABLE_LINEAR": "1", "HUANYU_USE_PRECOMPUTE": "1"}
+        updates = {"HUANYU_PRECISION_PROFILE": "custom", CORE[0]: "0",
+                   "MINICPMO_STABLE_LINEAR": "1", "HUANYU_USE_PRECOMPUTE": "1"}
         first = self.capture(updates=updates)
         second = self.capture(SOURCE + SOURCE + 'python3 "${HUANYU_PRECISION_ARGS[@]}"\n', updates=updates)
         self.assertEqual(first, second)
         self.assertEqual(second["env"][CORE[0]], "0")
         self.assertEqual(second["env"]["MINICPMO_STABLE_LINEAR"], "1")
         self.assertEqual(second["env"]["HUANYU_USE_PRECOMPUTE"], "1")
+        self.assertEqual(second["env"]["MINICPMO_GDN_PREFILL_REFERENCE"], "0")
+        self.assertEqual(self.overrides(second)[WORKER_KEY], WORKER_CLASS)
+
+    def test_full_overrides_stale_disabled_flags_and_reports_actual_policy_once(self):
+        updates = dict.fromkeys(CORE + FULL, "0")
+        updates["MINICPMO_FSDP2_PIN_MEMORY"] = "1"
+        result = self.fixture.run_shell(
+            SOURCE + SOURCE + 'python3 "${HUANYU_PRECISION_ARGS[@]}"\n', updates=updates,
+        )
+        capture = self.fixture.read_capture(result)
+        self.assertIn("overrides inherited values", result.stdout)
+        for key in CORE + FULL:
+            self.assertEqual(capture["env"][key], "1", key)
+            self.assertEqual(result.stdout.count(f"effective {key}=1\n"), 1)
+            self.assertEqual(json.loads(self.overrides(capture)[PREFIX + key]), "1")
+        self.assertEqual(capture["env"]["MINICPMO_FSDP2_PIN_MEMORY"], "0")
+        self.assertEqual(json.loads(self.overrides(capture)[PREFIX + "MINICPMO_FSDP2_PIN_MEMORY"]), "0")
+
+    def test_full_graph_conflict_rejected_in_either_source_order(self):
+        graph = 'source "${PROJECT_ROOT}/examples/qwen3_6_huanyu/graph_mode.sh" || exit $?\n'
+        for body in (SOURCE + graph, graph + SOURCE):
+            for value in ("1", "true"):
+                with self.subTest(body=body, value=value):
+                    result = self.fixture.run_shell(body + "python3\n", {"HUANYU_GRAPH_MODE": value})
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    self.assertIn("full", result.stderr)
+                    self.assertFalse(self.fixture.capture.exists())
 
     def test_hccl_policy_is_not_synthesized_and_late_defaults_are_forwarded(self):
         clear = "unset HCCL_OP_EXPANSION_MODE HCCL_DETERMINISTIC\n"
@@ -102,7 +140,8 @@ class PrecisionModeTests(unittest.TestCase):
 
     def test_invalid_flags_or_tp_fail_before_python(self):
         for updates, arguments in (
-            ({"MINICPMO_GDN_FP32_REFERENCE": "False"}, ()),
+            ({"HUANYU_PRECISION_PROFILE": "custom", "MINICPMO_GDN_FP32_REFERENCE": "False"}, ()),
+            ({"HUANYU_PRECISION_PROFILE": "invalid"}, ()),
             ({"HUANYU_USE_PRECOMPUTE": "yes"}, ()),
             ({"MINICPMO_ROW_TP_REFERENCE": "4"}, ("actor_rollout_ref.rollout.tensor_model_parallel_size=2",)),
             ({}, ("actor_rollout_ref.rollout.tensor_model_parallel_size=0",)),
@@ -139,6 +178,8 @@ class PrecisionModeTests(unittest.TestCase):
         for frozen, cache, rm in (("true", "1", "true"), ("false", "0", "true"), ("false", "0", "false")):
             with self.subTest(frozen=frozen, cache=cache, rm=rm):
                 arguments = (
+                    f"++{WORKER_KEY}=old.worker.Extension",
+                    "++reward.reward_model.rollout.engine_kwargs.vllm_omni.worker_extension_cls=reward.worker.Extension",
                     f"++{PREFIX}MINICPMO_GDN_FP32_REFERENCE=0",
                     f"++{PREFIX}VLLM_OMNI_EXTERNAL_MODULES=old.whisper",
                     f"++{PREFIX}HUANYU_USE_PRECOMPUTE={1-int(cache)}",
@@ -154,6 +195,11 @@ class PrecisionModeTests(unittest.TestCase):
                                  "verl_omni_ext.models.qwen3_6_huanyu.engine_hooks")
                 self.assertEqual(values["actor_rollout_ref.model.override_config.huanyu_freeze_audio"], frozen)
                 self.assertEqual(values["reward.reward_model.enable"], rm)
+                self.assertEqual(values[WORKER_KEY], WORKER_CLASS)
+                self.assertEqual(values["reward.reward_model.rollout.engine_kwargs.vllm_omni.worker_extension_cls"],
+                                 "reward.worker.Extension")
+                self.assertEqual(json.loads(values[PREFIX + "HUANYU_PRECISION_PROFILE"]), "full")
+                self.assertEqual(json.loads(values[PREFIX + "MINICPMO_FSDP2_PIN_MEMORY"]), "0")
 
 
 if __name__ == "__main__":

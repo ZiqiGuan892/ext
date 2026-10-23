@@ -209,8 +209,15 @@ class Huanyu16KLauncherTests(unittest.TestCase):
         self.assertEqual(len(self.fixture.events("train")), 1)
         self.assertIn("--head", self.fixture.events("ray")[0]["args"])
 
-    def test_missing_relative_or_wrong_project_root_stops_before_setup(self):
-        for root in (None, "relative/project", _job.shell_path(self.fixture.project / "missing")):
+    def test_default_root_is_selected_and_invalid_explicit_roots_stop_before_setup(self):
+        # Xtrace shows the selected real default without creating /opt paths.
+        # Invalid length guarantees this cannot launch the real server backend
+        # even when these CPU tests run on a host where that checkout exists.
+        result = self.fixture.run_launcher({"PROJECT_ROOT": None, "HUANYU_16K_RESPONSE_LENGTH": "invalid"}, trace=True)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"PROJECT_ROOT={_job.DEFAULT_PROJECT_ROOT}", result.stderr)
+        self.assertIn(f"{_job.DEFAULT_PROJECT_ROOT}/examples/qwen3_6_huanyu/run_huanyu_32card_job.sh", result.stderr)
+        for root in ("relative/project", _job.shell_path(self.fixture.project / "missing")):
             with self.subTest(root=root):
                 result = self.fixture.run_launcher({"PROJECT_ROOT": root})
                 self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -288,8 +295,13 @@ class Huanyu16KLauncherTests(unittest.TestCase):
             "reward.reward_model.rollout.tensor_model_parallel_size": "4",
             "data.train_batch_size": "32",
             "actor_rollout_ref.actor.ppo_mini_batch_size": "32",
+            "actor_rollout_ref.model.path": _job.DEFAULT_MODEL_PATH,
+            "reward.reward_model.model_path": _job.DEFAULT_RM_MODEL_PATH,
+            "data.train_files": _job.DEFAULT_TRAIN_FILE,
+            "data.val_files": _job.DEFAULT_VAL_FILE,
         }.items():
-            self.assertEqual(actual[key].lower(), expected, key)
+            observed = actual[key].lower() if expected in ("true", "false") else actual[key]
+            self.assertEqual(observed, expected, key)
 
     def assert_24_plus_8_backend(self, capture, rollout_tp=4, rm_tp=4, train_batch=24, mini_batch=24):
         actual = self.assert_lengths(capture)
@@ -336,17 +348,27 @@ class Huanyu16KLauncherTests(unittest.TestCase):
             stream.write(
                 "export NUM_NPUS=16 NNODES=1 RM_N_GPUS_PER_NODE=16 RM_NNODES=1\n"
                 "export REWARD_POOL_NPUS=16 RM_SPLIT_NODES=1 ROLLOUT_TP=8 RM_TP=8\n"
+                "export MODEL_PATH=/stale/whisper RM_MODEL_PATH=/stale/reward\n"
+                "export TRAIN_FILE=/stale/train.parquet VAL_FILE=/stale/validation.parquet\n"
             )
+        paths = {"MODEL_PATH": "/explicit/actor", "RM_MODEL_PATH": "/explicit/reward",
+                 "TRAIN_FILE": "/explicit/train.parquet", "VAL_FILE": "/explicit/validation.parquet"}
         capture = self.launch({
             "HUANYU_16K_POOL_LAYOUT": "24+8", "ROLLOUT_TP": "2", "RM_TP": "2",
             "TRAIN_BATCH_SIZE": "48", "PPO_MINI_BATCH_SIZE": "24",
+            **paths,
         })
         self.assert_24_plus_8_backend(capture, rollout_tp=2, rm_tp=2, train_batch=48)
+        actual = effective_arguments(capture)
+        for env, config in (("MODEL_PATH", "actor_rollout_ref.model.path"),
+                            ("RM_MODEL_PATH", "reward.reward_model.model_path"),
+                            ("TRAIN_FILE", "data.train_files"), ("VAL_FILE", "data.val_files")):
+            self.assertEqual(actual[config], paths[env], config)
 
     def test_user_hydra_overrides_survive_but_graph_selector_keeps_authority(self):
         self.use_real_training_composition()
         capture = self.launch(
-            {"HUANYU_GRAPH_MODE": "1"},
+            {"HUANYU_PRECISION_PROFILE": "custom", "HUANYU_GRAPH_MODE": "1"},
             arguments=(
                 "--scheduler_mount=/not/a/hydra/key",
                 "actor_rollout_ref.model.override_config.attn_implementation=eager",

@@ -3,16 +3,29 @@
 # Deploy to ${PROJECT_ROOT}/examples/qwen3_6_huanyu/ with the Huanyu package.
 # Defaults: frozen Huanyu, 35B sampleall, precomputed q128 cache, actor16 + RM16.
 # HUANYU_JOB_MODE=aqa_unfreeze selects online AQA training via its own entry.
-# Precision defaults: FP32/autocast-isolated training GDN, slot-local FP32
-# rollout GDN, layerwise IPC reload, logical KV zeroing and isolated vision.
+# Precision defaults: the complete full policy, including FP32 training/GDN,
+# prefill/gating/conv/L2/barrier, private hybrid cache, stable linear, layerwise
+# IPC reload, logical KV zeroing, isolated media and FSDP pin_memory=0.
 # Apply the same policy before Ray on BOTH nodes and explicitly in runtime_env
-# for training. Optional slow arithmetic references remain off by default.
+# for training. full requires graph mode=0; explicit profile=custom permits A/B.
 # Never stops an existing Ray cluster or deletes an old checkout.
 set -euo pipefail
 
-_HUANYU_EXAMPLE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-export PROJECT_ROOT="${PROJECT_ROOT:-$(cd "${_HUANYU_EXAMPLE_DIR}/../.." && pwd)}"
+export PROJECT_ROOT="${PROJECT_ROOT:-/opt/huawei/dataset/hfy-model-gy/verl_omni_qwen36_gzq_new}"
+_HUANYU_EXAMPLE_DIR="${PROJECT_ROOT}/examples/qwen3_6_huanyu"
 cd "$PROJECT_ROOT"
+# Resolve deployment paths once. Site environment files may still contain old
+# defaults; neither they nor downstream wrappers should replace caller paths.
+declare -A _HUANYU_PATH_CONFIG=(
+    [PROJECT_ROOT]="$PROJECT_ROOT"
+    [MODEL_PATH]="${MODEL_PATH:-/opt/huawei/dataset/hfy-model-gy/downloaded_models/Qwen3.6-35B-A3B-huanyu06b-iter2000-omni4b-hf-huanyu7tokens}"
+    [RM_MODEL_PATH]="${RM_MODEL_PATH:-/opt/huawei/dataset/hfy-model-gy/downloaded_models/Qwen3.5-35B-A3B}"
+    [TRAIN_FILE]="${TRAIN_FILE:-/opt/huawei/dataset/infra_data/data/train.parquet}"
+    [VAL_FILE]="${VAL_FILE:-/opt/huawei/dataset/infra_data/data/validation.parquet}"
+)
+for _key in "${!_HUANYU_PATH_CONFIG[@]}"; do
+    export "$_key=${_HUANYU_PATH_CONFIG[$_key]}"
+done
 # The downstream training entry also invokes python3; keep installation and
 # probes in that same interpreter environment.
 _PYTHON=python3
@@ -169,8 +182,8 @@ for _arg in "$@"; do
 done
 
 # Own the numerical policy at this entry, even with an older/custom site env.
-# Preserve explicit caller opt-outs for controlled comparisons; a site env
-# must not silently replace either those values or the corrected defaults.
+# The default full profile overrides stale per-kernel opt-outs. custom keeps
+# explicit caller values for comparisons; site env must not replace the policy.
 source "$_PRECISION_FILE" "${_TRAIN_ARGS[@]}" || exit $?
 declare -A _HUANYU_PRECISION_CONFIG=()
 for _key in "${HUANYU_PRECISION_KEYS[@]}"; do
@@ -209,6 +222,9 @@ set +u
 source "$_ENV_FILE"
 set +x
 set -euo pipefail
+for _key in "${!_HUANYU_PATH_CONFIG[@]}"; do
+    export "$_key=${_HUANYU_PATH_CONFIG[$_key]}"
+done
 cd "$PROJECT_ROOT"
 huanyu_preload_allocator
 echo "[huanyu-job] allocator for native check/Ray: LD_PRELOAD=$LD_PRELOAD"

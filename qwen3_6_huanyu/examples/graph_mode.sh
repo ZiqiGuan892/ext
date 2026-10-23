@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
 # Shared by every Huanyu training launcher through the final backend.
 # HUANYU_GRAPH_MODE=1 permits actor/RM inference graph capture; 0 keeps eager.
+# The full precision profile requires 0; graph A/Bs require explicit custom.
 # This does not enable actor/FSDP forward-backward torch.compile.
 
 huanyu_configure_graph_mode() {
+    if [[ "${HUANYU_PRECISION_PROFILE:-full}" == full && ( "${HUANYU_GRAPH_MODE:-0}" == 1 || "${HUANYU_GRAPH_MODE:-0}" == true ) ]]; then
+        echo "[huanyu-graph] FATAL: HUANYU_PRECISION_PROFILE=full cannot capture Python precision reference kernels; use HUANYU_GRAPH_MODE=0, or explicitly select profile=custom for a separate comparison" >&2
+        return 2
+    fi
     case "${HUANYU_GRAPH_MODE:-0}" in
         1|true)
             export HUANYU_GRAPH_MODE=1 HUANYU_ENFORCE_EAGER=false

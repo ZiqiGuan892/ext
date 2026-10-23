@@ -5,8 +5,8 @@
 # RM_ENABLE=1 retains the 32-card GenRM path; RM_ENABLE=0 uses 16 cards and rules.
 set -euo pipefail
 
-_HUANYU_EXAMPLE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-export PROJECT_ROOT="${PROJECT_ROOT:-$(cd "${_HUANYU_EXAMPLE_DIR}/../.." && pwd)}"
+export PROJECT_ROOT="${PROJECT_ROOT:-/opt/huawei/dataset/hfy-model-gy/verl_omni_qwen36_gzq_new}"
+_HUANYU_EXAMPLE_DIR="${PROJECT_ROOT}/examples/qwen3_6_huanyu"
 cd "${PROJECT_ROOT}"
 _HUANYU_MODEL_DIR="${PROJECT_ROOT}/verl_omni_ext/models/qwen3_6_huanyu"
 source "${_HUANYU_EXAMPLE_DIR}/run_output.sh" || exit $?
@@ -73,10 +73,10 @@ export ACTOR_OFFLOAD_POLICY=false
 export ACTIVATION_OFFLOAD=false
 export FILTER_OVERLONG=false
 
-export TRAIN_FILE="${TRAIN_FILE:-/opt/huawei/dataset/ccb_data/data/omni/omni_mix_aqa_only/train.parquet}"
-export VAL_FILE="${VAL_FILE:-/opt/huawei/dataset/ccb_data/data/omni/omni_mix_aqa_only/validation.parquet}"
-export MODEL_PATH=/opt/huawei/dataset/downloaded_models/Qwen3.6-35B-A3B-huanyu06b-iter2000-omni4b-hf-huanyu7tokens
-export RM_MODEL_PATH="${RM_MODEL_PATH:-/opt/huawei/dataset/downloaded_models/Qwen3.5-35B-A3B}"
+export TRAIN_FILE="${TRAIN_FILE:-/opt/huawei/dataset/infra_data/data/train.parquet}"
+export VAL_FILE="${VAL_FILE:-/opt/huawei/dataset/infra_data/data/validation.parquet}"
+export MODEL_PATH="${MODEL_PATH:-/opt/huawei/dataset/hfy-model-gy/downloaded_models/Qwen3.6-35B-A3B-huanyu06b-iter2000-omni4b-hf-huanyu7tokens}"
+export RM_MODEL_PATH="${RM_MODEL_PATH:-/opt/huawei/dataset/hfy-model-gy/downloaded_models/Qwen3.5-35B-A3B}"
 
 # Both paths use 16 actor/rollout NPUs; only GenRM needs another 16 NPUs.
 # One sequence per actor rank avoids retaining full unsharded gradients during
@@ -98,7 +98,7 @@ if (( PPO_MINI_BATCH_SIZE * ROLLOUT_N != 16 || ROLLOUT_N < 2 ||
     exit 2
 fi
 
-# DEBUG_MODE rewrites batching and may write shared mini_debug parquet files.
+# DEBUG_MODE rewrites batching and may create temporary debug parquet files.
 # For a short run use TOTAL_TRAINING_STEPS=2; do not use that old debug path.
 if [[ "${DEBUG_MODE:-0}" != 0 || "${DEBUG_SAMPLES:-0}" != 0 ]]; then
     echo "[huanyu-aqa] FATAL: use TOTAL_TRAINING_STEPS=2 instead of DEBUG_MODE/DEBUG_SAMPLES" >&2

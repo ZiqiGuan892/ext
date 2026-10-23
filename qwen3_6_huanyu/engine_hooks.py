@@ -14,4 +14,7 @@ from .weight_reload import install_huanyu_weight_reload
 
 install_huanyu_rollout_precision()
 install_huanyu_cache_precision()
+# Best-effort compatibility bind may defer during the native registry's
+# circular import. The rollout adapter also selects an explicit worker class;
+# that worker factory import is the mandatory, non-skippable binding point.
 install_huanyu_weight_reload()

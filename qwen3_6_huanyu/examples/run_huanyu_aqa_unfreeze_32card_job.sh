@@ -14,12 +14,14 @@
 #   prefix cache and MM processor cache: off while audio weights change
 # Explicit numerical environment overrides remain available for A/B tests;
 # slow reference kernels stay opt-in. The audio encoder/projector keep gradients.
-# Train attention remains eager; HUANYU_GRAPH_MODE still controls inference.
+# Train attention remains eager. The default full precision profile also
+# requires inference eager mode; graph comparisons require profile=custom.
 #
 # Run this SAME command on both nodes. VC_TASK_INDEX=0 starts Ray head and
 # training; VC_TASK_INDEX=1 only joins Ray. Actor/rollout uses 16 NPUs and
 # GenRM uses another 16 NPUs. The original job owns setup and readiness checks.
-# PROJECT_ROOT must be absolute; this wrapper may be stored outside it.
+# PROJECT_ROOT defaults to the shared Huanyu deployment; an override must be
+# absolute. This wrapper may be stored outside it.
 # Deploy the supporting scripts to PROJECT_ROOT/examples/qwen3_6_huanyu/.
 #
 # Optional AQA paths (checked by check_aqa_audio_train.py before training):
@@ -28,11 +30,11 @@
 # Smoke run: TOTAL_TRAINING_STEPS=2 bash /path/to/this/script.sh
 set -euo pipefail
 
-if [[ -z "${PROJECT_ROOT:-}" || "$PROJECT_ROOT" != /* ]]; then
+export PROJECT_ROOT="${PROJECT_ROOT:-/opt/huawei/dataset/hfy-model-gy/verl_omni_qwen36_gzq_new}"
+if [[ "$PROJECT_ROOT" != /* ]]; then
     echo 'FATAL: set PROJECT_ROOT to the absolute training-project path' >&2
     exit 2
 fi
-export PROJECT_ROOT
 _HUANYU_AQA_JOB="${PROJECT_ROOT}/examples/qwen3_6_huanyu/run_huanyu_32card_job.sh"
 _HUANYU_AQA_PRECISION="${PROJECT_ROOT}/examples/qwen3_6_huanyu/precision_mode.sh"
 [[ -f "$_HUANYU_AQA_JOB" && -f "$_HUANYU_AQA_PRECISION" ]] || {
@@ -40,14 +42,14 @@ _HUANYU_AQA_PRECISION="${PROJECT_ROOT}/examples/qwen3_6_huanyu/precision_mode.sh
     exit 1
 }
 
-# Dedicated profile variables prevent old sampleall/16K settings from leaking
-# into online audio training. The job reapplies the mode after sourcing env.
+# The profile establishes online audio training; the job reapplies that mode
+# after sourcing env. Explicit dataset paths are retained and AQA-validated.
 export HUANYU_JOB_MODE=aqa_unfreeze
 export HUANYU_FREEZE_AUDIO=false HUANYU_USE_PRECOMPUTE=0 HUANYU_EMBED_CACHE_DIR=""
 export HUANYU_AQA_AUDIO_TRAIN=1 MINICPMO_USE_PRECOMPUTE=0
 export MINICPMO_TUNE_AUDIO=1 MINICPMO_TUNE_VISION=0
-export TRAIN_FILE="${HUANYU_AQA_TRAIN_FILE:-/opt/huawei/dataset/ccb_data/data/omni/omni_mix_aqa_only/train.parquet}"
-export VAL_FILE="${HUANYU_AQA_VAL_FILE:-/opt/huawei/dataset/ccb_data/data/omni/omni_mix_aqa_only/validation.parquet}"
+export TRAIN_FILE="${HUANYU_AQA_TRAIN_FILE:-${TRAIN_FILE:-/opt/huawei/dataset/infra_data/data/train.parquet}}"
+export VAL_FILE="${HUANYU_AQA_VAL_FILE:-${VAL_FILE:-/opt/huawei/dataset/infra_data/data/validation.parquet}}"
 export TRAIN_BATCH_SIZE=4 PPO_MINI_BATCH_SIZE=4 ROLLOUT_N=4
 export PPO_MICRO_BATCH_SIZE_PER_GPU=1
 export MAX_PROMPT_LENGTH=3072 MAX_RESPONSE_LENGTH=2048

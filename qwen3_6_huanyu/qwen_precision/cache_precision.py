@@ -1,7 +1,7 @@
 """Common cache algorithms ported from qwen3_6_whisper.cache_precision.
 
-Huanyu owns policy selection and hook installation; numerical bodies are kept
-unchanged from the source implementation.
+Huanyu owns policy selection, hook installation and bounded execution logs.
+The allocation, budget and page-mapping arithmetic matches the source.
 """
 
 import torch
@@ -29,7 +29,6 @@ def private_buffers(runner,config):
  # touching a live Mamba state owned by a different cache group.
  if len({v.data_ptr() for v in buffers.values()})!=len(buffers):
   raise RuntimeError('Private cache allocations unexpectedly alias')
- print(f'[q36-cache] private contiguous hybrid buffers: layers={len(buffers)}, blocks={config.num_blocks}, bytes={sum(v.numel() for v in buffers.values())}',flush=True)
  return buffers
 
 
@@ -46,8 +45,11 @@ def planner_budget(available,groups):
 def zero_attention_blocks(runner,block_ids):
  """Expand logical scheduler blocks to the backend's physical cache pages."""
  from vllm.v1.kv_cache_interface import AttentionSpec
+ runner._huanyu_zero_execution=None
  if not block_ids or not hasattr(runner,'kv_cache_config'):return
  ids=torch.as_tensor(block_ids,device=runner.device,dtype=torch.long)
+ touched=0
+ geometry=None
  for group in runner.kv_cache_config.kv_cache_groups:
   spec=group.kv_cache_spec
   if not isinstance(spec,AttentionSpec):continue
@@ -66,6 +68,10 @@ def zero_attention_blocks(runner,block_ids):
      raise RuntimeError('Logical KV block to clear is outside the physical cache')
     pages=(ids[:,None]*ratio+torch.arange(ratio,device=state.device)[None,:]).reshape(-1)
     state.index_fill_(axis,pages,0)
-    if not getattr(runner,'_q36_zero_geometry_reported',False):
-     runner._q36_zero_geometry_reported=True
-     print(f'[q36-cache] logical KV zeroing: logical={logical}, physical={physical}, pages_per_block={ratio}',flush=True)
+    touched+=1
+    if geometry is None:
+     geometry=dict(logical=logical,physical=physical,pages_per_block=ratio)
+ # Report only after the whole call succeeds, not after the first state when a
+ # later state might still fail. Metadata never reads tensor values or syncs.
+ if touched:
+  runner._huanyu_zero_execution=dict(logical_blocks=len(block_ids),states=touched,**geometry)

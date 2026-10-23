@@ -54,31 +54,30 @@ def _validate_vision_references():
 
 
 def _install_linear(module, shared):
-    """Scope every model even when an earlier actor installed global F.linear.
-
-The shared installer exits early once F.linear is patched. Actor/reference
-instances created later would otherwise miss its ContextVar scope entirely.
-Recomputation can call forward directly, so use the same forward wrappers as
-Whisper rather than Module hooks, which checkpoint recomputation may bypass.
-"""
-    import torch.nn.functional as functional
-
-    language = module.model.language_model
-    targets = (language, *language.layers, module.lm_head)
-    installed_before = getattr(functional.linear, "_q36_stable_linear", False)
-    if installed_before and functional.linear.__module__ != shared.__name__:
-        raise RuntimeError(
-            "F.linear is already owned by another stable-linear precision implementation "
-            f"({functional.linear.__module__}); Huanyu cannot share its ContextVar scope. "
-            "Use one precision implementation per worker process and restart the worker"
-        )
+    """Let the Huanyu installer own its scope, including later actor/ref models."""
     shared.install_actor(module)
-    for target in targets:
-        if getattr(target, _LINEAR_SCOPE, False):
+
+
+def _gdn_coverage(language):
+    """Inspect bindings only: no tensor reads, device sync or kernel imports."""
+    counts = dict(total=0, guarded=0, native=0, unguarded_torch=0, unrecognized=0)
+    for layer in language.layers:
+        attention = getattr(layer, "linear_attn", None)
+        if attention is None:
             continue
-        if installed_before:
-            shared._scope_forward(target)
-        setattr(target, _LINEAR_SCOPE, True)
+        counts["total"] += 1
+        kernel = getattr(attention, "chunk_gated_delta_rule", None)
+        source = getattr(kernel, "__module__", "")
+        name = getattr(kernel, "__name__", "")
+        if getattr(kernel, "_huanyu_fp32_guard", False) is True:
+            counts["guarded"] += 1
+        elif source.startswith(("fla.", "flash_linear_attention.")):
+            counts["native"] += 1
+        elif source.startswith("transformers.") and name == "torch_chunk_gated_delta_rule":
+            counts["unguarded_torch"] += 1
+        else:
+            counts["unrecognized"] += 1
+    return counts
 
 
 def install_huanyu_actor_precision(module):
@@ -122,9 +121,18 @@ explicit .float() alone does not stop BF16 autocast on recurrence matmuls.
         # audio helper is deliberately never installed on Huanyu.
         _shared("media_precision").install_actor(module)
 
+    coverage = _gdn_coverage(language)
+    if os.environ.get("HUANYU_PRECISION_PROFILE") == "full" and (
+        not coverage["total"] or coverage["guarded"] != coverage["total"]
+    ):
+        raise RuntimeError(f"Huanyu full precision requires verified HF torch GDN guards on every layer: {coverage}")
     print(
         f"[huanyu-precision] actor padded forward retained; "
-        f"new FP32/autocast-isolated torch GDN kernels={guarded}; "
+        f"GDN coverage total={coverage['total']} guarded={coverage['guarded']} "
+        f"new={guarded} already={coverage['guarded'] - guarded} "
+        f"native={coverage['native']} unguarded_torch={coverage['unguarded_torch']} "
+        f"unrecognized={coverage['unrecognized']}; "
+        "coverage reports bindings only; execution is logged separately; "
         "Huanyu audio forward and gradients unchanged",
         flush=True,
     )

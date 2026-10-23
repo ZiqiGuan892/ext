@@ -103,8 +103,11 @@ class Qwen36HuanyuThinkerAdapter(OmniModelBase):
         from .entropy import install_huanyu_entropy_chunking
         from .forward import install_huanyu_forward
         from .precision import install_huanyu_actor_precision
+        from .precision_policy import report_policy, install_fsdp_pin_audit
 
         validate_huanyu_config(module.config)
+        if report_policy("actor/ref") == "full":
+            install_fsdp_pin_audit()
         if _value(model_config, "use_remove_padding", True):
             raise ValueError("Huanyu initial training integration requires actor_rollout_ref.model.use_remove_padding=false")
         freeze_audio = validate_audio_mode(model_config)

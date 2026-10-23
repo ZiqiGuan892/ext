@@ -300,7 +300,7 @@ class WeightReloadTests(unittest.TestCase):
             self.assertEqual(worker.update_weights_from_ipc(), "original")
         self.assertEqual(receivers, [])
 
-    def test_new_signature_is_delegated_instead_of_discarding_arguments(self):
+    def test_new_signature_fails_instead_of_silently_using_legacy_loading(self):
         extension = extension_class()
 
         def future_update(worker, peft_config=None, new_format="v2"):
@@ -311,13 +311,15 @@ class WeightReloadTests(unittest.TestCase):
         worker = extension()
         with fake_worker_api(extension) as receivers, redirect_stdout(io.StringIO()) as output:
             reload.install_huanyu_weight_reload()
-            self.assertEqual(worker.update_weights_from_ipc(new_format="v3"), "v3")
-            self.assertEqual(worker.update_weights_from_ipc(), "v2")
+            with self.assertRaisesRegex(RuntimeError, "unsupported arguments=.*new_format"):
+                worker.update_weights_from_ipc(new_format="v3")
+            with self.assertRaisesRegex(RuntimeError, "unsupported arguments=.*new_format"):
+                worker.update_weights_from_ipc()
         self.assertEqual(receivers, [])
-        self.assertEqual(worker.delegated, ["v3", "v2"])
-        self.assertEqual(output.getvalue().count("unsupported arguments"), 1)
+        self.assertEqual(worker.delegated, [])
+        self.assertNotIn("completed", output.getvalue())
 
-    def test_nonempty_variadic_kwargs_delegate(self):
+    def test_nonempty_variadic_kwargs_fail_without_receiving(self):
         extension = extension_class()
 
         def future_update(worker, peft_config=None, **kwargs):
@@ -328,8 +330,10 @@ class WeightReloadTests(unittest.TestCase):
         worker = extension()
         with fake_worker_api(extension) as receivers, redirect_stdout(io.StringIO()):
             reload.install_huanyu_weight_reload()
-            self.assertEqual(worker.update_weights_from_ipc(protocol="future"), {"protocol": "future"})
+            with self.assertRaisesRegex(RuntimeError, "unsupported arguments=.*kwargs"):
+                worker.update_weights_from_ipc(protocol="future")
         self.assertEqual(receivers, [])
+        self.assertEqual(worker.delegated, [])
 
     def test_disabled_before_install_imports_nothing_and_can_disable_after(self):
         with patch.dict("os.environ", {reload._ENV_FLAG: "0"}):
@@ -368,6 +372,65 @@ class WeightReloadTests(unittest.TestCase):
         with patch.dict("os.environ", {reload._ENV_FLAG: "maybe"}):
             with self.assertRaisesRegex(ValueError, "must be a boolean"):
                 reload.install_huanyu_weight_reload()
+
+    def test_known_huanyu_worker_without_runner_cannot_silently_delegate(self):
+        extension = extension_class()
+        del extension._get_standard_weight_model_and_config
+        worker = extension()
+        worker.model_runner = None
+        worker.model_config = config()
+        with fake_worker_api(extension) as receivers, redirect_stdout(io.StringIO()):
+            reload.install_huanyu_weight_reload()
+            with self.assertRaisesRegex(RuntimeError, "cannot resolve model_runner"):
+                worker.update_weights_from_ipc()
+        self.assertEqual(receivers, [])
+        self.assertEqual(worker.delegated, [])
+
+    def test_circular_registry_import_defers_only_partially_initialized_base(self):
+        module = ModuleType(reload._EXTENSION_MODULE)
+        module.__spec__ = SimpleNamespace(_initializing=True)
+        with patch.dict(sys.modules, {module.__name__: module}), redirect_stdout(io.StringIO()) as output:
+            with patch.object(reload.importlib, "import_module", side_effect=AssertionError("recursive import")):
+                self.assertFalse(reload.install_huanyu_weight_reload())
+        self.assertIn("deferred: base worker module is initializing", output.getvalue())
+        module.__spec__._initializing = False
+        with patch.dict(sys.modules, {module.__name__: module}), redirect_stdout(io.StringIO()) as output:
+            with self.assertRaises(AttributeError):
+                reload.install_huanyu_weight_reload()
+        self.assertIn("installation failed: AttributeError", output.getvalue())
+
+    def test_explicit_subclass_owns_inherited_wrapper_for_method_copy_factories(self):
+        base = extension_class()
+        with fake_worker_api(base), redirect_stdout(io.StringIO()) as output:
+            reload.install_huanyu_weight_reload()
+
+            class ExplicitExtension(base):
+                pass
+
+            reload.bind_huanyu_weight_reload(ExplicitExtension)
+            method = ExplicitExtension.__dict__["update_weights_from_ipc"]
+            self.assertIs(method, base.update_weights_from_ipc)
+            # Old worker factories copy methods into a concrete class rather
+            # than inheriting from the extension. The actual copied callable
+            # must be the patched one, without waiting for native model init.
+            copied = type("CopiedWorker", (base,), {"update_weights_from_ipc": method})
+            worker = copied()
+            with fake_reload_api(worker.model_runner.model):
+                worker.update_weights_from_ipc()
+                worker.update_weights_from_ipc()
+        self.assertEqual(worker.delegated, [])
+        self.assertIn("bound existing reload wrapper on explicit extension", output.getvalue())
+        self.assertEqual(output.getvalue().count("entered full Huanyu IPC update"), 1)
+        self.assertEqual(output.getvalue().count("weight update completed"), 2)
+        self.assertIn("host=", output.getvalue())
+        self.assertIn("pid=", output.getvalue())
+
+    def test_frozen_audio_zero_updates_are_valid_and_reported(self):
+        model = Model()
+        receiver = SimpleNamespace(receive_weights=lambda on_bucket_received: on_bucket_received({"llm.weight": Tensor(9)}))
+        with patch.dict("os.environ", {"HUANYU_FREEZE_AUDIO": "true"}), fake_reload_api(model), redirect_stdout(io.StringIO()) as output:
+            reload.receive_layerwise_weights(model, config(), receiver)
+        self.assertIn("audio_mode=frozen audio_encoder_tensors=0 audio_projection_tensors=0", output.getvalue())
 
 
 if __name__ == "__main__":

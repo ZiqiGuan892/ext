@@ -9,9 +9,10 @@ from collections.abc import Mapping
 from functools import wraps
 import importlib
 import os
+import socket
 
 
-_UNAVAILABLE_REPORTED = set()
+_REPORTED = set()
 _AUDIO_TYPE = "huanyu_conformer_0_6b"
 
 
@@ -33,10 +34,18 @@ def _shared():
     return importlib.import_module("verl_omni_ext.models.qwen3_6_huanyu.qwen_precision.cache_precision")
 
 
-def _unavailable(stage, error):
-    if stage not in _UNAVAILABLE_REPORTED:
-        _UNAVAILABLE_REPORTED.add(stage)
-        print(f"[huanyu-cache-precision] unavailable stage={stage}: {error}", flush=True)
+def _report_once(event, component, target, **details):
+    # Include PID in the key so a forked child emits its own execution proof.
+    key = (os.getpid(), event, component)
+    if key in _REPORTED:
+        return
+    fields = " ".join(f"{name}={value}" for name, value in details.items())
+    print(
+        f"[huanyu-cache-precision] event={event} component={component} "
+        f"host={socket.gethostname()} pid={os.getpid()} module={target} scope=huanyu {fields}",
+        flush=True,
+    )
+    _REPORTED.add(key)
 
 
 def _install_zero():
@@ -45,14 +54,14 @@ def _install_zero():
     try:
         runner = importlib.import_module("vllm_omni.worker.gpu_model_runner").OmniGPUModelRunner
         original = runner._torch_zero_attention_block_ids
+        if not callable(original):
+            raise AttributeError("native _torch_zero_attention_block_ids must be callable")
     except (ImportError, AttributeError) as error:
-        # Older native checkouts have no zeroing hook. Make the absence visible
-        # without claiming a fix was installed or breaking their default path.
-        _unavailable("logical_zero", error)
-        return False
-    if not callable(original):
-        _unavailable("logical_zero", "native _torch_zero_attention_block_ids is not callable")
-        return False
+        raise RuntimeError(
+            "MINICPMO_HYBRID_BLOCK_ZERO_REFERENCE=1 requests Huanyu logical-to-physical KV zeroing, "
+            "but the selected vLLM-Omni does not expose a callable "
+            "OmniGPUModelRunner._torch_zero_attention_block_ids"
+        ) from error
     if getattr(original, "_huanyu_logical_blocks", False):
         return True
     shared = _shared()
@@ -60,12 +69,26 @@ def _install_zero():
     @wraps(original)
     def zero(self, block_ids):
         if is_huanyu_policy(self):
-            return shared.zero_attention_blocks(self, block_ids)
+            result = shared.zero_attention_blocks(self, block_ids)
+            # This per-call evidence is committed only after every index_fill_
+            # returned successfully. A previous successful call cannot make an
+            # empty/no-cache call look like an execution. No device sync needed.
+            evidence = getattr(self, "_huanyu_zero_execution", None)
+            if evidence:
+                _report_once(
+                    "executed", "logical_zero",
+                    "vllm_omni.worker.gpu_model_runner.OmniGPUModelRunner._torch_zero_attention_block_ids",
+                    **evidence,
+                )
+            return result
         return original(self, block_ids)
 
     zero._huanyu_logical_blocks = True
     runner._torch_zero_attention_block_ids = zero
-    print("[huanyu-cache-precision] installed logical-to-physical KV zeroing; scope=huanyu", flush=True)
+    _report_once(
+        "installed", "logical_zero",
+        "vllm_omni.worker.gpu_model_runner.OmniGPUModelRunner._torch_zero_attention_block_ids",
+    )
     return True
 
 
@@ -97,25 +120,46 @@ def _install_private():
     def budget(self, available):
         if not is_huanyu_policy(self):
             return original_budget(self, available)
+        self.model_runner._q36_private_cache_budget_applied = False
         self.model_runner.supports_standardized_shared_kv_backing = False
-        groups = get_groups(self.vllm_config, self.get_kv_cache_spec())
+        groups = list(get_groups(self.vllm_config, self.get_kv_cache_spec()))
         result = shared.planner_budget(available, groups)
-        self.model_runner._q36_private_cache_budget_applied = True
-        self.model_runner._q36_private_cache_available_bytes = available
-        print(f"[huanyu-cache-precision] physical cache budget: available={available}, planner={result}", flush=True)
+        if groups:
+            self.model_runner._q36_private_cache_budget_applied = True
+            self.model_runner._q36_private_cache_available_bytes = available
+            _report_once(
+                "executed", "private_budget",
+                "vllm_ascend.worker.worker.NPUWorker._scale_kv_cache_memory_for_multi_group",
+                available_bytes=available, planner_bytes=result, groups=len(groups),
+            )
         return result
 
     @wraps(original_allocate)
     def allocate(self, config):
         if is_huanyu_policy(self):
-            return shared.private_buffers(self, config)
+            buffers = shared.private_buffers(self, config)
+            allocated = sum(value.numel() * value.element_size() for value in buffers.values())
+            if allocated:
+                _report_once(
+                    "executed", "private_buffers",
+                    "vllm_ascend.worker.model_runner_v1.NPUModelRunner._allocate_kv_cache_tensors",
+                    layers=len(buffers), blocks=config.num_blocks, allocated_bytes=allocated,
+                )
+            return buffers
         return original_allocate(self, config)
 
     budget._huanyu_private_cache = True
     allocate._huanyu_private_cache = True
     worker._scale_kv_cache_memory_for_multi_group = budget
     runner._allocate_kv_cache_tensors = allocate
-    print("[huanyu-cache-precision] installed private hybrid buffers and matching planner; scope=huanyu", flush=True)
+    _report_once(
+        "installed", "private_budget",
+        "vllm_ascend.worker.worker.NPUWorker._scale_kv_cache_memory_for_multi_group",
+    )
+    _report_once(
+        "installed", "private_buffers",
+        "vllm_ascend.worker.model_runner_v1.NPUModelRunner._allocate_kv_cache_tensors",
+    )
     return True
 
 

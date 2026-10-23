@@ -11,11 +11,45 @@ from types import MethodType
 import torch
 import torch.nn.functional as F
 
-_actor_depth = ContextVar("q36_stable_linear_depth", default=0)
+_actor_depth = ContextVar("huanyu_stable_linear_depth", default=0)
+
+
+_EXECUTED = set()
+
+
+def _status(component, phase, **details):
+    fields = " ".join(f"{key}={value}" for key, value in details.items())
+    print(f"[huanyu-precision] component={component} phase={phase} {fields}".rstrip(), flush=True)
+
+
+def _executed(component, x, output):
+    if component not in _EXECUTED:
+        _EXECUTED.add(component)
+        _status(component, "executed", input_dtype=x.dtype, output_dtype=output.dtype,
+                shape=tuple(x.shape), grad_enabled=torch.is_grad_enabled())
 
 
 def enabled():
-    return os.environ.get("MINICPMO_STABLE_LINEAR", "0") == "1"
+    value = os.environ.get("MINICPMO_STABLE_LINEAR", "0")
+    if value not in ("0", "1"):
+        raise ValueError(f"MINICPMO_STABLE_LINEAR must be 0 or 1, got {value!r}")
+    return value == "1"
+
+
+def _eligible(x, weight):
+    return x.device.type == "npu" and x.dtype == weight.dtype == torch.bfloat16
+
+
+def _require_backend():
+    from vllm_ascend.ops.triton.batch_invariant.matmul import (
+        linear_persistent_kernel, matmul_persistent,
+    )
+    import torch_npu
+    if not callable(matmul_persistent) or not hasattr(linear_persistent_kernel, "__getitem__"):
+        raise RuntimeError("Huanyu stable linear requires the Ascend persistent matmul kernels")
+    for name in ("get_npu_format", "npu_format_cast"):
+        if not callable(getattr(torch_npu, name, None)):
+            raise RuntimeError(f"Huanyu stable linear requires torch_npu.{name}")
 
 
 def persistent_linear(x, weight, bias=None):
@@ -71,39 +105,41 @@ class _Linear(torch.autograd.Function):
 
 
 def install_actor(module=None):
-    if not enabled() or getattr(F.linear, "_q36_stable_linear", False):
+    if not enabled():
+        _status("stable_linear_actor", "disabled")
+        return False
+    lm = getattr(getattr(module, "model", None), "language_model", None)
+    if lm is None or not hasattr(lm, "layers") or not hasattr(module, "lm_head"):
+        raise RuntimeError("Huanyu stable linear requires an explicit actor language model and lm_head")
+    # Validate the real NPU backend before announcing installation. CPU modules
+    # remain supported for wiring tests and do not execute the Ascend kernel.
+    if any(parameter.device.type == "npu" for parameter in lm.parameters()):
+        _require_backend()
+    targets = (lm, *lm.layers, module.lm_head)
+    new_scopes = sum(_scope_forward(target) for target in targets)
+    if getattr(F.linear, "_huanyu_stable_linear", False) is True:
+        _status("stable_linear_actor", "already_installed", new_scopes=new_scopes)
         return False
     original = F.linear
-    scoped = module is not None
-    if scoped:
-        lm = module.model.language_model
-        # Wrap forward itself: checkpoint wrappers can call forward directly,
-        # bypassing Module.__call__ and its forward hooks during recomputation.
-        for target in (lm, *lm.layers, module.lm_head):
-            _scope_forward(target)
 
+    @wraps(original)
     def linear(x, weight, bias=None):
-        if ((not scoped or _actor_depth.get() > 0) and x.device.type == "npu"
-                and x.dtype == weight.dtype == torch.bfloat16):
-            return _Linear.apply(x, weight, bias)
+        if _actor_depth.get() > 0 and _eligible(x, weight):
+            result = _Linear.apply(x, weight, bias)
+            _executed("stable_linear_actor", x, result)
+            return result
         return original(x, weight, bias)
 
-    linear._q36_stable_linear = True
+    linear._huanyu_stable_linear = True
     F.linear = linear
-    print("[q36-precision] actor fixed-tile BF16 language projections enabled", flush=True)
+    _status("stable_linear_actor", "installed", new_scopes=new_scopes)
     return True
-
-
-def _enter_actor():
-    _actor_depth.set(_actor_depth.get() + 1)
-
-
-def _leave_actor():
-    _actor_depth.set(max(0, _actor_depth.get() - 1))
 
 
 def _scope_forward(module):
     original = module.forward
+    if getattr(original, "_huanyu_linear_scope", False) is True:
+        return False
 
     @wraps(getattr(original, "__func__", original))
     def forward(self, *args, **kwargs):
@@ -113,25 +149,47 @@ def _scope_forward(module):
         finally:
             _actor_depth.reset(token)
 
+    forward._huanyu_linear_scope = True
     module.forward = MethodType(forward, module)
+    return True
 
 
-def install_rollout():
+def install_rollout(native):
     if not enabled():
+        _status("stable_linear_rollout", "disabled")
         return False
     from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
 
-    if getattr(AscendUnquantizedLinearMethod.apply, "_q36_stable_linear", False):
+    language = getattr(native, "llm", None)
+    if language is None:
+        language = getattr(getattr(native, "thinker", None), "llm", None)
+    if language is None or not callable(getattr(language, "modules", None)):
+        raise RuntimeError("Huanyu stable linear requires an explicit native language model")
+    layers = [layer for layer in language.modules()
+              if isinstance(getattr(layer, "quant_method", None), AscendUnquantizedLinearMethod)]
+    if not layers:
+        raise RuntimeError("Huanyu stable linear found no Ascend unquantized language projections")
+    if any(getattr(getattr(layer, "weight", None), "device", None).type == "npu" for layer in layers):
+        _require_backend()
+    new_scopes = 0
+    for layer in layers:
+        if getattr(layer, "_huanyu_stable_linear_layer", False) is not True:
+            layer._huanyu_stable_linear_layer = True
+            new_scopes += 1
+    if getattr(AscendUnquantizedLinearMethod.apply, "_huanyu_stable_linear", False) is True:
+        _status("stable_linear_rollout", "already_installed", new_scopes=new_scopes, total=len(layers))
         return False
     original = AscendUnquantizedLinearMethod.apply
 
+    @wraps(original)
     def apply(self, layer, x, bias=None):
-        if ("thinker.llm" in getattr(layer, "prefix", "")
-                and x.dtype == layer.weight.dtype == torch.bfloat16):
-            return persistent_linear(x, layer.weight, bias)
+        if getattr(layer, "_huanyu_stable_linear_layer", False) is True and _eligible(x, layer.weight):
+            result = persistent_linear(x, layer.weight, bias)
+            _executed("stable_linear_rollout", x, result)
+            return result
         return original(self, layer, x, bias)
 
-    apply._q36_stable_linear = True
+    apply._huanyu_stable_linear = True
     AscendUnquantizedLinearMethod.apply = apply
-    print("[q36-precision] rollout fixed-tile BF16 language projections enabled", flush=True)
+    _status("stable_linear_rollout", "installed", new_scopes=new_scopes, total=len(layers))
     return True

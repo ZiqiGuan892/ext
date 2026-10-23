@@ -2,7 +2,9 @@
 
 import importlib.util
 import inspect
+import io
 import os
+from contextlib import redirect_stdout
 from pathlib import Path
 import sys
 from types import ModuleType, SimpleNamespace
@@ -94,6 +96,7 @@ def model():
 
 class PrecisionTests(unittest.TestCase):
     def setUp(self):
+        packed._EXECUTION_REPORTED = False
         self.env = patch.dict(os.environ, {}, clear=True)
         self.env.start()
         self.addCleanup(self.env.stop)
@@ -107,6 +110,63 @@ class PrecisionTests(unittest.TestCase):
         self.shared = patch.object(precision, "_shared", side_effect=shared)
         self.shared.start()
         self.addCleanup(self.shared.stop)
+
+    def test_gdn_reports_binding_coverage_separately_from_successful_execution(self):
+        actor = model()
+        with redirect_stdout(io.StringIO()) as installed:
+            precision.install_huanyu_actor_precision(actor)
+            precision.install_huanyu_actor_precision(actor)
+        self.assertIn("total=1 guarded=1 new=1 already=0", installed.getvalue())
+        self.assertIn("total=1 guarded=1 new=0 already=1", installed.getvalue())
+        self.assertNotIn("training GDN executed", installed.getvalue())
+        kernel = actor.model.language_model.layers[0].linear_attn.chunk_gated_delta_rule
+        self.assertIs(kernel._huanyu_fp32_reference, torch_chunk_gated_delta_rule)
+        query = torch.randn(2, 3, requires_grad=True)
+        key = torch.randn(2, 3)
+        value = torch.zeros(2, 2)
+        with redirect_stdout(io.StringIO()) as executed:
+            with torch.autocast("cpu", dtype=torch.bfloat16):
+                output = kernel(query, key, value, g=None, beta=None)
+                again = kernel(query, key, value, g=None, beta=None)
+            # Another installed actor does not emit a line per layer or model.
+            another = model()
+            precision.install_huanyu_actor_precision(another)
+            other = another.model.language_model.layers[0].linear_attn.chunk_gated_delta_rule
+            other(query, key, value, g=None, beta=None)
+        lines = executed.getvalue()
+        self.assertEqual(lines.count("training GDN executed"), 1)
+        self.assertIn("autocast=false grad_enabled=True", lines)
+        self.assertIn("shape=(2, 3)", lines)
+        self.assertIn("output=(dtype=torch.float32,shape=(2, 2))", lines)
+        torch.testing.assert_close(output, query @ key.T)
+        torch.testing.assert_close(again, output)
+        actual_grad, = torch.autograd.grad(output.square().sum(), query)
+        expected_grad, = torch.autograd.grad((query @ key.T).square().sum(), query)
+        torch.testing.assert_close(actual_grad, expected_grad)
+
+    def test_gdn_failure_cannot_claim_success_and_native_unknown_are_distinguished(self):
+        actor = model()
+        reference = Mock(__name__="torch_chunk_gated_delta_rule",
+                         __module__=torch_chunk_gated_delta_rule.__module__,
+                         side_effect=RuntimeError("reference failed"))
+        actor.model.language_model.layers[0].linear_attn.chunk_gated_delta_rule = reference
+        with redirect_stdout(io.StringIO()) as log:
+            precision.install_huanyu_actor_precision(actor)
+            kernel = actor.model.language_model.layers[0].linear_attn.chunk_gated_delta_rule
+            with self.assertRaisesRegex(RuntimeError, "reference failed"):
+                kernel(torch.ones(2, 3), torch.ones(2, 3), torch.zeros(2, 2), g=None, beta=None)
+        self.assertNotIn("training GDN executed", log.getvalue())
+        self.assertFalse(packed._EXECUTION_REPORTED)
+        native = Layer()
+        native.linear_attn.chunk_gated_delta_rule = Mock(
+            __name__="chunk_gated_delta_rule", __module__="fla.ops.gated_delta_rule")
+        unknown = Layer()
+        unknown.linear_attn.chunk_gated_delta_rule = lambda *a: None
+        actor.model.language_model.layers.extend([native, unknown])
+        with redirect_stdout(io.StringIO()) as coverage:
+            precision.install_huanyu_actor_precision(actor)
+        self.assertIn("total=3 guarded=1 new=0 already=1 native=1", coverage.getvalue())
+        self.assertIn("unrecognized=1", coverage.getvalue())
 
     def test_gdn_default_disables_autocast_and_keeps_audio_gradients(self):
         torch.manual_seed(7)
@@ -133,6 +193,33 @@ class PrecisionTests(unittest.TestCase):
         self.assertEqual(audio_ids, [id(p) for p in actor.model.audio_encoder.parameters()])
         self.assertEqual(actor.model.language_model.layers[0].layer_type, "linear_attention")
         self.assertEqual(self.imports, ["packed", "media_precision"])
+
+    def test_full_profile_requires_verified_guard_on_every_gdn_layer(self):
+        for kind in ("unknown", "native", "none", "disabled"):
+            with self.subTest(kind=kind), patch.dict(os.environ, {"HUANYU_PRECISION_PROFILE": "full"}):
+                actor = model()
+                attention = actor.model.language_model.layers[0].linear_attn
+                if kind == "unknown":
+                    attention.chunk_gated_delta_rule = lambda *args: None
+                elif kind == "native":
+                    attention.chunk_gated_delta_rule = Mock(
+                        __name__="chunk_gated_delta_rule", __module__="fla.ops.gated_delta_rule")
+                elif kind == "none":
+                    actor.model.language_model.layers[0].linear_attn = None
+                else:
+                    os.environ["MINICPMO_HUANYU_GDN_FP32_TRAINING"] = "0"
+                with redirect_stdout(io.StringIO()) as log:
+                    with self.assertRaisesRegex(RuntimeError, "requires verified HF torch GDN guards on every layer"):
+                        precision.install_huanyu_actor_precision(actor)
+                self.assertNotIn("actor padded forward retained", log.getvalue())
+                self.assertNotIn("training GDN executed", log.getvalue())
+        with patch.dict(os.environ, {"HUANYU_PRECISION_PROFILE": "full"}), redirect_stdout(io.StringIO()) as log:
+            actor = model()
+            self.assertIs(precision.install_huanyu_actor_precision(actor), actor)
+            precision.install_huanyu_actor_precision(actor)
+        self.assertIn("total=1 guarded=1", log.getvalue())
+        self.assertIn("new=0 already=1", log.getvalue())
+        self.assertNotIn("training GDN executed", log.getvalue())
 
     def test_guard_is_idempotent_and_does_not_override_native_fla(self):
         actor = model()
@@ -340,17 +427,30 @@ class PrecisionTests(unittest.TestCase):
                     precision.install_huanyu_actor_precision(model())
         self.assertEqual(self.imports, [])
 
-    def test_foreign_stable_linear_cannot_silently_use_the_wrong_scope(self):
+    def test_foreign_stable_linear_gets_independent_huanyu_scope(self):
+        original = F.linear
+        calls = []
+
         def foreign_linear(*args, **kwargs):
-            raise AssertionError("must reject before executing the foreign linear")
+            calls.append("foreign")
+            return original(*args, **kwargs)
 
         foreign_linear._q36_stable_linear = True
         foreign_linear.__module__ = "whisper.linear_precision"
+        actor = model()
         with patch.object(F, "linear", foreign_linear), patch.dict(os.environ, {
             "MINICPMO_STABLE_LINEAR": "1",
         }):
-            with self.assertRaisesRegex(RuntimeError, "another stable-linear precision implementation"):
-                precision.install_huanyu_actor_precision(model())
+            precision.install_huanyu_actor_precision(actor)
+            self.assertTrue(F.linear._huanyu_stable_linear)
+            self.assertIs(F.linear.__wrapped__, foreign_linear)
+            self.assertTrue(actor.model.language_model.forward._huanyu_linear_scope)
+            # CPU/outside-Huanyu calls retain the previous implementation.
+            F.linear(torch.ones(1, 3), torch.ones(3, 3))
+            self.assertEqual(calls, ["foreign"])
+            wrapper = F.linear
+            precision.install_huanyu_actor_precision(actor)
+            self.assertIs(F.linear, wrapper)
 
     def test_scope_resets_after_forward_exception(self):
         actor = model()

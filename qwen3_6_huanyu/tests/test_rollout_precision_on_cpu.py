@@ -54,6 +54,9 @@ class RolloutPrecisionTests(unittest.TestCase):
         shared_patch = patch.object(precision, "_shared", side_effect=shared)
         shared_patch.start()
         self.addCleanup(shared_patch.stop)
+        audio_patch = patch.object(precision, "_install_audio", return_value=True)
+        self.audio_installer = audio_patch.start()
+        self.addCleanup(audio_patch.stop)
 
     def tensors(self):
         generator = torch.Generator().manual_seed(71)
@@ -149,7 +152,7 @@ class RolloutPrecisionTests(unittest.TestCase):
         self.assertTrue(self.ops.npu_recurrent_gated_delta_rule._huanyu_fp32_state)
         self.assertTrue(self.ops.npu_recurrent_gated_delta_rule._is_bf16_patched)
 
-    def test_each_image_is_isolated_without_wrapping_audio(self):
+    def test_each_image_is_isolated_and_audio_installer_gets_native_model(self):
         calls = []
 
         class Thinker:
@@ -176,6 +179,7 @@ class RolloutPrecisionTests(unittest.TestCase):
         self.assertEqual(calls, [(4, 2), (2, 2)])
         self.assertEqual(len(outputs), 2)
         self.assertIs(native.thinker.get_audio_hidden_states.__func__, audio)
+        self.audio_installer.assert_called_once_with(native)
 
     def test_optout_missing_operator_and_bad_cache_mode(self):
         with patch.dict(os.environ, {"MINICPMO_GDN_FP32_REFERENCE": "0"}):

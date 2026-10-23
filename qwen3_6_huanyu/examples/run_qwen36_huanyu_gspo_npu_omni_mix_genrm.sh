@@ -21,12 +21,12 @@
 # =============================================================================
 
 set -eo pipefail
-export PROJECT_ROOT="${PROJECT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+export PROJECT_ROOT="${PROJECT_ROOT:-/opt/huawei/dataset/hfy-model-gy/verl_omni_qwen36_gzq_new}"
 _HERE="${PROJECT_ROOT}/examples/qwen3_6_huanyu"
 
 # ---- GenRM 配置 ----
 export RM_ENABLE=1
-export RM_MODEL_PATH=${RM_MODEL_PATH:-"/opt/huawei/dataset/downloaded_models/Qwen3.5-35B-A3B"}
+export RM_MODEL_PATH=${RM_MODEL_PATH:-"/opt/huawei/dataset/hfy-model-gy/downloaded_models/Qwen3.5-35B-A3B"}
 
 
 # Resource sizes come from the upper entry. This layer only composes GenRM
@@ -48,11 +48,11 @@ export RM_PROMPT_LENGTH=${RM_PROMPT_LENGTH:-$((RM_MAX_MODEL_LEN - RM_RESPONSE_LE
 export RM_NUM_REWARD_WORKERS=${RM_NUM_REWARD_WORKERS:-8}
 
 # ---- OmniMix 数据集路径 ----
-export TRAIN_FILE=${TRAIN_FILE:-"/opt/huawei/dataset/ccb_data/data/omni/omni_mix_f8_genrm_sampleall/train.parquet"}
-export VAL_FILE=${VAL_FILE:-"/opt/huawei/dataset/ccb_data/data/omni/omni_mix_f8_genrm_sampleall/validation.parquet"}
+export TRAIN_FILE=${TRAIN_FILE:-"/opt/huawei/dataset/infra_data/data/train.parquet"}
+export VAL_FILE=${VAL_FILE:-"/opt/huawei/dataset/infra_data/data/validation.parquet"}
 
 # ---- 模型路径：Qwen3.6-35B-A3B-huanyu06b-iter2000-omni4b-hf-huanyu7tokens ----
-export MODEL_PATH=${MODEL_PATH:-"/opt/huawei/dataset/downloaded_models/Qwen3.6-35B-A3B-huanyu06b-iter2000-omni4b-hf-huanyu7tokens"}
+export MODEL_PATH=${MODEL_PATH:-"/opt/huawei/dataset/hfy-model-gy/downloaded_models/Qwen3.6-35B-A3B-huanyu06b-iter2000-omni4b-hf-huanyu7tokens"}
 
 # ---- 预计算缓存：本模型默认**不走** ----
 # 2026-10-14：原来这里默认指向 embed_cache_qwen36_sampleall_empty —— 一个**不存在**
@@ -116,8 +116,8 @@ if [ "${DEBUG_MODE}" = "1" ]; then
     # 用法: DEBUG_SAMPLES=4 DEBUG_MODE=1 bash ..._omni_mix_genrm.sh
     export DEBUG_SAMPLES=${DEBUG_SAMPLES:-0}
     if [ "${DEBUG_SAMPLES}" -gt 0 ] 2>/dev/null; then
-        _MINI_DIR="/opt/huawei/dataset/ccb_data/data/omni/mini_debug"
-        mkdir -p "${_MINI_DIR}"
+        mkdir -p "${PROJECT_ROOT}/runs"
+        _MINI_DIR="$(mktemp -d "${PROJECT_ROOT}/runs/huanyu_debug_data.XXXXXX")"
         _MINI_TRAIN="${_MINI_DIR}/mini_train_${DEBUG_SAMPLES}.parquet"
         _MINI_VAL="${_MINI_DIR}/mini_val_${DEBUG_SAMPLES}.parquet"
         python3 -c "

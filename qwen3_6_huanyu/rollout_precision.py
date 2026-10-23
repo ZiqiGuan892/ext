@@ -34,9 +34,16 @@ def _shared(name):
     return import_module(_SHARED + name)
 
 
+def _install_audio(native):
+    from .audio_rollout import install_audio_isolation
+
+    return install_audio_isolation(native)
+
+
 def install_recurrent_fp32():
     """Keep FP32 cache values, updating only the slots scheduled this step."""
     if os.environ.get("MINICPMO_GDN_FP32_REFERENCE", "1") != "1":
+        print("[huanyu-precision] component=gdn_decode phase=disabled", flush=True)
         return False
     ops = torch.ops._C_ascend
     if not hasattr(ops, "npu_recurrent_gated_delta_rule"):
@@ -59,11 +66,13 @@ def install_recurrent_fp32():
                 "text_config.mamba_ssm_dtype / mamba_ssm_cache_dtype. "
                 "Set MINICPMO_GDN_FP32_REFERENCE=0 only for an explicit legacy comparison."
             )
+        with torch.autocast(device_type=state.device.type, enabled=False):
+            result = reference(*args, **kwargs)
         if not reported:
             reported = True
-            print("[huanyu-precision] GDN decode executing FP32; only scheduled cache slots updated", flush=True)
-        with torch.autocast(device_type=state.device.type, enabled=False):
-            return reference(*args, **kwargs)
+            print("[huanyu-precision] component=gdn_decode phase=executed "
+                  "GDN decode executing FP32; only scheduled cache slots updated", flush=True)
+        return result
 
     recurrent._huanyu_fp32_state = True
     # The inherited Whisper initializer retries its legacy BF16 wrapper. Mark
@@ -78,6 +87,7 @@ def install_recurrent_fp32():
     packet = getattr(raw, "_overloadpacket", None) if raw is not None else None
     if packet is not None and packet is not raw:
         packet.default = recurrent
+    print("[huanyu-precision] component=gdn_decode phase=installed scope=huanyu cache_dtype=float32", flush=True)
     return True
 
 
@@ -106,13 +116,20 @@ def _isolate_vision(native):
     if original is None or getattr(original, "_huanyu_isolated_vision", False):
         return False
     split = _shared("media_precision").split_vision_inputs
+    reported = False
 
     @wraps(original)
     def vision(self, pixels, grids):
+        nonlocal reported
         if getattr(self, "visual", None) is None:
             return original(pixels, grids)
-        return tuple(item for one_pixels, one_grid in split(pixels, grids)
-                     for item in original(one_pixels, one_grid))
+        result = tuple(item for one_pixels, one_grid in split(pixels, grids)
+                       for item in original(one_pixels, one_grid))
+        if result and not reported:
+            reported = True
+            print(f"[huanyu-precision] component=vision_rollout phase=executed "
+                  f"pid={os.getpid()} items={len(result)} per_item_shape=True", flush=True)
+        return result
 
     vision._huanyu_isolated_vision = True
     thinker._q36_encode_vision = MethodType(vision, thinker)
@@ -135,17 +152,19 @@ def configure_huanyu_rollout(native, vllm_config):
     if os.environ.get("MINICPMO_GDN_FP32_REFERENCE", "1") == "1" and not fp32:
         raise RuntimeError("Huanyu GDN precision hook unavailable after native init: Ascend recurrent op was not loaded")
     gdn = _shared("gdn_precision")
-    gdn.install_reference_prefill()  # Optional prefill/gate/conv references keep their opt-in flags.
+    gdn.install_reference_prefill(native)
     gdn.install_mixed_cache_barrier(native)
     # These installers already restrict edits to the selected language model;
     # they are deliberately opt-in, just as in the Whisper implementation.
     _shared("norm_precision").install_rollout(native)
     _shared("text_rope_precision").install_rollout(native)
     _shared("router_precision").install_rollout(native)
-    _shared("linear_precision").install_rollout()
+    _shared("linear_precision").install_rollout(native)
     vision = _isolate_vision(native)
+    audio = _install_audio(native)
     native._huanyu_precision_configured = True
-    print(f"[huanyu-precision] rollout installed: gdn_fp32={fp32} isolated_vision={vision}; native Huanyu audio retained", flush=True)
+    print(f"[huanyu-precision] rollout installed: gdn_fp32={fp32} isolated_vision={vision} "
+          f"isolated_audio={audio}; native Huanyu audio retained", flush=True)
     return True
 
 

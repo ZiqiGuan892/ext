@@ -29,8 +29,8 @@
 
 set -euo pipefail
 
-# 定位 repo 根：本脚本在 examples/qwen3_6_huanyu/ 下。
-export PROJECT_ROOT="${PROJECT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+# 支持从任意目录启动；依赖脚本统一从 PROJECT_ROOT 读取。
+export PROJECT_ROOT="${PROJECT_ROOT:-/opt/huawei/dataset/hfy-model-gy/verl_omni_qwen36_gzq_new}"
 _REPO_ROOT="${PROJECT_ROOT}"
 cd "$_REPO_ROOT"
 
@@ -57,8 +57,8 @@ echo "[huanyu config] vLLM-Omni Python root: ${_huanyu_vllm_omni_root}; FILTER_O
 unset _huanyu_vllm_omni_root _huanyu_retained_pythonpath _huanyu_python_entries _huanyu_path
 
 # ---------------------------------------------------------------- 1) 模型
-# 显式指定 Huanyu，避免继承 shell 中残留的 Whisper MODEL_PATH。
-export MODEL_PATH=/opt/huawei/dataset/downloaded_models/Qwen3.6-35B-A3B-huanyu06b-iter2000-omni4b-hf-huanyu7tokens
+# 默认选择 Huanyu，保留调用方显式传入的 checkpoint。
+export MODEL_PATH="${MODEL_PATH:-/opt/huawei/dataset/hfy-model-gy/downloaded_models/Qwen3.6-35B-A3B-huanyu06b-iter2000-omni4b-hf-huanyu7tokens}"
 
 # ---------------------------------------------------------------- 2) 尺寸口径
 # Direct-entry defaults only. An upper job/profile can supply every value;

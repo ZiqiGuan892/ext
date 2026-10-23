@@ -12,6 +12,8 @@ from functools import wraps
 import importlib
 import inspect
 import os
+import socket
+import sys
 
 
 _EXTENSION_MODULE = "verl_omni.workers.rollout.vllm_rollout.utils"
@@ -21,6 +23,17 @@ _PATCH_MARKER = "_huanyu_layerwise_reload_patch"
 _ENV_FLAG = "MINICPMO_HUANYU_LAYERWISE_RELOAD"
 _KNOWN_ARGUMENTS = {"peft_config", "base_sync_done", "use_shm", "zmq_update_id"}
 _REPORTED_FALLBACKS = set()
+
+
+def _log(message, worker=None):
+    rank = getattr(worker, "local_rank", os.environ.get("LOCAL_RANK", "-"))
+    print(f"[huanyu-reload] host={socket.gethostname()} pid={os.getpid()} rank={rank} {message}", flush=True)
+
+
+def _report_once(reason, worker=None):
+    if reason not in _REPORTED_FALLBACKS:
+        _REPORTED_FALLBACKS.add(reason)
+        _log(reason, worker)
 
 
 def _value(obj, name, default=None):
@@ -93,7 +106,7 @@ def _load_audio_weights(model, weights):
     return remaining, count
 
 
-def receive_layerwise_weights(model, model_config, receiver):
+def receive_layerwise_weights(model, model_config, receiver, *, worker=None):
     """Receive one complete update; finalize once after all buckets succeeded."""
     try:
         reload_api = importlib.import_module(_RELOAD_MODULE)
@@ -106,16 +119,18 @@ def receive_layerwise_weights(model, model_config, receiver):
         ) from exc
 
     initialize(model)
-    audio_count, bucket_count = 0, 0
+    audio_count, bucket_count, encoder_count, projector_count = 0, 0, 0, 0
 
     def load_bucket(weights, is_last=None):
-        nonlocal audio_count, bucket_count
+        nonlocal audio_count, bucket_count, encoder_count, projector_count
         # Both callback(weights) and callback(weights, is_last) are used by verl
         # versions. Completion is receiver return, never a per-bucket finalize.
         items = weights.items() if isinstance(weights, Mapping) else weights
         # Deferred loaders may retain tensors until a later bucket completes a
         # layer. The IPC buffer is reused immediately after the callback's ACK.
         owned = [(name, value.clone()) for name, value in items]
+        encoder_count += sum(name.startswith(("model.audio_encoder.", "apm.")) for name, _ in owned)
+        projector_count += sum(name.startswith(("model.audio_projection.", "audio_projection_layer.")) for name, _ in owned)
         remaining, count = _load_audio_weights(model, owned)
         audio_count += count
         bucket_count += 1
@@ -129,11 +144,13 @@ def receive_layerwise_weights(model, model_config, receiver):
     meta = [name for name, value in model.named_parameters() if value.is_meta]
     if meta:
         raise RuntimeError(f"Huanyu layerwise reload left meta parameters: {meta[:8]}")
-    print(
-        f"[huanyu-reload] layerwise IPC weight update completed; "
-        f"buckets={bucket_count} audio_tensors={audio_count} meta_parameters=0",
-        flush=True,
+    freeze = os.environ.get("HUANYU_FREEZE_AUDIO", "unspecified").lower()
+    audio_mode = "frozen" if freeze in {"1", "true", "yes", "on"} else (
+        "trainable" if freeze in {"0", "false", "no", "off"} else "unspecified"
     )
+    _log(f"layerwise IPC weight update completed; buckets={bucket_count} "
+         f"audio_tensors={audio_count} meta_parameters=0 audio_mode={audio_mode} "
+         f"audio_encoder_tensors={encoder_count} audio_projection_tensors={projector_count}", worker)
 
 
 def _arguments(signature, worker, args, kwargs):
@@ -151,48 +168,54 @@ def _arguments(signature, worker, args, kwargs):
         elif name in _KNOWN_ARGUMENTS:
             values[name] = value
         else:
-            # Future defaults can alter the transfer contract too. Delegate to
-            # their implementation rather than silently discarding them.
+            # Future defaults can alter the transfer contract too. Full Huanyu
+            # updates must reject these rather than fall back to unsafe loading.
             unknown.append(name)
     return values, unknown
 
 
-def install_huanyu_weight_reload():
-    """Install a process-local, Huanyu-only extension wrapper, idempotently.
+def bind_huanyu_weight_reload(extension):
+    """Bind directly on the selected worker extension, before vLLM consumes it.
 
-    Dependencies are never edited on disk. Import the reload API only when a
-    Huanyu full update occurs, so training-only and RM imports remain unaffected.
-    Returns False when explicitly disabled, True when installed/already present.
+    Keeping the method in this class's own namespace supports both native
+    workers that copy extension methods and workers that add it to their MRO.
+    The subclass retains the base extension's __new__ and other lifecycle APIs.
     """
-    if not _enabled():
-        return False
-    extension = importlib.import_module(_EXTENSION_MODULE).vLLMOmniColocateWorkerExtension
     original = extension.update_weights_from_ipc
     if getattr(original, _PATCH_MARKER, False):
+        inherited = "update_weights_from_ipc" not in extension.__dict__
+        extension.update_weights_from_ipc = original
+        if inherited:
+            _log(f"bound existing reload wrapper on explicit extension={extension.__module__}.{extension.__name__}")
         return True
     signature = inspect.signature(original)
 
     @wraps(original)
     def huanyu_update_weights(worker, *args, **kwargs):
         if not _enabled():
+            _report_once(f"delegated to original IPC handler: {_ENV_FLAG}=0", worker)
             return original(worker, *args, **kwargs)
         standard = _standard_model_and_config(worker)
+        if standard is None:
+            config = getattr(worker, "model_config", None)
+            if config is None:
+                config = _value(getattr(worker, "vllm_config", None), "model_config")
+            if _is_huanyu(None, config):
+                raise RuntimeError("Huanyu IPC reload cannot resolve model_runner model/config; refusing legacy loading")
         if standard is None or not _is_huanyu(*standard):
+            _report_once("delegated to original IPC handler: model is not a Huanyu AR model", worker)
             return original(worker, *args, **kwargs)
         values, unknown = _arguments(signature, worker, args, kwargs)
-        if unknown:
-            reason = tuple(unknown)
-            if reason not in _REPORTED_FALLBACKS:
-                _REPORTED_FALLBACKS.add(reason)
-                print(
-                    f"[huanyu-reload] delegated to original IPC handler: "
-                    f"unsupported arguments={unknown}", flush=True,
-                )
-            return original(worker, *args, **kwargs)
         if values.get("peft_config") is not None or getattr(worker, "_pending_lora_peft_config", None) is not None:
             # Original code owns pending-LoRA consumption/base_sync_done and
             # adapter IDs. Do not clear the stash or receive any buckets here.
+            _report_once("delegated to original IPC handler: LoRA update", worker)
             return original(worker, *args, **kwargs)
+        if unknown:
+            raise RuntimeError(
+                f"Huanyu layerwise IPC reload cannot safely handle unsupported arguments={unknown}; "
+                f"worker extension signature={signature}. Refusing the legacy full-weight load path."
+            )
         if getattr(worker, "device", None) is None:
             raise RuntimeError("Huanyu IPC reload requires an initialized worker device")
         handle = worker._get_zmq_handle()
@@ -204,9 +227,40 @@ def install_huanyu_weight_reload():
         receiver = receiver_class(
             zmq_handle=handle, device=worker.device, use_shm=values.get("use_shm", False),
         )
-        return receive_layerwise_weights(*standard, receiver)
+        _report_once(
+            f"entered full Huanyu IPC update; worker={type(worker).__module__}.{type(worker).__name__}", worker,
+        )
+        return receive_layerwise_weights(*standard, receiver, worker=worker)
 
     setattr(huanyu_update_weights, _PATCH_MARKER, True)
     extension.update_weights_from_ipc = huanyu_update_weights
-    print("[huanyu-reload] installed Huanyu-only layerwise IPC reload", flush=True)
+    _log(f"installed Huanyu-only layerwise IPC reload; extension={extension.__module__}.{extension.__name__} "
+         f"enabled={int(_enabled())}")
     return True
+
+
+def install_huanyu_weight_reload():
+    """Compatibility installer for external engine imports.
+
+    The registry can import engine_hooks while utils is still defining the
+    original worker extension. Do not recursively request its not-yet-defined
+    class: GP-004 catches that error and silently skips this last installer.
+    Huanyu's stage config names worker_extension.HuanyuColocateWorkerExtension;
+    importing that explicit class after utils completes is the mandatory bind.
+    """
+    if not _enabled():
+        _report_once(f"disabled by {_ENV_FLAG}=0")
+        return False
+    pending = sys.modules.get(_EXTENSION_MODULE)
+    if pending is not None and getattr(getattr(pending, "__spec__", None), "_initializing", False):
+        if not hasattr(pending, "vLLMOmniColocateWorkerExtension"):
+            _report_once("deferred: base worker module is initializing; explicit Huanyu worker extension will bind")
+            return False
+    try:
+        extension = importlib.import_module(_EXTENSION_MODULE).vLLMOmniColocateWorkerExtension
+        return bind_huanyu_weight_reload(extension)
+    except Exception as error:
+        # The native registry catches exceptions. Emit direct evidence before
+        # propagating, and let the explicit worker extension fail startup too.
+        _log(f"installation failed: {type(error).__name__}: {error}")
+        raise

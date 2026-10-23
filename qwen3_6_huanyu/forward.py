@@ -9,6 +9,7 @@ keeps its image/video masks and mRoPE construction intact.
 from contextvars import ContextVar
 from functools import wraps
 from numbers import Integral
+import os
 from types import MethodType
 
 import torch
@@ -167,6 +168,18 @@ def install_huanyu_forward(module, *, start_token_id, end_token_id, placeholder_
         raise ValueError("Huanyu precompute requires image token ID and spatial merge size")
     if use_precompute and require_audio_only:
         raise ValueError("Trainable Huanyu audio requires online encoding, not cached embeddings")
+    reported_audio_modes = set()
+
+    def report_audio(chunks, mode):
+        # Report only after HF consumed the injected embeddings successfully.
+        # Tensor metadata adds no norm reduction or device synchronization.
+        if not chunks or mode in reported_audio_modes:
+            return
+        reported_audio_modes.add(mode)
+        print(f"[huanyu-audio] component=embedding_injection phase=executed pid={os.getpid()} "
+              f"mode={mode} chunks={len(chunks)} audio_tokens={sum(x.shape[0] for x in chunks)} "
+              f"dtype={chunks[0].dtype} audio_requires_grad={any(x.requires_grad for x in chunks)} "
+              f"grad_enabled={torch.is_grad_enabled()} alignment=verified", flush=True)
 
     def inject_audio(embedding_module, args, output):
         active = _ACTIVE_AUDIO.get()
@@ -239,6 +252,7 @@ def install_huanyu_forward(module, *, start_token_id, end_token_id, placeholder_
                 output = original_forward(*args, **kwargs)
                 if active["calls"] != 1:
                     raise RuntimeError("HF forward did not consume Huanyu cached embeddings")
+                report_audio(_feature_chunks(cached_audio), "cached_frozen")
                 return output
             finally:
                 _ACTIVE_AUDIO.reset(token)
@@ -286,10 +300,13 @@ def install_huanyu_forward(module, *, start_token_id, end_token_id, placeholder_
             output = original_forward(*args, **kwargs)
             if active["calls"] != 1:
                 raise RuntimeError("HF forward did not consume Huanyu audio through the input embedding module")
+            report_audio(chunks, "online_trainable" if require_audio_only else "online_frozen")
             return output
         finally:
             _ACTIVE_AUDIO.reset(token)
 
     module.forward = MethodType(forward, module)
     setattr(module, _FLAG, True)
+    print(f"[huanyu-audio] component=embedding_injection phase=installed pid={os.getpid()} "
+          f"cache={use_precompute} trainable={require_audio_only} forward=padded", flush=True)
     return module

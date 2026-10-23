@@ -13,6 +13,14 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 EXAMPLES = ROOT / "examples"
 LAUNCHER = EXAMPLES / "run_huanyu_32card_job.sh"
+DEFAULT_PROJECT_ROOT = "/opt/huawei/dataset/hfy-model-gy/verl_omni_qwen36_gzq_new"
+DEFAULT_MODEL_PATH = (
+    "/opt/huawei/dataset/hfy-model-gy/downloaded_models/"
+    "Qwen3.6-35B-A3B-huanyu06b-iter2000-omni4b-hf-huanyu7tokens"
+)
+DEFAULT_RM_MODEL_PATH = "/opt/huawei/dataset/hfy-model-gy/downloaded_models/Qwen3.5-35B-A3B"
+DEFAULT_TRAIN_FILE = "/opt/huawei/dataset/infra_data/data/train.parquet"
+DEFAULT_VAL_FILE = "/opt/huawei/dataset/infra_data/data/validation.parquet"
 
 
 def find_bash():
@@ -35,6 +43,7 @@ import sys
 
 def record(kind, args, **extra):
     precision_names = (
+        "HUANYU_PRECISION_PROFILE", "MINICPMO_FSDP2_PIN_MEMORY",
         "MINICPMO_HUANYU_GDN_FP32_TRAINING", "MINICPMO_GDN_FP32_REFERENCE",
         "MINICPMO_HUANYU_LAYERWISE_RELOAD", "MINICPMO_HYBRID_BLOCK_ZERO_REFERENCE",
         "MINICPMO_ISOLATE_MEDIA_ENCODERS", "MINICPMO_STABLE_LINEAR",
@@ -42,6 +51,8 @@ def record(kind, args, **extra):
         "MINICPMO_ROW_TP_REFERENCE", "MINICPMO_HUANYU_ROLLOUT_TP",
         "VLLM_OMNI_EXTERNAL_MODULES", "HUANYU_USE_PRECOMPUTE",
         "HCCL_OP_EXPANSION_MODE", "HCCL_DETERMINISTIC",
+        "MINICPMO_GDN_CACHE_BARRIER", "MINICPMO_GDN_L2NORM_REFERENCE",
+        "MINICPMO_GDN_CONV_REFERENCE", "MINICPMO_GDN_GATING_REFERENCE", "MINICPMO_PRIVATE_HYBRID_CACHE",
     )
     item = dict(kind=kind, args=args, preload=os.environ.get("LD_PRELOAD"),
                 precision={key: os.environ.get(key) for key in precision_names}, **extra)
@@ -104,6 +115,7 @@ keys = (
     "HUANYU_AQA_AUDIO_TRAIN", "MINICPMO_USE_PRECOMPUTE", "MINICPMO_TUNE_AUDIO",
     "MINICPMO_TUNE_VISION", "WANDB_MODE", "HUANYU_TEST_ENV_SOURCED",
     "NNODES", "NUM_NPUS", "REWARD_POOL_NPUS", "RM_ENABLE", "RAY_ADDRESS", "LD_PRELOAD",
+    "PROJECT_ROOT", "MODEL_PATH", "RM_MODEL_PATH", "TRAIN_FILE", "VAL_FILE",
 )
 Path(os.environ["HUANYU_TEST_CAPTURE"]).write_text(
     json.dumps(dict(argv=sys.argv[1:], env={key: os.environ.get(key) for key in keys})),
@@ -174,6 +186,7 @@ if command not in ("ray", "git", "pip", "flock", "env-source"):
             )) or key in {
                 "PYTHON", "PROJECT_ROOT", "EXPERIMENT_NAME", "WANDB_MODE",
                 "NNODES", "NUM_NPUS", "REWARD_POOL_NPUS", "TMPDIR", "LD_PRELOAD",
+                "MODEL_PATH", "TRAIN_FILE", "VAL_FILE",
             }:
                 self.env.pop(key)
         self.env.update(
@@ -204,6 +217,10 @@ if command not in ("ray", "git", "pip", "flock", "env-source"):
         self.env["MSYS2_ARG_CONV_EXCL"] = (
             argument_exclusions + (";" if argument_exclusions else "")
             + "++ray_kwargs.ray_init.runtime_env.env_vars.LD_PRELOAD="
+            # These are Linux server paths carried inside Hydra overrides,
+            # not native Windows Python filenames to translate into Git/opt.
+            + ";actor_rollout_ref.model.path=;reward.reward_model.model_path="
+            + ";data.train_files=;data.val_files="
         )
 
     def write_executable(self, name, source):
@@ -229,14 +246,14 @@ if command not in ("ray", "git", "pip", "flock", "env-source"):
             # argv tests without loading a real allocator into the test process.
             path.write_bytes(b"not an ELF shared library\n")
 
-    def run_launcher(self, updates=None, arguments=()):
+    def run_launcher(self, updates=None, arguments=(), *, trace=False):
         env = dict(self.env)
         for key, value in (updates or {}).items():
             if value is None:
                 env.pop(key, None)
             else:
                 env[key] = value
-        command = [find_bash(), shell_path(self.entry), *arguments]
+        command = [find_bash(), *(["-x"] if trace else []), shell_path(self.entry), *arguments]
         if os.name == "nt" and "LD_PRELOAD" in env:
             # MSYS cannot preload a Linux-style mixed/duplicate list while
             # forking the path-discovery subshells. Keep it as a shell variable
@@ -244,7 +261,7 @@ if command not in ("ray", "git", "pip", "flock", "env-source"):
             # retain the inherited environment; all recorded child processes
             # below still receive the launcher's actual exported LD_PRELOAD.
             env["HUANYU_TEST_INITIAL_PRELOAD"] = env.pop("LD_PRELOAD")
-            command = [find_bash(), "-c", 'LD_PRELOAD="$HUANYU_TEST_INITIAL_PRELOAD"; export -n LD_PRELOAD; source "$@"',
+            command = [find_bash(), *(["-x"] if trace else []), "-c", 'LD_PRELOAD="$HUANYU_TEST_INITIAL_PRELOAD"; export -n LD_PRELOAD; source "$@"',
                        "huanyu-fixture", shell_path(self.entry), *arguments]
         return subprocess.run(
             command,
@@ -268,13 +285,16 @@ if command not in ("ray", "git", "pip", "flock", "env-source"):
             "MINICPMO_HUANYU_GDN_FP32_TRAINING", "MINICPMO_GDN_FP32_REFERENCE",
             "MINICPMO_HUANYU_LAYERWISE_RELOAD", "MINICPMO_HYBRID_BLOCK_ZERO_REFERENCE",
             "MINICPMO_ISOLATE_MEDIA_ENCODERS",
+            "MINICPMO_STABLE_LINEAR", "MINICPMO_GDN_PREFILL_REFERENCE",
+            "MINICPMO_GDN_CACHE_BARRIER", "MINICPMO_GDN_L2NORM_REFERENCE",
+            "MINICPMO_GDN_CONV_REFERENCE", "MINICPMO_GDN_GATING_REFERENCE", "MINICPMO_PRIVATE_HYBRID_CACHE",
         ):
             self.assertEqual(event["precision"][key], "1", event)
         for key in (
-            "MINICPMO_STABLE_LINEAR", "MINICPMO_GDN_PREFILL_REFERENCE",
-            "MINICPMO_MOE_TP_REFERENCE", "MINICPMO_ROW_TP_REFERENCE",
+            "MINICPMO_MOE_TP_REFERENCE", "MINICPMO_ROW_TP_REFERENCE", "MINICPMO_FSDP2_PIN_MEMORY",
         ):
             self.assertEqual(event["precision"][key], "0", event)
+        self.assertEqual(event["precision"]["HUANYU_PRECISION_PROFILE"], "full", event)
         self.assertEqual(event["precision"]["VLLM_OMNI_EXTERNAL_MODULES"],
                          "verl_omni_ext.models.qwen3_6_huanyu.engine_hooks", event)
         self.assertEqual(event["precision"]["MINICPMO_HUANYU_ROLLOUT_TP"], "4", event)
@@ -334,10 +354,12 @@ if command not in ("ray", "git", "pip", "flock", "env-source"):
             encoding="utf-8",
         )
         result = self.run_launcher({
+            "HUANYU_PRECISION_PROFILE": "custom",
             "MINICPMO_GDN_FP32_REFERENCE": "0", "MINICPMO_STABLE_LINEAR": "1",
         })
         self.assert_success(result)
         expected = {
+            "HUANYU_PRECISION_PROFILE": "custom",
             "MINICPMO_GDN_FP32_REFERENCE": "0",
             "MINICPMO_HUANYU_GDN_FP32_TRAINING": "1",
             "MINICPMO_HUANYU_LAYERWISE_RELOAD": "1",
@@ -377,7 +399,7 @@ if command not in ("ray", "git", "pip", "flock", "env-source"):
             "MINICPMO_HUANYU_GDN_FP32_TRAINING": "1",
             "MINICPMO_GDN_FP32_REFERENCE": "1", "MINICPMO_HUANYU_LAYERWISE_RELOAD": "1",
             "MINICPMO_HYBRID_BLOCK_ZERO_REFERENCE": "1", "MINICPMO_ISOLATE_MEDIA_ENCODERS": "1",
-            "MINICPMO_STABLE_LINEAR": "0",
+            "MINICPMO_STABLE_LINEAR": "1", "HUANYU_PRECISION_PROFILE": "full", "MINICPMO_FSDP2_PIN_MEMORY": "0",
             "VLLM_OMNI_EXTERNAL_MODULES": "verl_omni_ext.models.qwen3_6_huanyu.engine_hooks",
         }
         for key, value in expected.items():
@@ -387,6 +409,29 @@ if command not in ("ray", "git", "pip", "flock", "env-source"):
             for kind in ("runtime", "train"):
                 for event in self.events(kind):
                     self.assertEqual(event["precision"][key], value, event)
+
+    def test_full_profile_restores_complete_policy_after_stale_site_environment(self):
+        env_file = self.examples / "env_export_huanyu.sh"
+        with env_file.open("a", encoding="utf-8") as stream:
+            stream.write(
+                "export HUANYU_PRECISION_PROFILE=custom MINICPMO_FSDP2_PIN_MEMORY=1\n"
+                "export MINICPMO_GDN_PREFILL_REFERENCE=0 MINICPMO_GDN_CONV_REFERENCE=0\n"
+                "export MINICPMO_STABLE_LINEAR=0 MINICPMO_PRIVATE_HYBRID_CACHE=0\n"
+            )
+        result = self.run_launcher({
+            "MINICPMO_GDN_FP32_REFERENCE": "0", "MINICPMO_GDN_GATING_REFERENCE": "0",
+            "MINICPMO_FSDP2_PIN_MEMORY": "1",
+        })
+        self.assert_success(result)
+        self.assertIn("overrides inherited values", result.stdout)
+        for kind in ("runtime", "ray", "train"):
+            for event in self.events(kind):
+                self.assert_precision_defaults(event)
+        actual = dict(arg.lstrip("+").split("=", 1)
+                      for arg in json.loads(self.capture_file.read_text())["argv"])
+        for key, value in {"HUANYU_PRECISION_PROFILE": "full", "MINICPMO_FSDP2_PIN_MEMORY": "0",
+                           "MINICPMO_STABLE_LINEAR": "1", "MINICPMO_PRIVATE_HYBRID_CACHE": "1"}.items():
+            self.assertEqual(json.loads(actual["ray_kwargs.ray_init.runtime_env.env_vars." + key]), value)
 
     def test_allocator_precedes_first_python_probe_pip_env_source_and_ray(self):
         result = self.run_launcher()

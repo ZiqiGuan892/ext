@@ -145,6 +145,7 @@ class HuanyuGraphModeTests(unittest.TestCase):
                     'source "${PROJECT_ROOT}/examples/qwen3_6_huanyu/graph_mode.sh"\n'
                     'python3 "${HUANYU_GRAPH_ARGS[@]}"\n',
                     updates={
+                        "HUANYU_PRECISION_PROFILE": "custom",
                         "HUANYU_GRAPH_MODE": value,
                         "VLLM_TORCH_COMPILE": str(1 - mode),
                         "TORCH_COMPILE_DISABLE": str(mode),
@@ -162,7 +163,7 @@ class HuanyuGraphModeTests(unittest.TestCase):
                     "huanyu_configure_graph_mode\n"
                     'source "${PROJECT_ROOT}/examples/qwen3_6_huanyu/graph_mode.sh"\n'
                     'python3 "${HUANYU_GRAPH_ARGS[@]}"\n',
-                    updates={"HUANYU_GRAPH_MODE": first},
+                    updates={"HUANYU_PRECISION_PROFILE": "custom", "HUANYU_GRAPH_MODE": first},
                 )
                 capture = self.read_capture(result)
                 self.assert_graph_settings(capture, last)
@@ -174,7 +175,7 @@ class HuanyuGraphModeTests(unittest.TestCase):
                 result = self.run_shell(
                     'source "${PROJECT_ROOT}/examples/qwen3_6_huanyu/graph_mode.sh" || exit $?\n'
                     'python3 "${HUANYU_GRAPH_ARGS[@]}"\n',
-                    updates={"HUANYU_GRAPH_MODE": value},
+                    updates={"HUANYU_PRECISION_PROFILE": "custom", "HUANYU_GRAPH_MODE": value},
                 )
                 self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
                 self.assertIn("HUANYU_GRAPH_MODE", result.stderr)
@@ -191,7 +192,7 @@ class HuanyuGraphModeTests(unittest.TestCase):
             with self.subTest(mode=value):
                 result = self.run_shell(
                     "git() { return 0; }\n" + prefix,
-                    updates={"HUANYU_GRAPH_MODE": value},
+                    updates={"HUANYU_PRECISION_PROFILE": "custom", "HUANYU_GRAPH_MODE": value},
                 )
                 if value == "invalid":
                     self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
@@ -234,6 +235,7 @@ class HuanyuGraphModeTests(unittest.TestCase):
                         result = self.run_shell(
                             setup + training_command,
                             updates={
+                                "HUANYU_PRECISION_PROFILE": "custom",
                                 "HUANYU_GRAPH_MODE": str(mode),
                                 "RM_ENABLE": str(rm_enable),
                                 "HUANYU_FREEZE_AUDIO": frozen,

@@ -15,3 +15,15 @@ class Qwen36HuanyuRolloutAdapter(Qwen36WhisperRolloutAdapter):
     """
 
     _pipeline_label = "qwen3_6_huanyu"
+
+    @classmethod
+    def get_stage_engine_extras(cls, stage_id: int, pipeline_mode: str = "thinker_only") -> dict:
+        extras = dict(super().get_stage_engine_extras(stage_id, pipeline_mode=pipeline_mode))
+        if stage_id == 0:
+            # Resolve/bind IPC handling through the actual worker factory, not
+            # only the registry's best-effort external import (which may run
+            # while the original extension module is still being imported).
+            extras["worker_extension_cls"] = (
+                "verl_omni_ext.models.qwen3_6_huanyu.worker_extension.HuanyuColocateWorkerExtension"
+            )
+        return extras

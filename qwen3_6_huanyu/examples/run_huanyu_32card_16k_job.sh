@@ -18,7 +18,8 @@
 # Gradient checkpointing and dynamic batching stay enabled. Sampling,
 # GSPO, FP32 master weights, GDN precision, frozen cache and GenRM are retained.
 #
-# Set PROJECT_ROOT to the absolute training-project path. This 16K script may
+# PROJECT_ROOT defaults to the shared Huanyu deployment; an absolute override
+# selects a different checkout. This 16K script may
 # live anywhere; its backend always comes from PROJECT_ROOT/examples/qwen3_6_huanyu.
 # Example: PROJECT_ROOT=/path/to/project bash /path/to/this/script.sh
 # Run this SAME script on both nodes; the existing job launcher owns setup,
@@ -33,16 +34,17 @@
 #   HUANYU_16K_RESPONSE_LENGTH=4096        # prompt becomes 12288; total stays 16K
 #   HUANYU_16K_ATTN_IMPLEMENTATION=eager   # compare against the SDPA default
 #   HUANYU_16K_MAX_NUM_SEQS=16             # rollout concurrency (default 32)
-# HUANYU_GRAPH_MODE retains its existing meaning/default (inference eager).
+# The default full precision policy requires HUANYU_GRAPH_MODE=0 (eager).
+# Graph A/Bs require explicit HUANYU_PRECISION_PROFILE=custom as well as mode=1.
 # Additional Hydra arguments are forwarded last and can override this profile;
 # use HUANYU_16K_RESPONSE_LENGTH to change the prompt/response split together.
 set -euo pipefail
 
-if [[ -z "${PROJECT_ROOT:-}" || "$PROJECT_ROOT" != /* ]]; then
+export PROJECT_ROOT="${PROJECT_ROOT:-/opt/huawei/dataset/hfy-model-gy/verl_omni_qwen36_gzq_new}"
+if [[ "$PROJECT_ROOT" != /* ]]; then
     echo 'FATAL: set PROJECT_ROOT to the absolute training-project path' >&2
     exit 2
 fi
-export PROJECT_ROOT
 export HUANYU_JOB_MODE=frozen_cache
 _HUANYU_16K_JOB="${PROJECT_ROOT}/examples/qwen3_6_huanyu/run_huanyu_32card_job.sh"
 _HUANYU_16K_RESPONSE="${HUANYU_16K_RESPONSE_LENGTH:-2048}"

@@ -6,9 +6,9 @@ source "${_huanyu_env_example_dir}/precision_mode.sh" || {
 }
 
 # Huanyu 环境；在每个节点 ray start 前 source 本文件。
-# source 前 export PROJECT_ROOT 可选择原目录或 gzq 副本；未设置时使用原目录。
+# source 前 export PROJECT_ROOT 可覆盖部署目录；默认使用 hfy-model-gy 下的新项目。
 # ext 从 PROJECT_ROOT 加载，verl / verl-omni 继续使用公共安装。
-export PROJECT_ROOT="${PROJECT_ROOT:-/opt/huawei/dataset/ccb_data/code/hufenyu/verl_omni_qwen36}"
+export PROJECT_ROOT="${PROJECT_ROOT:-/opt/huawei/dataset/hfy-model-gy/verl_omni_qwen36_gzq_new}"
 # 兼容旧 Huanyu 入口；唯一需要配置的代码根目录是 PROJECT_ROOT。
 export QWEN36_HUANYU_ROOT="${PROJECT_ROOT}"
 export HUANYU_VLLM_OMNI_ROOT=/vllm-workspace/vllm-omni
@@ -53,6 +53,8 @@ for _huanyu_path in "${_huanyu_python_entries[@]}"; do
         /opt/huawei/dataset/ccb_data/code/hufenyu/verl_omni_qwen36/*|\
         /opt/huawei/dataset/ccb_data/code/hufenyu/verl_omni_qwen36_gzq|\
         /opt/huawei/dataset/ccb_data/code/hufenyu/verl_omni_qwen36_gzq/*|\
+        /opt/huawei/dataset/ccb_data/code/hufenyu/verl_omni_qwen36_gzq_new|\
+        /opt/huawei/dataset/ccb_data/code/hufenyu/verl_omni_qwen36_gzq_new/*|\
         /opt/huawei/dataset/ccb/data/code/hufenyu/verl_omni_qwen36|\
         /opt/huawei/dataset/ccb/data/code/hufenyu/verl_omni_qwen36/*|\
         /opt/huawei/dataset/ccb/data/code/hufenyu/verl_omni_qwen36_gzq|\
@@ -84,6 +86,8 @@ export TENSORBOARD_DIR="${PROJECT_ROOT}/tensorboard_log"
 # 两个代码目录之间切换时，迁移继承的诊断目录并保留其相对路径。
 # 其他用户指定的独立诊断目录保持不变。
 case "${MINICPMO_ROLLOUT_DIAG_DIR:-}" in
+    /opt/huawei/dataset/ccb_data/code/hufenyu/verl_omni_qwen36_gzq_new/*)
+        export MINICPMO_ROLLOUT_DIAG_DIR="${PROJECT_ROOT}/${MINICPMO_ROLLOUT_DIAG_DIR#*/verl_omni_qwen36_gzq_new/}" ;;
     /opt/huawei/dataset/ccb_data/code/hufenyu/verl_omni_qwen36_gzq/*|\
     /opt/huawei/dataset/ccb/data/code/hufenyu/verl_omni_qwen36_gzq/*)
         export MINICPMO_ROLLOUT_DIAG_DIR="${PROJECT_ROOT}/${MINICPMO_ROLLOUT_DIAG_DIR#*/verl_omni_qwen36_gzq/}" ;;
@@ -97,8 +101,13 @@ pip install zarr
 
 export TORCH_EXTENSIONS_DIR=/cache/.torch_extension
 export NPUS_PER_NODE=16
-export MODEL_PATH=/opt/huawei/dataset/downloaded_models/Qwen3.6-35B-A3B-huanyu06b-iter2000-omni4b-hf-huanyu7tokens
+export MODEL_PATH="${MODEL_PATH:-/opt/huawei/dataset/hfy-model-gy/downloaded_models/Qwen3.6-35B-A3B-huanyu06b-iter2000-omni4b-hf-huanyu7tokens}"
+export RM_MODEL_PATH="${RM_MODEL_PATH:-/opt/huawei/dataset/hfy-model-gy/downloaded_models/Qwen3.5-35B-A3B}"
+export TRAIN_FILE="${TRAIN_FILE:-/opt/huawei/dataset/infra_data/data/train.parquet}"
+export VAL_FILE="${VAL_FILE:-/opt/huawei/dataset/infra_data/data/validation.parquet}"
 export Q36_CKPT_DIR="${MODEL_PATH}"
+echo "[huanyu-paths] project=$PROJECT_ROOT actor=$MODEL_PATH reward=$RM_MODEL_PATH"
+echo "[huanyu-paths] train=$TRAIN_FILE validation=$VAL_FILE"
 
 # 这里**曾经**有一行 `export MINICPMO_DISABLE_IMAGE_EXPAND=1`（2026-10-10 调试残留）。
 # 它的位置决定了它的危险：本文件在 `ray start` **之前**被 source，于是每个 Ray worker

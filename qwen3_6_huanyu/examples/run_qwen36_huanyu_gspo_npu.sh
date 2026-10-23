@@ -37,8 +37,8 @@
 # Direct launches bypass run_q36_job.sh, which installs the local entry points.
 # A source checkout on sys.path is insufficient: plugin discovery uses installed
 # distribution metadata. Install before the first Python/plugin import.
-_HUANYU_EXAMPLE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-export PROJECT_ROOT="${PROJECT_ROOT:-$(cd "${_HUANYU_EXAMPLE_DIR}/../.." && pwd)}"
+export PROJECT_ROOT="${PROJECT_ROOT:-/opt/huawei/dataset/hfy-model-gy/verl_omni_qwen36_gzq_new}"
+_HUANYU_EXAMPLE_DIR="${PROJECT_ROOT}/examples/qwen3_6_huanyu"
 EXT_ROOT="${PROJECT_ROOT}"
 source "${_HUANYU_EXAMPLE_DIR}/run_output.sh" || exit $?
 set -x
@@ -298,18 +298,11 @@ set -eo pipefail
 # §4. 路径与规模参数
 # =============================================================================
 # [MiniCPM 改动 1/6] 模型路径
-MODEL_PATH=${MODEL_PATH:-"/opt/huawei/dataset/downloaded_models/Qwen3.6-35B-A3B-whisper-0814-rl"}
+MODEL_PATH=${MODEL_PATH:-"/opt/huawei/dataset/hfy-model-gy/downloaded_models/Qwen3.6-35B-A3B-huanyu06b-iter2000-omni4b-hf-huanyu7tokens"}
 
-# [MiniCPM 改动 2/6] 数据集：**先用纯文本**，不要一上来就用带图的 geo3k。
-#
-# 原因见方案 §4.6：verl 的多模态数据管线是照 Qwen-VL 的形状写死的
-# （qwen_vl_utils.process_vision_info / image_grid_thw / processor(videos=,audio=)），
-# 而 MiniCPM-o 是 UHD NaViT + tgt_sizes/image_bound，对不上。带图的 batch 要么
-# TypeError，要么**不报错但算错**。先用纯文本把「能训」这件事立住，多模态单独立项。
-#
-# 纯文本可用 gsm8k / math 这类；换成带图数据集之前，先跑通方案的 V5 前置检查。
-TRAIN_FILE=${TRAIN_FILE:-"/opt/huawei/dataset/ccb_data/data/omni/gsm8k/train.parquet"}
-VAL_FILE=${VAL_FILE:-"/opt/huawei/dataset/ccb_data/data/omni/gsm8k/test.parquet"}
+# 默认使用当前部署数据；显式 TRAIN_FILE / VAL_FILE 可选择其他兼容 parquet。
+TRAIN_FILE=${TRAIN_FILE:-"/opt/huawei/dataset/infra_data/data/train.parquet"}
+VAL_FILE=${VAL_FILE:-"/opt/huawei/dataset/infra_data/data/validation.parquet"}
 
 # ---- 数据集格式前置校验（坑 #32）----
 # verl 要的是**预处理过**的 RL parquet：列 prompt / data_source / reward_model。

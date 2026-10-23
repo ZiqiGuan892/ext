@@ -17,16 +17,25 @@ import pyarrow.parquet as pq
 ROOT = Path(__file__).resolve().parents[1]
 EXAMPLES = ROOT / "examples"
 PRECISION_ENV = {
+    "HUANYU_PRECISION_PROFILE": "full", "MINICPMO_FSDP2_PIN_MEMORY": "0",
     "MINICPMO_HUANYU_GDN_FP32_TRAINING": "1", "MINICPMO_GDN_FP32_REFERENCE": "1",
     "MINICPMO_HUANYU_LAYERWISE_RELOAD": "1", "MINICPMO_HYBRID_BLOCK_ZERO_REFERENCE": "1",
-    "MINICPMO_ISOLATE_MEDIA_ENCODERS": "1", "MINICPMO_STABLE_LINEAR": "0",
-    "MINICPMO_GDN_PREFILL_REFERENCE": "0", "MINICPMO_MOE_TP_REFERENCE": "0",
+    "MINICPMO_ISOLATE_MEDIA_ENCODERS": "1", "MINICPMO_STABLE_LINEAR": "1",
+    "MINICPMO_GDN_PREFILL_REFERENCE": "1", "MINICPMO_MOE_TP_REFERENCE": "0",
+    "MINICPMO_GDN_CACHE_BARRIER": "1", "MINICPMO_GDN_L2NORM_REFERENCE": "1",
+    "MINICPMO_GDN_CONV_REFERENCE": "1", "MINICPMO_GDN_GATING_REFERENCE": "1",
+    "MINICPMO_PRIVATE_HYBRID_CACHE": "1",
     "MINICPMO_ROW_TP_REFERENCE": "0", "MINICPMO_HUANYU_ROLLOUT_TP": "4",
     "VLLM_OMNI_EXTERNAL_MODULES": "verl_omni_ext.models.qwen3_6_huanyu.engine_hooks",
     "HUANYU_USE_PRECOMPUTE": "0", "MINICPMO_USE_PRECOMPUTE": "0",
     "HUANYU_EMBED_CACHE_DIR": "", "HUANYU_FREEZE_AUDIO": "false",
     "MINICPMO_TUNE_AUDIO": "1", "MINICPMO_TUNE_VISION": "0",
 }
+CUSTOM_PRECISION_ENV = dict(PRECISION_ENV, HUANYU_PRECISION_PROFILE="custom", **dict.fromkeys((
+    "MINICPMO_STABLE_LINEAR", "MINICPMO_GDN_PREFILL_REFERENCE", "MINICPMO_GDN_CACHE_BARRIER",
+    "MINICPMO_GDN_L2NORM_REFERENCE", "MINICPMO_GDN_CONV_REFERENCE", "MINICPMO_GDN_GATING_REFERENCE",
+    "MINICPMO_PRIVATE_HYBRID_CACHE",
+), "0"))
 SPEC = importlib.util.spec_from_file_location("huanyu_aqa_preflight", EXAMPLES / "check_aqa_audio_train.py")
 checker = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(checker)
@@ -271,7 +280,7 @@ class AudioTrainingLauncherTests(unittest.TestCase):
                 self.assertEqual(actual["actor_rollout_ref.rollout.engine_kwargs.vllm_omni.mm_processor_cache_gb"], "0")
 
     def test_caller_precision_optout_reaches_native_and_workers_with_effective_tp4(self):
-        explicit = {"MINICPMO_HUANYU_GDN_FP32_TRAINING": "0", "MINICPMO_MOE_TP_REFERENCE": "4"}
+        explicit = dict(CUSTOM_PRECISION_ENV, MINICPMO_HUANYU_GDN_FP32_TRAINING="0", MINICPMO_MOE_TP_REFERENCE="4")
         result = self.run_script(explicit, (
             "actor_rollout_ref.rollout.tensor_model_parallel_size=8",
             '++ray_kwargs.ray_init.runtime_env.env_vars.MINICPMO_HUANYU_GDN_FP32_TRAINING="1"',
