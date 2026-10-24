@@ -3,6 +3,7 @@
 # Deploy to ${PROJECT_ROOT}/examples/qwen3_6_huanyu/ with the Huanyu package.
 # Defaults: frozen Huanyu, 35B sampleall, precomputed q128 cache, actor16 + RM16.
 # HUANYU_JOB_MODE=aqa_unfreeze selects online AQA training via its own entry.
+# HUANYU_JOB_MODE=aqa_precision selects the dedicated full-precision AQA entry.
 # Precision defaults: the complete full policy, including FP32 training/GDN,
 # prefill/gating/conv/L2/barrier, private hybrid cache, stable linear, layerwise
 # IPC reload, logical KV zeroing, isolated media and FSDP pin_memory=0.
@@ -80,7 +81,7 @@ if (( ! _POOLS_FIT )); then
     echo 'FATAL: per-node pools cannot fit on two 16-card nodes; for actor24 + RM8 use actor12x2 and RM4x2' >&2
     exit 2
 fi
-if [[ "$_JOB_MODE" == aqa_unfreeze ]] &&
+if [[ "$_JOB_MODE" == aqa_unfreeze || "$_JOB_MODE" == aqa_precision ]] &&
     (( _ACTOR_PER_NODE != 16 || _ACTOR_NODES != 1 || _RM_PER_NODE != 16 || _RM_NODES != 1 )); then
     echo 'FATAL: the online AQA entry still requires actor16 + RM16; configurable pools apply to the frozen entry' >&2
     exit 2
@@ -88,7 +89,8 @@ fi
 case "$_JOB_MODE" in
     frozen_cache) _TRAIN_ENTRY=run_huanyu.sh ;;
     aqa_unfreeze) _TRAIN_ENTRY=run_huanyu_aqa_audio_train.sh ;;
-    *) echo 'FATAL: HUANYU_JOB_MODE must be frozen_cache or aqa_unfreeze' >&2; exit 2 ;;
+    aqa_precision) _TRAIN_ENTRY=run_huanyu_aqa_precision.sh ;;
+    *) echo 'FATAL: HUANYU_JOB_MODE must be frozen_cache, aqa_unfreeze or aqa_precision' >&2; exit 2 ;;
 esac
 [[ -f "$PROJECT_ROOT/examples/qwen3_6_huanyu/$_TRAIN_ENTRY" ]] || {
     echo "FATAL: missing training entry $PROJECT_ROOT/examples/qwen3_6_huanyu/$_TRAIN_ENTRY" >&2
@@ -240,6 +242,12 @@ set +u
 source "$_ENV_FILE"
 set +x
 set -euo pipefail
+# This dedicated entry always uses the reference precision kernels, including
+# on the worker node. A site's graph/custom defaults cannot replace its policy.
+if [[ "$_JOB_MODE" == aqa_precision ]]; then
+    export HUANYU_PRECISION_PROFILE=full HUANYU_GRAPH_MODE=0
+    source "${_HUANYU_EXAMPLE_DIR}/graph_mode.sh"
+fi
 for _key in "${!_HUANYU_PATH_CONFIG[@]}"; do
     export "$_key=${_HUANYU_PATH_CONFIG[$_key]}"
 done
@@ -265,7 +273,7 @@ case "$_JOB_MODE" in
             exit 1
         }
         ;;
-    aqa_unfreeze)
+    aqa_unfreeze|aqa_precision)
         # Apply before Ray starts on BOTH nodes, after the site environment.
         # Empty the cache path as well as disabling it, including runtime_env
         # below for workers launched by an already-running frozen-cache raylet.

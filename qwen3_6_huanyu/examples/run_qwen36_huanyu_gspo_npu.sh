@@ -48,10 +48,17 @@ source "${_HUANYU_EXAMPLE_DIR}/graph_mode.sh" || exit $?
 source "${_HUANYU_EXAMPLE_DIR}/precision_mode.sh" "$@" || exit $?
 echo "[huanyu-graph] HUANYU_GRAPH_MODE=${HUANYU_GRAPH_MODE} actor/RM.enforce_eager=${HUANYU_ENFORCE_EAGER} VLLM_TORCH_COMPILE=${VLLM_TORCH_COMPILE} TORCH_COMPILE_DISABLE=${TORCH_COMPILE_DISABLE} NPU_GRAPH_CAPTURE_DISABLE=${NPU_GRAPH_CAPTURE_DISABLE}"
 export PYTHONPATH="${EXT_ROOT}${PYTHONPATH:+:$PYTHONPATH}"
-# Match the job launcher for shared mounts. setuptools-scm strips Git environment
-# overrides, so the trust entry must be in Git's configuration before installation.
-git config --global --add safe.directory "${EXT_ROOT}" || exit $?
-python3 -m pip install -e "${EXT_ROOT}" --no-deps --no-build-isolation || exit $?
+# Prepared-environment entries retain the installed entry points. The plugin
+# discovery check below still reports missing metadata before training starts.
+case "${HUANYU_SKIP_EDITABLE_INSTALL:-0}" in
+    0)
+        # setuptools-scm needs the trust entry before installation on shared mounts.
+        git config --global --add safe.directory "${EXT_ROOT}" || exit $?
+        python3 -m pip install -e "${EXT_ROOT}" --no-deps --no-build-isolation || exit $?
+        ;;
+    1) echo '[huanyu-setup] using installed plugin; editable installation skipped' ;;
+    *) echo 'FATAL: HUANYU_SKIP_EDITABLE_INSTALL must be 0 or 1' >&2; exit 2 ;;
+esac
 
 # =============================================================================
 # §1. Ascend / vLLM 运行时
@@ -933,8 +940,13 @@ echo "=== 自检通过 ==="
 # Refresh after all environment defaults and append last for reused Raylets.
 huanyu_configure_precision_mode "$@" || exit $?
 echo "[huanyu-precision] training_GDN=${MINICPMO_HUANYU_GDN_FP32_TRAINING} rollout_GDN=${MINICPMO_GDN_FP32_REFERENCE} layerwise_reload=${MINICPMO_HUANYU_LAYERWISE_RELOAD} actual_TP=${MINICPMO_HUANYU_ROLLOUT_TP} cache=${HUANYU_USE_PRECOMPUTE}"
+# Direct launches may reuse Raylets started before WANDB_MODE was exported.
+# Pass the offline default to TaskRunner through the job environment as well.
+# Keep it before "$@" so an explicit runtime-env override retains precedence.
+echo "[huanyu-tracking] WANDB_MODE=${WANDB_MODE:-offline} forwarded to Ray (explicit runtime-env overrides take precedence)"
 python3 -m verl_omni.trainer.main_omni \
     trainer.device=npu \
+    "++ray_kwargs.ray_init.runtime_env.env_vars.WANDB_MODE=\"${WANDB_MODE:-offline}\"" \
     \
     data.train_files="${TRAIN_FILE}" \
     data.val_files="${VAL_FILE}" \
