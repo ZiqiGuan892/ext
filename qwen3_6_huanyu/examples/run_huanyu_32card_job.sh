@@ -32,7 +32,7 @@ _PYTHON=python3
 _HELPER="${_HUANYU_EXAMPLE_DIR}/job_bootstrap.py"
 _ENV_FILE="${HUANYU_ENV_FILE:-${_HUANYU_EXAMPLE_DIR}/env_export_huanyu.sh}"
 _PRECISION_FILE="${_HUANYU_EXAMPLE_DIR}/precision_mode.sh"
-_VLLM_SOURCE="${HUANYU_VLLM_SOURCE:-/opt/huawei/dataset/hfy_guiyang/vllm-omni-xy-qwen-vit}"
+_VLLM_SOURCE="${HUANYU_VLLM_SOURCE:-/opt/huawei/dataset/infra_data/code/vllm-omni-xy-qwen-vit}"
 _VLLM_TARGET=/vllm-workspace/vllm-omni
 _RANK="${VC_TASK_INDEX:-}"
 _WAIT="${RAY_CLUSTER_WAIT_TIMEOUT:-900}"
@@ -220,6 +220,7 @@ _LIVE_RAY=0
 if pgrep -x raylet >/dev/null; then _LIVE_RAY=1; fi
 _SYNC_ARGS=()
 if (( _LIVE_RAY )); then _SYNC_ARGS+=(--ray-running); fi
+echo "[huanyu-job] vLLM-Omni sync source=$_VLLM_SOURCE target=$_VLLM_TARGET"
 "$_PYTHON" -B "$_HELPER" sync "$_VLLM_SOURCE" "$_VLLM_TARGET" "${_SYNC_ARGS[@]}"
 if (( _LIVE_RAY )); then
     echo '[huanyu-job] reusing local Ray; code matches, editable installation skipped'

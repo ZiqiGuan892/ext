@@ -66,7 +66,9 @@ for _huanyu_path in "${_huanyu_python_entries[@]}"; do
         /vllm-workspace/vllm-omni|\
         /vllm-workspace/vllm-omni/*|\
         /opt/huawei/dataset/hfy_guiyang/vllm-omni-xy-qwen-vit|\
-        /opt/huawei/dataset/hfy_guiyang/vllm-omni-xy-qwen-vit/*)
+        /opt/huawei/dataset/hfy_guiyang/vllm-omni-xy-qwen-vit/*|\
+        /opt/huawei/dataset/infra_data/code/vllm-omni-xy-qwen-vit|\
+        /opt/huawei/dataset/infra_data/code/vllm-omni-xy-qwen-vit/*)
             continue ;;
     esac
     _huanyu_retained_pythonpath="${_huanyu_retained_pythonpath:+${_huanyu_retained_pythonpath}:}${_huanyu_path}"

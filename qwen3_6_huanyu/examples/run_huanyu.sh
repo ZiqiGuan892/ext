@@ -18,7 +18,10 @@ for _huanyu_path in "${_huanyu_path_entries[@]}"; do
         ""|"$HUANYU_VLLM_OMNI_ROOT"|"$PWD"|\
         /opt/huawei/dataset/ccb_data/code/hufenyu/vllm-omni-xy|\
         /opt/huawei/dataset/ccb/data/code/hufenyu/vllm-omni-xy|\
-        /opt/huawei/dataset/hfy_guiyang/vllm-omni-xy-qwen-vit) continue ;;
+        /opt/huawei/dataset/hfy_guiyang/vllm-omni-xy-qwen-vit|\
+        /opt/huawei/dataset/hfy_guiyang/vllm-omni-xy-qwen-vit/*|\
+        /opt/huawei/dataset/infra_data/code/vllm-omni-xy-qwen-vit|\
+        /opt/huawei/dataset/infra_data/code/vllm-omni-xy-qwen-vit/*) continue ;;
     esac
     _huanyu_retained_path+="${_huanyu_retained_path:+:}${_huanyu_path}"
 done

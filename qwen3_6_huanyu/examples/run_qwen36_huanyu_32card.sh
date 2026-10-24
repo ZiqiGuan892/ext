@@ -46,7 +46,11 @@ _huanyu_retained_pythonpath=""
 IFS=: read -r -a _huanyu_python_entries <<< "${PYTHONPATH:-}"
 for _huanyu_path in "${_huanyu_python_entries[@]}"; do
     case "${_huanyu_path%/}" in
-        ""|/opt/huawei/dataset/ccb_data/code/hufenyu/vllm-omni-xy|/vllm-workspace/vllm-omni|/opt/huawei/dataset/hfy_guiyang/vllm-omni-xy-qwen-vit)
+        ""|/opt/huawei/dataset/ccb_data/code/hufenyu/vllm-omni-xy|/vllm-workspace/vllm-omni|\
+        /opt/huawei/dataset/hfy_guiyang/vllm-omni-xy-qwen-vit|\
+        /opt/huawei/dataset/hfy_guiyang/vllm-omni-xy-qwen-vit/*|\
+        /opt/huawei/dataset/infra_data/code/vllm-omni-xy-qwen-vit|\
+        /opt/huawei/dataset/infra_data/code/vllm-omni-xy-qwen-vit/*)
             continue ;;
     esac
     _huanyu_retained_pythonpath="${_huanyu_retained_pythonpath:+${_huanyu_retained_pythonpath}:}${_huanyu_path}"
