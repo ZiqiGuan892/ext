@@ -73,8 +73,17 @@ export ACTOR_OFFLOAD_POLICY=false
 export ACTIVATION_OFFLOAD=false
 export FILTER_OVERLONG=false
 
-export TRAIN_FILE="${TRAIN_FILE:-/opt/huawei/dataset/infra_data/data/train.parquet}"
-export VAL_FILE="${VAL_FILE:-/opt/huawei/dataset/infra_data/data/validation.parquet}"
+# Upgrade the generic defaults inherited from env_export_huanyu.sh in AQA
+# mode. Dedicated AQA overrides take precedence; other explicit paths survive.
+if [[ "${TRAIN_FILE:-}" == /opt/huawei/dataset/infra_data/data/train.parquet ]]; then
+    unset TRAIN_FILE
+fi
+if [[ "${VAL_FILE:-}" == /opt/huawei/dataset/infra_data/data/validation.parquet ]]; then
+    unset VAL_FILE
+fi
+export TRAIN_FILE="${HUANYU_AQA_TRAIN_FILE:-${TRAIN_FILE:-/opt/huawei/dataset/infra_data/data/aqa_dataset/train.parquet}}"
+export VAL_FILE="${HUANYU_AQA_VAL_FILE:-${VAL_FILE:-/opt/huawei/dataset/infra_data/data/aqa_dataset/validation.parquet}}"
+echo "[huanyu-aqa] train=$TRAIN_FILE validation=$VAL_FILE"
 export MODEL_PATH="${MODEL_PATH:-/opt/huawei/dataset/hfy-model-gy/downloaded_models/Qwen3.6-35B-A3B-huanyu06b-iter2000-omni4b-hf-huanyu7tokens}"
 export RM_MODEL_PATH="${RM_MODEL_PATH:-/opt/huawei/dataset/hfy-model-gy/downloaded_models/Qwen3.5-35B-A3B}"
 

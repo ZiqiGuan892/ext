@@ -3,7 +3,7 @@
 # Changes from the frozen sampleall job:
 #   HUANYU_FREEZE_AUDIO: true -> false; MINICPMO_TUNE_AUDIO: 0 -> 1
 #   HUANYU_USE_PRECOMPUTE: 1 -> 0 (raw audio, no cache manifest required)
-#   dataset: omni_mix_f8_genrm_sampleall -> omni_mix_aqa_only
+#   dataset: migrated AQA under /opt/huawei/dataset/infra_data/data/aqa_dataset
 #   train/mini batch: 32/32 -> 4/4; rollout.n stays 4 (16 actor sequences)
 #   dynamic batches -> static microbatch=1; SP=1; prefetch=off in AQA entry
 #   length: prompt=3072 + response=2048 = 5120; engine/token budget=5248
@@ -48,8 +48,15 @@ export HUANYU_JOB_MODE=aqa_unfreeze
 export HUANYU_FREEZE_AUDIO=false HUANYU_USE_PRECOMPUTE=0 HUANYU_EMBED_CACHE_DIR=""
 export HUANYU_AQA_AUDIO_TRAIN=1 MINICPMO_USE_PRECOMPUTE=0
 export MINICPMO_TUNE_AUDIO=1 MINICPMO_TUNE_VISION=0
-export TRAIN_FILE="${HUANYU_AQA_TRAIN_FILE:-${TRAIN_FILE:-/opt/huawei/dataset/infra_data/data/train.parquet}}"
-export VAL_FILE="${HUANYU_AQA_VAL_FILE:-${VAL_FILE:-/opt/huawei/dataset/infra_data/data/validation.parquet}}"
+# Do not let the shared environment's generic dataset defaults mask AQA paths.
+if [[ "${TRAIN_FILE:-}" == /opt/huawei/dataset/infra_data/data/train.parquet ]]; then
+    unset TRAIN_FILE
+fi
+if [[ "${VAL_FILE:-}" == /opt/huawei/dataset/infra_data/data/validation.parquet ]]; then
+    unset VAL_FILE
+fi
+export TRAIN_FILE="${HUANYU_AQA_TRAIN_FILE:-${TRAIN_FILE:-/opt/huawei/dataset/infra_data/data/aqa_dataset/train.parquet}}"
+export VAL_FILE="${HUANYU_AQA_VAL_FILE:-${VAL_FILE:-/opt/huawei/dataset/infra_data/data/aqa_dataset/validation.parquet}}"
 export TRAIN_BATCH_SIZE=4 PPO_MINI_BATCH_SIZE=4 ROLLOUT_N=4
 export PPO_MICRO_BATCH_SIZE_PER_GPU=1
 export MAX_PROMPT_LENGTH=3072 MAX_RESPONSE_LENGTH=2048
