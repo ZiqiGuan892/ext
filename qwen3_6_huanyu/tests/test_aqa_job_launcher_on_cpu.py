@@ -18,6 +18,7 @@ ENTRY = "run_huanyu_aqa_unfreeze_32card_job.sh"
 ENV_PREFIX = "ray_kwargs.ray_init.runtime_env.env_vars."
 MODE_ENV = {
     "HUANYU_FREEZE_AUDIO": "false", "HUANYU_USE_PRECOMPUTE": "0",
+    "HUANYU_TRAIN_AUDIO_ENCODER": "true", "HUANYU_TRAIN_AUDIO_PROJECTOR": "true",
     "HUANYU_AQA_AUDIO_TRAIN": "1", "MINICPMO_USE_PRECOMPUTE": "0",
     "MINICPMO_TUNE_AUDIO": "1", "MINICPMO_TUNE_VISION": "0",
     "HUANYU_EMBED_CACHE_DIR": "", "Q36_BACKWARD_PREFETCH": "off",
@@ -299,6 +300,67 @@ class AqaJobLauncherTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("mixed sources", result.stdout + result.stderr)
         self.assertFalse(self.fixture.events("train"))
+
+    def test_component_choices_survive_site_env_and_existing_ray(self):
+        env_file = self.fixture.examples / "env_export_huanyu.sh"
+        with env_file.open("a", encoding="utf-8") as stream:
+            stream.write(
+                "export HUANYU_FREEZE_AUDIO=false MINICPMO_TUNE_AUDIO=1\n"
+                "export HUANYU_TRAIN_AUDIO_ENCODER=true HUANYU_TRAIN_AUDIO_PROJECTOR=true\n"
+            )
+        for encoder, projector in (("false", "true"), ("true", "false"), ("false", "false")):
+            with self.subTest(encoder=encoder, projector=projector):
+                mode = {"HUANYU_TRAIN_AUDIO_ENCODER": encoder, "HUANYU_TRAIN_AUDIO_PROJECTOR": projector}
+                capture = self.launch(dict(mode, HUANYU_TEST_RAY_LIVE="1"), (
+                    "++actor_rollout_ref.model.override_config.huanyu_train_audio_encoder=true",
+                    "++actor_rollout_ref.model.override_config.huanyu_train_audio_projector=true",
+                    '++ray_kwargs.ray_init.runtime_env.env_vars.HUANYU_TRAIN_AUDIO_ENCODER="true"',
+                    '++ray_kwargs.ray_init.runtime_env.env_vars.HUANYU_TRAIN_AUDIO_PROJECTOR="true"',
+                ))
+                actual = effective_arguments(capture)
+                train_any = "true" in (encoder, projector)
+                expected = dict(mode, HUANYU_FREEZE_AUDIO="false" if train_any else "true",
+                                MINICPMO_TUNE_AUDIO="1" if train_any else "0")
+                for key, value in expected.items():
+                    self.assertEqual(capture["env"][key], value, key)
+                    self.assertEqual(json.loads(actual[ENV_PREFIX + key]), value, key)
+                    for event in self.fixture.events("runtime"):
+                        self.assertEqual(event["env"][key], value, key)
+                self.assertEqual(actual["actor_rollout_ref.model.override_config.huanyu_train_audio_encoder"], encoder)
+                self.assertEqual(actual["actor_rollout_ref.model.override_config.huanyu_train_audio_projector"], projector)
+                self.assertEqual(actual["actor_rollout_ref.model.override_config.huanyu_freeze_audio"], expected["HUANYU_FREEZE_AUDIO"])
+                self.assertFalse(any("start" in event["args"] for event in self.fixture.events("ray")))
+                self.fixture.events_file.write_text("", encoding="utf-8")
+
+    def test_worker_preserves_independent_component_choices_after_site_env(self):
+        env_file = self.fixture.examples / "env_export_huanyu.sh"
+        with env_file.open("a", encoding="utf-8") as stream:
+            stream.write("export HUANYU_TRAIN_AUDIO_ENCODER=true HUANYU_TRAIN_AUDIO_PROJECTOR=false\n")
+        for encoder, projector in (("false", "true"), ("false", "false")):
+            with self.subTest(encoder=encoder, projector=projector):
+                mode = {"HUANYU_TRAIN_AUDIO_ENCODER": encoder, "HUANYU_TRAIN_AUDIO_PROJECTOR": projector}
+                result = self.fixture.run_launcher(dict(mode, VC_TASK_INDEX="1"))
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertFalse(self.fixture.events("train"))
+                ray = self.fixture.events("ray")
+                self.assertEqual(len(ray), 1)
+                self.assertIn("--block", ray[0]["args"])
+                for event in ray + self.fixture.events("runtime"):
+                    for key, value in mode.items():
+                        self.assertEqual(event["env"][key], value, key)
+                    self.assertEqual(event["env"]["MINICPMO_TUNE_AUDIO"], "1" if projector == "true" else "0")
+                for component, value in (("encoder", encoder), ("projector", projector)):
+                    self.assertIn(f"train_audio_{component}={value}", result.stdout)
+                self.fixture.events_file.write_text("", encoding="utf-8")
+
+    def test_invalid_component_choice_stops_before_bootstrap_or_ray(self):
+        for key in ("HUANYU_TRAIN_AUDIO_ENCODER", "HUANYU_TRAIN_AUDIO_PROJECTOR"):
+            with self.subTest(key=key):
+                result = self.fixture.run_launcher({key: "typo"})
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(key, result.stdout + result.stderr)
+                for kind in ("helper", "pip", "ray", "train"):
+                    self.assertFalse(self.fixture.events(kind), kind)
 
     def test_invalid_job_mode_fails_before_setup(self):
         self.fixture.entry = self.fixture.examples / "run_huanyu_32card_job.sh"

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Online AQA + trainable Huanyu encoder/projector + GenRM, 32 NPUs, 5K budget.
 # Changes from the frozen sampleall job:
-#   HUANYU_FREEZE_AUDIO: true -> false; MINICPMO_TUNE_AUDIO: 0 -> 1
+#   encoder/projector training: independent flags, both true by default
 #   HUANYU_USE_PRECOMPUTE: 1 -> 0 (raw audio, no cache manifest required)
 #   dataset: migrated AQA under /opt/huawei/dataset/infra_data/data/aqa_dataset
 #   train/mini batch: 32/32 -> 4/4; rollout.n stays 4 (16 actor sequences)
@@ -13,7 +13,7 @@
 #   hybrid KV blocks: logical-to-physical zeroing; vision item isolation on
 #   prefix cache and MM processor cache: off while audio weights change
 # Explicit numerical environment overrides remain available for A/B tests;
-# slow reference kernels stay opt-in. The audio encoder/projector keep gradients.
+# individual kernel overrides require profile=custom.
 # Train attention remains eager. The default full precision profile also
 # requires inference eager mode; graph comparisons require profile=custom.
 #
@@ -37,17 +37,24 @@ if [[ "$PROJECT_ROOT" != /* ]]; then
 fi
 _HUANYU_AQA_JOB="${PROJECT_ROOT}/examples/qwen3_6_huanyu/run_huanyu_32card_job.sh"
 _HUANYU_AQA_PRECISION="${PROJECT_ROOT}/examples/qwen3_6_huanyu/precision_mode.sh"
-[[ -f "$_HUANYU_AQA_JOB" && -f "$_HUANYU_AQA_PRECISION" ]] || {
-    echo "FATAL: deploy run_huanyu_32card_job.sh and precision_mode.sh under PROJECT_ROOT/examples/qwen3_6_huanyu" >&2
+_HUANYU_AQA_AUDIO_MODE="${PROJECT_ROOT}/examples/qwen3_6_huanyu/audio_train_mode.sh"
+[[ -f "$_HUANYU_AQA_JOB" && -f "$_HUANYU_AQA_PRECISION" && -f "$_HUANYU_AQA_AUDIO_MODE" ]] || {
+    echo "FATAL: deploy run_huanyu_32card_job.sh, precision_mode.sh and audio_train_mode.sh under PROJECT_ROOT/examples/qwen3_6_huanyu" >&2
     exit 1
 }
 
-# The profile establishes online audio training; the job reapplies that mode
-# after sourcing env. Explicit dataset paths are retained and AQA-validated.
+# Set each option independently (true=train, false=freeze). Edit these defaults
+# or export the same values on BOTH nodes before launching. For example,
+# encoder=false/projector=true trains only the projector. Both false keeps
+# online audio encoding and trains only the remaining trainable model parts.
+export HUANYU_TRAIN_AUDIO_ENCODER="${HUANYU_TRAIN_AUDIO_ENCODER-true}"
+export HUANYU_TRAIN_AUDIO_PROJECTOR="${HUANYU_TRAIN_AUDIO_PROJECTOR-true}"
+# The job snapshots these choices and restores them after sourcing the site env.
 export HUANYU_JOB_MODE=aqa_unfreeze
 export HUANYU_FREEZE_AUDIO=false HUANYU_USE_PRECOMPUTE=0 HUANYU_EMBED_CACHE_DIR=""
 export HUANYU_AQA_AUDIO_TRAIN=1 MINICPMO_USE_PRECOMPUTE=0
-export MINICPMO_TUNE_AUDIO=1 MINICPMO_TUNE_VISION=0
+export MINICPMO_TUNE_VISION=0
+source "$_HUANYU_AQA_AUDIO_MODE" || exit $?
 # Do not let the shared environment's generic dataset defaults mask AQA paths.
 if [[ "${TRAIN_FILE:-}" == /opt/huawei/dataset/infra_data/data/train.parquet ]]; then
     unset TRAIN_FILE
@@ -70,11 +77,11 @@ export EXPERIMENT_NAME="${EXPERIMENT_NAME:-huanyu_aqa_unfreeze_5k_32card}"
 # well, rather than validating an inherited frozen-profile TP which is ignored.
 source "$_HUANYU_AQA_PRECISION" "$@" actor_rollout_ref.rollout.tensor_model_parallel_size=4 || exit $?
 echo "[huanyu-aqa-job] train=$TRAIN_FILE validation=$VAL_FILE"
-echo '[huanyu-aqa-job] freeze_audio=false cache=off actor=16NPU GenRM=16NPU prompt=3072 response=2048'
+echo "[huanyu-aqa-job] freeze_audio=$HUANYU_FREEZE_AUDIO train_audio_encoder=$HUANYU_TRAIN_AUDIO_ENCODER train_audio_projector=$HUANYU_TRAIN_AUDIO_PROJECTOR cache=off actor=16NPU GenRM=16NPU prompt=3072 response=2048"
 echo "[huanyu-aqa-job] precision train_GDN=$MINICPMO_HUANYU_GDN_FP32_TRAINING rollout_GDN=$MINICPMO_GDN_FP32_REFERENCE reload=$MINICPMO_HUANYU_LAYERWISE_RELOAD KV_zero=$MINICPMO_HYBRID_BLOCK_ZERO_REFERENCE hooks=$VLLM_OMNI_EXTERNAL_MODULES"
 
 # Length/attention defaults precede caller Hydra overrides. AQA's checked
-# dataset, trainable-audio and synchronized microbatch settings are enforced
+# dataset, audio component modes and synchronized microbatch settings are enforced
 # by run_huanyu_aqa_audio_train.sh after caller arguments. TOTAL_TRAINING_STEPS
 # is its supported run-length control. Logs/GenRM retain unique runs folders.
 exec bash "$_HUANYU_AQA_JOB" \

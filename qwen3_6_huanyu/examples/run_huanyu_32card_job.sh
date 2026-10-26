@@ -100,6 +100,19 @@ case "$_JOB_MODE" in
     aqa_16k_24_8) _TRAIN_ENTRY=run_huanyu_aqa_16k_24_8.sh ;;
     *) echo 'FATAL: HUANYU_JOB_MODE must be frozen_cache, aqa_unfreeze, aqa_precision or aqa_16k_24_8' >&2; exit 2 ;;
 esac
+# Keep the component choices through site environment setup and into existing
+# Ray workers. The frozen-cache entry always freezes both audio components.
+_AUDIO_MODE_FILE="${_HUANYU_EXAMPLE_DIR}/audio_train_mode.sh"
+[[ -f "$_AUDIO_MODE_FILE" ]] || { echo "FATAL: missing $_AUDIO_MODE_FILE" >&2; exit 1; }
+if [[ "$_JOB_MODE" == frozen_cache ]]; then
+    export HUANYU_FREEZE_AUDIO=true
+    export HUANYU_TRAIN_AUDIO_ENCODER=false HUANYU_TRAIN_AUDIO_PROJECTOR=false
+fi
+source "$_AUDIO_MODE_FILE" || exit $?
+declare -A _HUANYU_AUDIO_CONFIG=()
+for _key in HUANYU_FREEZE_AUDIO HUANYU_TRAIN_AUDIO_ENCODER HUANYU_TRAIN_AUDIO_PROJECTOR MINICPMO_TUNE_AUDIO; do
+    _HUANYU_AUDIO_CONFIG["$_key"]="${!_key}"
+done
 [[ -f "$PROJECT_ROOT/examples/qwen3_6_huanyu/$_TRAIN_ENTRY" ]] || {
     echo "FATAL: missing training entry $PROJECT_ROOT/examples/qwen3_6_huanyu/$_TRAIN_ENTRY" >&2
     exit 1
@@ -278,6 +291,9 @@ export RAY_USAGE_STATS_ENABLED=0 PYTHONUNBUFFERED=1 HYDRA_FULL_ERROR=1
 export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
 export HUANYU_VLLM_OMNI_ROOT="$_VLLM_TARGET"
 export MINICPMO_USE_PRECOMPUTE=0 MINICPMO_TUNE_VISION=0
+for _key in "${!_HUANYU_AUDIO_CONFIG[@]}"; do
+    export "$_key=${_HUANYU_AUDIO_CONFIG[$_key]}"
+done
 case "$_JOB_MODE" in
     frozen_cache)
         export HUANYU_USE_PRECOMPUTE=1 HUANYU_FREEZE_AUDIO=true
@@ -292,9 +308,9 @@ case "$_JOB_MODE" in
         # Apply before Ray starts on BOTH nodes, after the site environment.
         # Empty the cache path as well as disabling it, including runtime_env
         # below for workers launched by an already-running frozen-cache raylet.
-        export HUANYU_USE_PRECOMPUTE=0 HUANYU_FREEZE_AUDIO=false
+        export HUANYU_USE_PRECOMPUTE=0
         export HUANYU_EMBED_CACHE_DIR=""
-        export MINICPMO_TUNE_AUDIO=1 HUANYU_AQA_AUDIO_TRAIN=1
+        export HUANYU_AQA_AUDIO_TRAIN=1
         export Q36_BACKWARD_PREFETCH=off
         ;;
 esac
@@ -315,6 +331,7 @@ source "$_PRECISION_FILE" "${_TRAIN_ARGS[@]}" || exit $?
 echo "[huanyu-job] precision before Ray: train_GDN=${MINICPMO_HUANYU_GDN_FP32_TRAINING} rollout_GDN=${MINICPMO_GDN_FP32_REFERENCE} reload=${MINICPMO_HUANYU_LAYERWISE_RELOAD} KV_zero=${MINICPMO_HYBRID_BLOCK_ZERO_REFERENCE} isolate_media=${MINICPMO_ISOLATE_MEDIA_ENCODERS} actual_TP=${MINICPMO_HUANYU_ROLLOUT_TP}"
 echo "[huanyu-job] inference hooks: ${VLLM_OMNI_EXTERNAL_MODULES}"
 echo "[huanyu-job] mode=$_JOB_MODE freeze_audio=$HUANYU_FREEZE_AUDIO precompute=$HUANYU_USE_PRECOMPUTE train_entry=$_TRAIN_ENTRY"
+echo "[huanyu-job] train_audio_encoder=$HUANYU_TRAIN_AUDIO_ENCODER train_audio_projector=$HUANYU_TRAIN_AUDIO_PROJECTOR"
 echo "[huanyu-job] physical=16x2 actor=${NUM_NPUS}x${NNODES} rollout_TP=$ROLLOUT_TP RM=${RM_N_GPUS_PER_NODE}x${RM_NNODES} RM_TP=$RM_TP requested=$((NUM_NPUS * NNODES + REWARD_POOL_NPUS))"
 "$_PYTHON" -B "${_HUANYU_EXAMPLE_DIR}/check_native_runtime.py" \
     --check --expected-root "$_VLLM_TARGET"
@@ -345,6 +362,7 @@ if (( _RANK == 0 )); then
     # environment whitelist; Ray can also strip its own allocator preload.
     _RUNTIME_ARGS=()
     for _key in HUANYU_USE_PRECOMPUTE HUANYU_EMBED_CACHE_DIR HUANYU_FREEZE_AUDIO \
+        HUANYU_TRAIN_AUDIO_ENCODER HUANYU_TRAIN_AUDIO_PROJECTOR \
         HUANYU_AQA_AUDIO_TRAIN MINICPMO_USE_PRECOMPUTE MINICPMO_TUNE_AUDIO \
         MINICPMO_TUNE_VISION WANDB_MODE LD_PRELOAD; do
         _value="$("$_PYTHON" -c 'import json, os, sys; print(json.dumps(os.environ[sys.argv[1]]))' "$_key")"
@@ -354,6 +372,8 @@ if (( _RANK == 0 )); then
     bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/$_TRAIN_ENTRY" \
         "${_TRAIN_ARGS[@]}" \
         "++actor_rollout_ref.model.override_config.huanyu_freeze_audio=${HUANYU_FREEZE_AUDIO}" \
+        "++actor_rollout_ref.model.override_config.huanyu_train_audio_encoder=${HUANYU_TRAIN_AUDIO_ENCODER}" \
+        "++actor_rollout_ref.model.override_config.huanyu_train_audio_projector=${HUANYU_TRAIN_AUDIO_PROJECTOR}" \
         "${_RUNTIME_ARGS[@]}" "${HUANYU_PRECISION_ARGS[@]}"
 else
     timeout --foreground "${_WAIT}s" "$_PYTHON" -B "$_HELPER" wait-head \

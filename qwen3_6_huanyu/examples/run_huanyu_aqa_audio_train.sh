@@ -72,7 +72,8 @@ case "${RM_ENABLE}" in
     *) echo "[huanyu-aqa] FATAL: RM_ENABLE must be 0 or 1" >&2; exit 2 ;;
 esac
 for _huanyu_file in "${_HUANYU_EXAMPLE_DIR}/check_native_runtime.py" "${_HUANYU_BACKEND}" \
-    "${_HUANYU_EXAMPLE_DIR}/check_aqa_audio_train.py" "${_HUANYU_EXAMPLE_DIR}/precision_mode.sh"; do
+    "${_HUANYU_EXAMPLE_DIR}/check_aqa_audio_train.py" "${_HUANYU_EXAMPLE_DIR}/precision_mode.sh" \
+    "${_HUANYU_EXAMPLE_DIR}/audio_train_mode.sh"; do
     if [[ ! -f "${_huanyu_file}" ]]; then
         echo "[huanyu-aqa] FATAL: missing ${_huanyu_file}; deploy to PROJECT_ROOT/examples/qwen3_6_huanyu" >&2
         exit 2
@@ -81,12 +82,7 @@ done
 
 # This is an online AQA-only mode. Cache flags cannot be inherited from a
 # previous frozen-encoder run. The HF override is the actual model hyperparameter.
-export HUANYU_FREEZE_AUDIO="${HUANYU_FREEZE_AUDIO:-false}"
-case "${HUANYU_FREEZE_AUDIO}" in
-    false) export MINICPMO_TUNE_AUDIO=1 ;;
-    true) export MINICPMO_TUNE_AUDIO=0 ;;
-    *) echo "[huanyu-aqa] FATAL: HUANYU_FREEZE_AUDIO must be true or false" >&2; exit 2 ;;
-esac
+source "${_HUANYU_EXAMPLE_DIR}/audio_train_mode.sh" || exit $?
 export HUANYU_AQA_AUDIO_TRAIN=1
 export HUANYU_USE_PRECOMPUTE=0
 export HUANYU_EMBED_CACHE_DIR=""
@@ -151,6 +147,9 @@ elif [[ ! "${_huanyu_steps}" =~ ^[1-9][0-9]*$ ]]; then
 fi
 export PROJECT_NAME="${PROJECT_NAME:-huanyu_aqa}"
 _huanyu_experiment="audio_freeze_${HUANYU_FREEZE_AUDIO}_online"
+if [[ "$HUANYU_TRAIN_AUDIO_ENCODER" != "$HUANYU_TRAIN_AUDIO_PROJECTOR" ]]; then
+    _huanyu_experiment="audio_encoder_${HUANYU_TRAIN_AUDIO_ENCODER}_projector_${HUANYU_TRAIN_AUDIO_PROJECTOR}_online"
+fi
 if [[ "${RM_ENABLE}" == 0 ]]; then
     _huanyu_experiment+="_rule_based_${_huanyu_actor_world}card"
 fi
@@ -235,6 +234,7 @@ python3 -B "${_HUANYU_EXAMPLE_DIR}/check_native_runtime.py" --check --expected-r
 
 _huanyu_ray_args=()
 for _huanyu_env_key in PYTHONPATH HUANYU_VLLM_OMNI_ROOT HUANYU_FREEZE_AUDIO \
+    HUANYU_TRAIN_AUDIO_ENCODER HUANYU_TRAIN_AUDIO_PROJECTOR \
     HUANYU_AQA_AUDIO_TRAIN HUANYU_USE_PRECOMPUTE HUANYU_EMBED_CACHE_DIR MINICPMO_USE_PRECOMPUTE \
     MINICPMO_TUNE_AUDIO MINICPMO_TUNE_VISION Q36_BACKWARD_PREFETCH GENRM_DUMP_DIR; do
     _huanyu_env_json="$(python3 -c 'import json, os, sys; print(json.dumps(os.environ[sys.argv[1]]))' "${_huanyu_env_key}")"
@@ -242,6 +242,7 @@ for _huanyu_env_key in PYTHONPATH HUANYU_VLLM_OMNI_ROOT HUANYU_FREEZE_AUDIO \
 done
 
 echo "[huanyu-aqa] freeze_audio=${HUANYU_FREEZE_AUDIO} cache=off visual=frozen; actor=${_huanyu_actor_world}NPU RM=${REWARD_POOL_NPUS}NPU RM_ENABLE=${RM_ENABLE} actor_pool=${NUM_NPUS}x${NNODES}"
+echo "[huanyu-aqa] train_audio_encoder=$HUANYU_TRAIN_AUDIO_ENCODER train_audio_projector=$HUANYU_TRAIN_AUDIO_PROJECTOR"
 if [[ "${RM_ENABLE}" == 0 ]]; then
     echo "[huanyu-aqa] reward=rule_based (character bigram Dice against ground_truth; no model/API)"
 fi
@@ -264,6 +265,8 @@ exec bash "${_HUANYU_BACKEND}" "${_huanyu_backend_defaults[@]}" "$@" \
     actor_rollout_ref.model.model_stage=thinker \
     actor_rollout_ref.model.lora_rank=0 \
     "++actor_rollout_ref.model.override_config.huanyu_freeze_audio=${HUANYU_FREEZE_AUDIO}" \
+    "++actor_rollout_ref.model.override_config.huanyu_train_audio_encoder=${HUANYU_TRAIN_AUDIO_ENCODER}" \
+    "++actor_rollout_ref.model.override_config.huanyu_train_audio_projector=${HUANYU_TRAIN_AUDIO_PROJECTOR}" \
     actor_rollout_ref.model.use_remove_padding=false \
     actor_rollout_ref.model.enable_gradient_checkpointing=true \
     actor_rollout_ref.model.enable_activation_offload=false \

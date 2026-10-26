@@ -58,12 +58,44 @@ class AudioTrainingConfigTests(unittest.TestCase):
     def test_options_are_booleans_not_truthy_strings_or_numbers(self):
         for resolver, option in (
             (training.resolve_freeze_audio, "huanyu_freeze_audio"),
+            (training.resolve_audio_train_components, "huanyu_train_audio_encoder"),
+            (training.resolve_audio_train_components, "huanyu_train_audio_projector"),
             (training.resolve_audio_checkpointing, "huanyu_audio_gradient_checkpointing"),
         ):
             for value in ("false", "true", 0, 1, None):
                 with self.subTest(option=option, value=value):
                     with self.assertRaisesRegex(ValueError, "must be a boolean"):
                         resolver(SimpleNamespace(override_config={option: value}))
+
+    def test_component_flags_override_legacy_and_checkpoint_modes_independently(self):
+        self.assertEqual(training.resolve_audio_train_components(SimpleNamespace()), (False, False))
+        checkpoint = {"huanyu_freeze_audio": False,
+                      "huanyu_train_audio_encoder": False, "huanyu_train_audio_projector": True}
+        self.assertEqual(training.resolve_audio_train_components({"hf_config": checkpoint}), (False, True))
+        for frozen in (False, True):
+            with self.subTest(frozen=frozen):
+                config = {"hf_config": checkpoint, "override_config": {"huanyu_freeze_audio": frozen}}
+                self.assertEqual(training.resolve_audio_train_components(config), (not frozen, not frozen))
+                config["override_config"]["huanyu_train_audio_encoder"] = frozen
+                self.assertEqual(training.resolve_audio_train_components(config), (frozen, not frozen))
+        self.assertEqual(training.resolve_audio_train_components({
+            "hf_config": checkpoint, "override_config": {"huanyu_train_audio_projector": False},
+        }), (False, False))
+
+    def test_each_trainable_component_rejects_embedding_cache(self):
+        for encoder, projector in ((True, True), (True, False), (False, True), (False, False)):
+            config = {"override_config": {
+                "huanyu_train_audio_encoder": encoder, "huanyu_train_audio_projector": projector,
+            }}
+            with self.subTest(encoder=encoder, projector=projector):
+                self.assertEqual(training.resolve_freeze_audio(config), not (encoder or projector))
+                for flag in ("HUANYU_USE_PRECOMPUTE", "MINICPMO_USE_PRECOMPUTE"):
+                    with patch.dict(os.environ, {flag: "1"}):
+                        if encoder or projector:
+                            with self.assertRaisesRegex(ValueError, "precomputed embeddings cannot train audio"):
+                                training.validate_audio_mode(config)
+                        else:
+                            self.assertTrue(training.validate_audio_mode(config))
 
     def test_chunk_checkpointing_defaults_true_and_can_be_disabled(self):
         self.assertTrue(training.resolve_audio_checkpointing(SimpleNamespace()))
@@ -109,9 +141,10 @@ class AudioTrainingGradientTests(unittest.TestCase):
         self.features = torch.randn(3, 4, 24)
         self.lengths = torch.tensor([16, 9, 24])
 
-    def configure(self, *, checkpoint_chunks=False, model=None):
+    def configure(self, *, checkpoint_chunks=False, model=None, train_encoder=True, train_projector=True):
         model = self.module if model is None else model
-        training.configure_trainable_audio(model, checkpoint_chunks=checkpoint_chunks)
+        training.configure_trainable_audio(model, checkpoint_chunks=checkpoint_chunks,
+                                           train_encoder=train_encoder, train_projector=train_projector)
         return model
 
     def assert_audio_gradients(self, model):
@@ -168,6 +201,66 @@ class AudioTrainingGradientTests(unittest.TestCase):
         for prefix in ("model.audio_encoder.", "model.audio_projection."):
             self.assertTrue(any(not torch.equal(value, before[key])
                                 for key, value in parameters.items() if key.startswith(prefix)), prefix)
+
+    def test_independent_component_modes_update_only_selected_parameters(self):
+        for encoder, projector in ((True, True), (True, False), (False, True), (False, False)):
+            for checkpoint_chunks in (False, True):
+                with self.subTest(encoder=encoder, projector=projector, checkpoint=checkpoint_chunks):
+                    model = copy.deepcopy(self.module)
+                    with self.assertLogs(training.logger, level="INFO") as configured:
+                        self.configure(model=model, train_encoder=encoder, train_projector=projector,
+                                       checkpoint_chunks=checkpoint_chunks)
+                    message = "\n".join(configured.output)
+                    for name, enabled in (("audio_encoder", encoder), ("audio_projection", projector)):
+                        self.assertIn(f"configured component={name} trainable={enabled}", message)
+                        if not enabled:
+                            self.assertIn(f"component={name} trainable=False trainable_params=0", message)
+                    any_train = encoder or projector
+                    kwargs = (dict(encode_audio=training.encode_trainable_huanyu_audio, require_audio_only=True)
+                              if any_train else {})
+                    forward.install_huanyu_forward(model, start_token_id=2, end_token_id=3,
+                                                   placeholder_token_id=4, **kwargs)
+                    parameters = dict(model.named_parameters())
+                    before = {name: value.detach().clone() for name, value in parameters.items()}
+                    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+                    # Simulate the trainer setting the parent back into train
+                    # mode; frozen components must return to eval on forward.
+                    model.train()
+                    output = model(
+                        torch.tensor([[9, 2, 4, 4, 3, 2, 4, 3]]),
+                        huanyu_audio_features=[self.features[0, :, :16], self.features[1, :, :9]],
+                        huanyu_audio_lengths=[16, 9], huanyu_audio_chunk_counts=[2],
+                    )
+                    if any_train:
+                        with self.assertLogs(training.logger, level="INFO") as backward:
+                            output.float().square().sum().backward()
+                        backward_messages = "\n".join(backward.output)
+                        for name, enabled in (("audio_encoder", encoder), ("audio_projection", projector)):
+                            self.assertEqual(f"backward component={name}" in backward_messages, enabled)
+                    else:
+                        output.float().square().sum().backward()
+                    optimizer.step()
+                    for name, enabled in (("audio_encoder", encoder), ("audio_projection", projector)):
+                        part = getattr(model.model, name)
+                        self.assertEqual(part.training, enabled)
+                        self.assertTrue(all(p.requires_grad == enabled for p in part.parameters()))
+                        selected = {k: p for k, p in parameters.items() if k.startswith(f"model.{name}.")}
+                        if enabled:
+                            self.assertTrue(all(p.grad is not None and torch.isfinite(p.grad).all()
+                                                for p in selected.values()))
+                            self.assertGreater(sum(p.grad.abs().sum().item() for p in selected.values()), 0)
+                            self.assertTrue(any(not torch.equal(p, before[k]) for k, p in selected.items()))
+                        else:
+                            self.assertTrue(all(p.grad is None for p in selected.values()))
+                            for key, parameter in selected.items():
+                                torch.testing.assert_close(parameter, before[key], rtol=0, atol=0)
+                    if any_train:
+                        model.requires_grad_(False).eval()
+                        with torch.no_grad():
+                            rows = training.encode_trainable_huanyu_audio(model, self.features, self.lengths)
+                        self.assertTrue(all(not row.requires_grad for row in rows))
+                        self.assertFalse(model.model.audio_encoder.training)
+                        self.assertFalse(model.model.audio_projection.training)
 
     def test_training_evidence_is_visible_once_under_warning_root(self):
         # Capture the real console handler, without assertLogs changing levels.

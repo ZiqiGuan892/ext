@@ -31,7 +31,30 @@ def _option(model_config, name, default):
 
 def resolve_freeze_audio(model_config):
     """Public model override; environment variables never silently unfreeze."""
-    return _option(model_config, "huanyu_freeze_audio", True)
+    return not any(resolve_audio_train_components(model_config))
+
+
+def resolve_audio_train_components(model_config):
+    """Resolve independent flags while retaining legacy checkpoint/CLI behavior.
+
+    An explicit legacy override resets both checkpoint component defaults; an
+    explicit component override then wins for that component. Environment
+    variables are transported by the launcher as HF overrides, never read here.
+    """
+    missing = object()
+    overrides = _get(model_config, "override_config", {})
+    legacy_override = _get(overrides, "huanyu_freeze_audio", missing)
+    legacy_train = not _option(model_config, "huanyu_freeze_audio", True)
+    result = []
+    for name in ("huanyu_train_audio_encoder", "huanyu_train_audio_projector"):
+        value = _get(overrides, name, missing)
+        if value is missing:
+            value = (legacy_train if legacy_override is not missing else
+                     _get(_get(model_config, "hf_config"), name, legacy_train))
+        if not isinstance(value, bool):
+            raise ValueError(f"{name} must be a boolean, got {value!r}")
+        result.append(value)
+    return tuple(result)
 
 
 def resolve_audio_checkpointing(model_config):
@@ -64,32 +87,44 @@ def _assert_root_owned(part):
         raise RuntimeError("Huanyu audio parameters are still sharded; encode inside the outer FSDP forward")
 
 
-def configure_trainable_audio(module, checkpoint_chunks=True):
+def configure_trainable_audio(module, checkpoint_chunks=True, *, train_encoder=True, train_projector=True):
     """Run before optimizer construction and FSDP wrapping."""
+    if not isinstance(train_encoder, bool) or not isinstance(train_projector, bool):
+        raise ValueError("Huanyu audio component training flags must be booleans")
     model = module.model
     if getattr(model, "_huanyu_audio_runtime", None) is None:
         raise RuntimeError("Attach native Huanyu audio modules before configuring training")
     wrap_names = set(getattr(module, "_no_split_modules", ()) or ())
-    for name in ("audio_encoder", "audio_projection"):
+    modes = {"audio_encoder": train_encoder, "audio_projection": train_projector}
+    for name, train in modes.items():
         part = getattr(model, name)
         _assert_root_owned(part)
         for child_name, child in part.named_modules():
-            if (type(child).__name__ in wrap_names or isinstance(child, torch.nn.Embedding)
+            if any(modes.values()) and (type(child).__name__ in wrap_names or isinstance(child, torch.nn.Embedding)
                     or child_name.rsplit(".", 1)[-1] in ("embed_tokens", "lm_head")):
                 raise ValueError(
                     f"{name}.{child_name} would be independently FSDP-wrapped; "
                     "remove audio classes from the wrap policy (retain language decoder wrapping)"
                 )
-        part.requires_grad_(True)
-        part.train(module.training)
+        part.requires_grad_(train)
+        part.train(module.training and train)
         part._huanyu_train_component = name
+        logger.info("[huanyu-audio-train] configured component=%s trainable=%s trainable_params=%s "
+                    "total_params=%s module_training=%s",
+                    name, any(p.requires_grad for p in part.parameters()),
+                    sum(p.numel() for p in part.parameters() if p.requires_grad),
+                    sum(p.numel() for p in part.parameters()), part.training)
     model._huanyu_audio_runtime["checkpoint_chunks"] = bool(checkpoint_chunks)
-    model._huanyu_audio_runtime["trainable"] = True
+    model._huanyu_audio_runtime["trainable"] = any(modes.values())
+    model._huanyu_audio_runtime["train_encoder"] = train_encoder
+    model._huanyu_audio_runtime["train_projector"] = train_projector
     counts = {name: sum(p.numel() for p in getattr(model, name).parameters())
               for name in ("audio_encoder", "audio_projection")}
-    logger.info("[huanyu-audio-train] enabled encoder_params=%s projector_params=%s "
-                "ownership=fsdp_root checkpoint_chunks=%s cache=off",
-                counts["audio_encoder"], counts["audio_projection"], checkpoint_chunks)
+    if any(modes.values()):
+        logger.info("[huanyu-audio-train] enabled encoder_params=%s projector_params=%s "
+                    "train_encoder=%s train_projector=%s ownership=fsdp_root checkpoint_chunks=%s cache=off",
+                    counts["audio_encoder"], counts["audio_projection"],
+                    train_encoder, train_projector, checkpoint_chunks)
 
 
 def _trainable_bf16_call(part, *args):
@@ -122,9 +157,12 @@ def _encode_chunk(module, features, lengths):
     runtime = model._huanyu_audio_runtime
     device = next(encoder.parameters()).device
     with torch.autocast(device_type=device.type, enabled=False):
-        encoded, _ = _trainable_bf16_call(encoder, features, lengths)
-        if torch.is_grad_enabled() and not encoded.requires_grad:
+        with torch.set_grad_enabled(torch.is_grad_enabled() and runtime["train_encoder"]):
+            encoded, _ = _trainable_bf16_call(encoder, features, lengths)
+        if torch.is_grad_enabled() and runtime["train_encoder"] and not encoded.requires_grad:
             raise RuntimeError("Huanyu native encoder detached its output; encoder training is impossible")
+        # A frozen projector must still differentiate its input when the
+        # encoder trains. Do not put this projection under no_grad().
         projected, valid = runtime["fold"](
             encoded, lengths, lambda values: _trainable_bf16_call(projector, values),
             enc_downsample=encoder.fwd_downsample, downsample_rate=runtime["downsample_rate"],
@@ -156,12 +194,11 @@ def encode_trainable_huanyu_audio(module, features, lengths):
     if features.shape[1] != runtime["input_features"]:
         raise ValueError(f"Huanyu fbank mismatch: expected {runtime['input_features']}, got {features.shape[1]}")
     encoder, projector = module.model.audio_encoder, module.model.audio_projection
-    for part in (encoder, projector):
+    for part, train in ((encoder, runtime["train_encoder"]), (projector, runtime["train_projector"])):
         _assert_root_owned(part)
-        part.train(module.training)
-    if torch.is_grad_enabled() and any(not p.requires_grad for part in (encoder, projector)
-                                      for p in part.parameters()):
-        raise RuntimeError("Huanyu trainable audio parameters were frozen after adapter configuration")
+        part.train(module.training and train)
+        if torch.is_grad_enabled() and any(p.requires_grad != train for p in part.parameters()):
+            raise RuntimeError("Huanyu audio trainability changed or trainable parameters were frozen after adapter configuration")
     device = next(encoder.parameters()).device
     outputs = []
     # Lengths are metadata. Moving them to a Python list does not detach features
@@ -178,14 +215,16 @@ def encode_trainable_huanyu_audio(module, features, lengths):
         else:
             output = _encode_chunk(module, chunk, real_length)
         if torch.is_grad_enabled() and not output.requires_grad:
-            raise RuntimeError("Huanyu native audio forward detached its output; encoder training is impossible")
+            raise RuntimeError("Huanyu native audio forward detached its output; audio training is impossible")
         outputs.append(output)
     mode = "grad" if torch.is_grad_enabled() else "no_grad"
     marker = f"_logged_{mode}"
     if not runtime.get(marker):
         logger.info("[huanyu-audio-train] forward mode=%s chunks=%s frames=%s "
-                    "output_requires_grad=%s ownership=fsdp_root",
+                    "output_requires_grad=%s encoder_requires_grad=%s projector_requires_grad=%s ownership=fsdp_root",
                     mode, len(outputs), lengths.tolist()[:8],
-                    any(x.requires_grad for x in outputs))
+                    any(x.requires_grad for x in outputs),
+                    any(p.requires_grad for p in encoder.parameters()),
+                    any(p.requires_grad for p in projector.parameters()))
         runtime[marker] = True
     return outputs

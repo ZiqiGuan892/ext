@@ -75,6 +75,7 @@ class HuanyuJobLauncherTests(unittest.TestCase):
         self.entry = self.examples / LAUNCHER.name
         shutil.copyfile(LAUNCHER, self.entry)
         shutil.copyfile(EXAMPLES / "precision_mode.sh", self.examples / "precision_mode.sh")
+        shutil.copyfile(EXAMPLES / "audio_train_mode.sh", self.examples / "audio_train_mode.sh")
         shutil.copyfile(EXAMPLES / "check_native_runtime.py", self.examples / "check_native_runtime.py")
         self.package = self.project / "verl_omni_ext/models/qwen3_6_huanyu"
         self.package.mkdir(parents=True)
@@ -112,6 +113,7 @@ elif operation not in ("sync", "check-devices"):
 record("train", sys.argv[1:])
 keys = (
     "HUANYU_USE_PRECOMPUTE", "HUANYU_EMBED_CACHE_DIR", "HUANYU_FREEZE_AUDIO",
+    "HUANYU_TRAIN_AUDIO_ENCODER", "HUANYU_TRAIN_AUDIO_PROJECTOR",
     "HUANYU_AQA_AUDIO_TRAIN", "MINICPMO_USE_PRECOMPUTE", "MINICPMO_TUNE_AUDIO",
     "MINICPMO_TUNE_VISION", "WANDB_MODE", "HUANYU_TEST_ENV_SOURCED",
     "NNODES", "NUM_NPUS", "REWARD_POOL_NPUS", "RM_ENABLE", "RAY_ADDRESS", "LD_PRELOAD",
@@ -591,16 +593,23 @@ if command not in ("ray", "git", "pip", "flock", "env-source"):
 
     def test_cache_and_freeze_settings_reach_training_and_ray_runtime_environment(self):
         result = self.run_launcher(
-            {"HUANYU_FREEZE_AUDIO": "false", "MINICPMO_TUNE_AUDIO": "1"},
-            arguments=("++actor_rollout_ref.model.override_config.huanyu_freeze_audio=false",),
+            {"HUANYU_FREEZE_AUDIO": "false", "MINICPMO_TUNE_AUDIO": "1",
+             "HUANYU_TRAIN_AUDIO_ENCODER": "true", "HUANYU_TRAIN_AUDIO_PROJECTOR": "true"},
+            arguments=("++actor_rollout_ref.model.override_config.huanyu_freeze_audio=false",
+                       "++actor_rollout_ref.model.override_config.huanyu_train_audio_encoder=true",
+                       "++actor_rollout_ref.model.override_config.huanyu_train_audio_projector=true"),
         )
         self.assert_success(result)
         capture = json.loads(self.capture_file.read_text())
         actual = dict(arg.lstrip("+").split("=", 1) for arg in capture["argv"])
         self.assertEqual(actual["actor_rollout_ref.model.override_config.huanyu_freeze_audio"], "true")
+        self.assertEqual(actual["actor_rollout_ref.model.override_config.huanyu_train_audio_encoder"], "false")
+        self.assertEqual(actual["actor_rollout_ref.model.override_config.huanyu_train_audio_projector"], "false")
         for key, expected in {
             "HUANYU_USE_PRECOMPUTE": "1",
             "HUANYU_FREEZE_AUDIO": "true",
+            "HUANYU_TRAIN_AUDIO_ENCODER": "false",
+            "HUANYU_TRAIN_AUDIO_PROJECTOR": "false",
             # Git Bash translates this environment path for the native Python stub.
             "HUANYU_EMBED_CACHE_DIR": self.cache.as_posix(),
             "HUANYU_AQA_AUDIO_TRAIN": "0",

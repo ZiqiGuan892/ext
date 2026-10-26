@@ -98,6 +98,7 @@ class Qwen36HuanyuThinkerAdapter(OmniModelBase):
             configure_trainable_audio,
             encode_trainable_huanyu_audio,
             resolve_audio_checkpointing,
+            resolve_audio_train_components,
             validate_audio_mode,
         )
         from .entropy import install_huanyu_entropy_chunking
@@ -111,6 +112,7 @@ class Qwen36HuanyuThinkerAdapter(OmniModelBase):
         if _value(model_config, "use_remove_padding", True):
             raise ValueError("Huanyu initial training integration requires actor_rollout_ref.model.use_remove_padding=false")
         freeze_audio = validate_audio_mode(model_config)
+        train_encoder, train_projector = resolve_audio_train_components(model_config)
         if os.environ.get("MINICPMO_USE_PRECOMPUTE", "0") == "1":
             raise ValueError("Set MINICPMO_USE_PRECOMPUTE=0 for Huanyu: Whisper caches are not compatible; use online encoding")
         use_cache = os.environ.get("HUANYU_USE_PRECOMPUTE", "0") == "1"
@@ -140,16 +142,15 @@ class Qwen36HuanyuThinkerAdapter(OmniModelBase):
         # Save the explicit mode in future checkpoints as well as the resolved
         # runtime config. Optimizer construction happens after this adapter.
         module.config.huanyu_freeze_audio = freeze_audio
+        module.config.huanyu_train_audio_encoder = train_encoder
+        module.config.huanyu_train_audio_projector = train_projector
+        configure_trainable_audio(module, checkpoint_chunks=resolve_audio_checkpointing(model_config),
+                                  train_encoder=train_encoder, train_projector=train_projector)
         cache_args = {}
         if use_cache:
             cache_args = dict(use_precompute=True, image_token_id=_value(module.config, "image_token_id"),
                               spatial_merge_size=_value(vision_config, "spatial_merge_size", 2))
-        if freeze_audio:
-            for child in (module.model.audio_encoder, module.model.audio_projection):
-                child.requires_grad_(False)
-                child.eval()
-        else:
-            configure_trainable_audio(module, checkpoint_chunks=resolve_audio_checkpointing(model_config))
+        if not freeze_audio:
             cache_args = dict(encode_audio=encode_trainable_huanyu_audio, require_audio_only=True)
         install_huanyu_actor_precision(module)
         install_huanyu_forward(module, **token_ids, **cache_args)
@@ -166,6 +167,8 @@ class Qwen36HuanyuThinkerAdapter(OmniModelBase):
             from .microbatch_sync import install_huanyu_microbatch_sync
 
             install_huanyu_microbatch_sync(module)
-        logger.info("Huanyu training adapter selected: alias=%s, HF architecture=%s, huanyu_freeze_audio=%s, cache=%s",
-                    TRAINING_ARCHITECTURE, module.config.architectures, freeze_audio, "strict" if use_cache else "off")
+        logger.info("Huanyu training adapter selected: alias=%s, HF architecture=%s, huanyu_freeze_audio=%s, "
+                    "train_encoder=%s, train_projector=%s, cache=%s",
+                    TRAINING_ARCHITECTURE, module.config.architectures, freeze_audio,
+                    train_encoder, train_projector, "strict" if use_cache else "off")
         return module

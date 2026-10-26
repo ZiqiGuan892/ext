@@ -148,6 +148,7 @@ class AudioTrainingLauncherTests(unittest.TestCase):
             "check_native_runtime.py",
             "run_output.sh",
             "precision_mode.sh",
+            "audio_train_mode.sh",
         ):
             shutil.copyfile(EXAMPLES / name, self.examples / name)
         self.model = self.project / "verl_omni_ext" / "models" / "qwen3_6_huanyu"
@@ -303,6 +304,47 @@ class AudioTrainingLauncherTests(unittest.TestCase):
         self.assertEqual(capture["env"]["MINICPMO_TUNE_AUDIO"], "0")
         self.assertEqual(capture["env"]["HUANYU_USE_PRECOMPUTE"], "0")
         self.assertEqual(actual["trainer.total_training_steps"], "null")
+        for component in ("ENCODER", "PROJECTOR"):
+            self.assertEqual(capture["env"]["HUANYU_TRAIN_AUDIO_" + component], "false")
+            self.assertEqual(actual["actor_rollout_ref.model.override_config.huanyu_train_audio_" + component.lower()], "false")
+
+    def test_independent_component_modes_reach_model_and_ray_despite_stale_cli(self):
+        for encoder, projector in (("true", "true"), ("false", "true"), ("true", "false"), ("false", "false")):
+            with self.subTest(encoder=encoder, projector=projector):
+                mode = {"HUANYU_TRAIN_AUDIO_ENCODER": encoder, "HUANYU_TRAIN_AUDIO_PROJECTOR": projector}
+                result = self.run_script(mode, (
+                    "++actor_rollout_ref.model.override_config.huanyu_train_audio_encoder=true",
+                    "++actor_rollout_ref.model.override_config.huanyu_train_audio_projector=false",
+                    "++actor_rollout_ref.model.override_config.huanyu_freeze_audio=true",
+                    '++ray_kwargs.ray_init.runtime_env.env_vars.HUANYU_TRAIN_AUDIO_ENCODER="true"',
+                    '++ray_kwargs.ray_init.runtime_env.env_vars.HUANYU_TRAIN_AUDIO_PROJECTOR="false"',
+                ))
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                capture = json.loads(self.capture.read_text())
+                actual = dict(item.lstrip("+").split("=", 1) for item in capture["argv"])
+                train_any = "true" in (encoder, projector)
+                expected = dict(mode, HUANYU_FREEZE_AUDIO="false" if train_any else "true",
+                                MINICPMO_TUNE_AUDIO="1" if train_any else "0")
+                native = json.loads(self.native_capture.read_text())
+                for key, value in expected.items():
+                    self.assertEqual(capture["env"][key], value, key)
+                    self.assertEqual(native[key], value, key)
+                    self.assertEqual(json.loads(actual["ray_kwargs.ray_init.runtime_env.env_vars." + key]), value, key)
+                for component, value in (("encoder", encoder), ("projector", projector)):
+                    self.assertEqual(actual["actor_rollout_ref.model.override_config.huanyu_train_audio_" + component], value)
+                    self.assertIn(f"train_audio_{component}={value}", result.stdout)
+                self.assertEqual(actual["actor_rollout_ref.model.override_config.huanyu_freeze_audio"], expected["HUANYU_FREEZE_AUDIO"])
+                self.assertEqual(capture["env"]["HUANYU_USE_PRECOMPUTE"], "0")
+
+    def test_single_component_override_preserves_legacy_default_for_other_component(self):
+        result = self.run_script({"HUANYU_FREEZE_AUDIO": "true", "HUANYU_TRAIN_AUDIO_ENCODER": "true"})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        capture = json.loads(self.capture.read_text())
+        actual = dict(item.lstrip("+").split("=", 1) for item in capture["argv"])
+        self.assertEqual(actual["actor_rollout_ref.model.override_config.huanyu_train_audio_encoder"], "true")
+        self.assertEqual(actual["actor_rollout_ref.model.override_config.huanyu_train_audio_projector"], "false")
+        self.assertEqual(actual["actor_rollout_ref.model.override_config.huanyu_freeze_audio"], "false")
+        self.assertEqual(capture["env"]["MINICPMO_TUNE_AUDIO"], "1")
 
     def test_run_outputs_are_unique_and_override_inherited_genrm_path(self):
         previous_logs = {}
@@ -470,6 +512,8 @@ class AudioTrainingLauncherTests(unittest.TestCase):
             ({"TRAIN_BATCH_SIZE": "6"}, "train_batch"),
             ({"DEBUG_MODE": "1"}, "TOTAL_TRAINING_STEPS=2"),
             ({"HUANYU_FREEZE_AUDIO": "maybe"}, "must be true or false"),
+            ({"HUANYU_TRAIN_AUDIO_ENCODER": "yes"}, "HUANYU_TRAIN_AUDIO_ENCODER"),
+            ({"HUANYU_TRAIN_AUDIO_PROJECTOR": "0"}, "HUANYU_TRAIN_AUDIO_PROJECTOR"),
             ({"RM_ENABLE": "maybe"}, "RM_ENABLE must be 0 or 1"),
         ):
             with self.subTest(updates=updates):

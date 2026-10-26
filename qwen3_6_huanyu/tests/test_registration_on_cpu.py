@@ -200,11 +200,29 @@ class RegistrationTests(unittest.TestCase):
 
     def test_hf_config_unfreeze_and_explicit_refreeze_override(self):
         self.model.config.huanyu_freeze_audio = False
+        self.model.config.huanyu_train_audio_encoder = True
+        self.model.config.huanyu_train_audio_projector = True
         self.config.override_config = {"huanyu_freeze_audio": True}
         self.adapter.configure_model(self.model, self.config)
         self.assertTrue(self.model.config.huanyu_freeze_audio)
         self.assertTrue(all(not p.requires_grad for p in self.model.model.audio_encoder.parameters()))
         self.assertNotIn("encode_audio", self.install_forward.call_args.kwargs)
+
+    def test_component_overrides_select_forward_and_persist_checkpoint_trainability(self):
+        for encoder, projector in ((True, True), (True, False), (False, True), (False, False)):
+            with self.subTest(encoder=encoder, projector=projector):
+                self.config.override_config = {
+                    "huanyu_train_audio_encoder": encoder, "huanyu_train_audio_projector": projector,
+                }
+                self.adapter.configure_model(self.model, self.config)
+                self.assertEqual(self.model.config.huanyu_train_audio_encoder, encoder)
+                self.assertEqual(self.model.config.huanyu_train_audio_projector, projector)
+                self.assertEqual(self.model.config.huanyu_freeze_audio, not (encoder or projector))
+                self.assertEqual("encode_audio" in self.install_forward.call_args.kwargs, encoder or projector)
+                for name, enabled in (("audio_encoder", encoder), ("audio_projection", projector)):
+                    part = getattr(self.model.model, name)
+                    self.assertEqual(part.training, enabled)
+                    self.assertTrue(all(p.requires_grad == enabled for p in part.parameters()))
 
     def test_cached_vision_cannot_be_tuned_or_require_deepstack(self):
         self.model.config.vision_config = SimpleNamespace(deepstack_visual_indexes=[1])
