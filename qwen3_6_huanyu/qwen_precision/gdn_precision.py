@@ -5,6 +5,7 @@ whole cache: doing so rounds even slots belonging to unrelated requests on
 every decode step. This implements the recurrent delta rule used by the HF
 Qwen3.5 model, gathering and updating only the requested slots.
 """
+import inspect
 import os
 from contextvars import ContextVar
 from functools import wraps
@@ -229,6 +230,110 @@ def install_l2norm_reference():
     return True
 
 
+def _prefill_core(attention):
+    """Inspect through the known legacy barrier without removing it at runtime.
+
+    Whisper's barrier predates functools.wraps: its saved bound method lives in
+    the `original` closure, so inspect.unwrap alone stops at that wrapper. Do
+    not search arbitrary closures or guess an owner from an imported class.
+    """
+    current = getattr(attention, "_forward_core", None)
+    seen, legacy_wrappers = set(), []
+    while True:
+        try:
+            current = inspect.unwrap(current)
+        except ValueError as exc:
+            raise RuntimeError("Huanyu GDN _forward_core wrapper cycle") from exc
+        function = getattr(current, "__func__", current)
+        if id(function) in seen:
+            raise RuntimeError("Huanyu GDN _forward_core wrapper cycle")
+        seen.add(id(function))
+        code = getattr(function, "__code__", None)
+        if (code is None
+                or not code.co_filename.replace("\\", "/").endswith("/qwen3_6_whisper/gdn_precision.py")
+                or function.__qualname__ != "install_mixed_cache_barrier.<locals>.wrap.<locals>.core"):
+            return function, ",".join(legacy_wrappers) or "none"
+        cells = dict(zip(code.co_freevars, function.__closure__ or ()))
+        try:
+            original = cells["original"].cell_contents
+        except (KeyError, ValueError) as exc:
+            raise RuntimeError("Whisper GDN cache barrier has no saved original method") from exc
+        if not inspect.ismethod(original) or original.__self__ is not attention:
+            raise RuntimeError("Whisper GDN cache barrier original is not bound to the selected Huanyu layer")
+        legacy_wrappers.append("whisper_mixed_cache_barrier")
+        current = original
+
+
+def _prefill_target(attention):
+    """Find the dispatch owner, including Ascend methods copied onto Qwen layers.
+
+    Ascend's _forward_core calls the class helpers by name, not through self.
+    The upstream instance need not inherit those helpers at all.
+    """
+    core, legacy_wrappers = _prefill_core(attention)
+    code = getattr(core, "__code__", None)
+    names = code.co_names if code is not None else ()
+    owner_name = "AscendGatedDeltaNetAttention"
+    if owner_name in names and "_chunk_gated_delta_rule_fused" in names:
+        owner = core.__globals__.get(owner_name)
+        descriptor = inspect.getattr_static(owner, "_probe_fused_chunk", None)
+        if (not isinstance(owner, type)
+                or not callable(getattr(owner, "_chunk_gated_delta_rule_fused", None))
+                or "_probe_fused_chunk" not in names
+                or not isinstance(descriptor, (classmethod, staticmethod))
+                or not callable(getattr(owner, "_probe_fused_chunk", None))):
+            raise RuntimeError(
+                "Huanyu GDN prefill requires callable Ascend class prefill/probe helpers; "
+                f"layer={type(attention).__module__}.{type(attention).__qualname__} "
+                f"core={code.co_filename}"
+            )
+        return "ascend_class", owner, code.co_filename, legacy_wrappers
+    if callable(getattr(attention, "_chunk_gated_delta_rule_fused", None)):
+        return "instance", attention, code.co_filename if code is not None else "unknown", legacy_wrappers
+    raise RuntimeError(
+        "Huanyu GDN prefill reference requires _chunk_gated_delta_rule_fused on "
+        "the instance or the Ascend class used by _forward_core; "
+        f"layer={type(attention).__module__}.{type(attention).__qualname__} "
+        f"core={code.co_filename if code is not None else 'unavailable'}"
+    )
+
+
+def _run_reference_prefill(*args, **kwargs):
+    result = reference_prefill(*args, **kwargs)
+    _executed("gdn_prefill", output_dtype=result[0].dtype, state_dtype=result[1].dtype,
+              output_shape=tuple(result[0].shape), autocast=False)
+    return result
+
+
+def _bind_class_prefill(owner):
+    original = owner._chunk_gated_delta_rule_fused
+    original_probe = inspect.getattr_static(owner, "_probe_fused_chunk")
+    changed = False
+    if getattr(original, "_huanyu_reference_prefill", False) is not True:
+        @wraps(original)
+        def prefill(*args, **kwargs):
+            if _policy_prefill.get():
+                return _run_reference_prefill(*args, **kwargs)
+            return original(*args, **kwargs)
+
+        prefill._huanyu_reference_prefill = True
+        owner._chunk_gated_delta_rule_fused = staticmethod(prefill)
+        changed = True
+    if getattr(original_probe.__func__, "_huanyu_reference_probe", False) is not True:
+        @wraps(original_probe.__func__)
+        def probe(cls, *args, **kwargs):
+            # The torch reference does not require the CANN fused operator.
+            # Do not change the shared availability cache used by other models.
+            if _policy_prefill.get():
+                return True
+            return original_probe.__get__(None, cls)(*args, **kwargs)
+
+        probe._huanyu_reference_probe = True
+        owner._probe_fused_chunk = classmethod(probe)
+        changed = True
+    return changed
+
+
 def install_reference_prefill(native):
     """Bind reference calls to explicit Huanyu layers, independently of Whisper.
 
@@ -242,11 +347,12 @@ def install_reference_prefill(native):
             _status(f"gdn_{name}", "disabled")
         return False
     modules = _attention_modules(native)
+    targets = []
     for module in modules:
         if not callable(getattr(module, "forward", None)):
             raise RuntimeError("Huanyu GDN reference requires attention.forward")
-        if flags["prefill"] and not callable(getattr(module, "_chunk_gated_delta_rule_fused", None)):
-            raise RuntimeError("Huanyu GDN prefill reference requires _chunk_gated_delta_rule_fused")
+        if flags["prefill"]:
+            targets.append(_prefill_target(module))
     if flags["prefill"]:
         from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import torch_chunk_gated_delta_rule
         if not callable(torch_chunk_gated_delta_rule):
@@ -256,8 +362,8 @@ def install_reference_prefill(native):
     install_l2norm_reference()
     new_scope = new_prefill = 0
 
-    def scope(module):
-        original = module.forward
+    def scope(module, name):
+        original = getattr(module, name)
 
         @wraps(original)
         def forward(self, *args, **kwargs):
@@ -268,29 +374,43 @@ def install_reference_prefill(native):
                 _policy_prefill.reset(token)
 
         forward._huanyu_gdn_scope = True
-        module.forward = MethodType(forward, module)
+        setattr(module, name, MethodType(forward, module))
 
     def bind_prefill(module):
         def prefill(*args, **kwargs):
-            result = reference_prefill(*args, **kwargs)
-            _executed("gdn_prefill", output_dtype=result[0].dtype, state_dtype=result[1].dtype,
-                      output_shape=tuple(result[0].shape), autocast=False)
-            return result
+            return _run_reference_prefill(*args, **kwargs)
         prefill._huanyu_reference_prefill = True
         # Native's API is static. A function stored on the instance stays unbound.
         module._chunk_gated_delta_rule_fused = prefill
         module._fused_chunk_available = True
 
     for module in modules:
-        if getattr(module.forward, "_huanyu_gdn_scope", False) is not True:
-            scope(module)
-            new_scope += 1
-        if flags["prefill"] and getattr(module._chunk_gated_delta_rule_fused, "_huanyu_reference_prefill", False) is not True:
-            bind_prefill(module)
-            new_prefill += 1
-    _status("gdn_scope", "installed" if new_scope else "already_installed", new=new_scope, total=len(modules))
+        # Custom attention operators can enter _forward_core directly.
+        for name in ("forward", "_forward_core"):
+            method = getattr(module, name, None)
+            if callable(method) and getattr(method, "_huanyu_gdn_scope", False) is not True:
+                scope(module, name)
+                new_scope += 1
+    seen = set()
+    for dispatch, target, source, legacy_wrappers in targets:
+        if id(target) in seen:
+            continue
+        seen.add(id(target))
+        if dispatch == "ascend_class":
+            changed = _bind_class_prefill(target)
+            owner = f"{target.__module__}.{target.__qualname__}"
+        else:
+            changed = getattr(target._chunk_gated_delta_rule_fused, "_huanyu_reference_prefill", False) is not True
+            if changed:
+                bind_prefill(target)
+            owner = f"{type(target).__module__}.{type(target).__qualname__}"
+        new_prefill += int(changed)
+        _status("gdn_prefill_binding", "installed" if changed else "already_installed",
+                dispatch=dispatch, owner=owner, source=source, wrappers=legacy_wrappers, scope="huanyu")
+    _status("gdn_scope", "installed" if new_scope else "already_installed",
+            new_methods=new_scope, layers=len(modules))
     _status("gdn_prefill", ("installed" if new_prefill else "already_installed") if flags["prefill"] else "disabled",
-            new=new_prefill, total=len(modules))
+            new_targets=new_prefill, layers=len(modules))
     return True
 
 

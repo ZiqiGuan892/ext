@@ -9,7 +9,7 @@ import os
 from contextlib import redirect_stdout
 from pathlib import Path
 import sys
-from types import ModuleType, SimpleNamespace
+from types import MethodType, ModuleType, SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
@@ -56,6 +56,54 @@ class Attention:
 def native(attention):
     return SimpleNamespace(llm=SimpleNamespace(model=SimpleNamespace(
         layers=[SimpleNamespace(linear_attn=attention)])))
+
+
+def class_dispatch_attention(ascend_module):
+    """Model Ascend copying core methods, but not static helpers, onto Qwen."""
+    exec(compile('''
+class AscendGatedDeltaNetAttention:
+    _fused_chunk_available = False
+    probe_calls = 0
+
+    @classmethod
+    def _probe_fused_chunk(cls):
+        cls.probe_calls += 1
+        return cls._fused_chunk_available
+
+    @staticmethod
+    def _chunk_gated_delta_rule_fused(q, k, v, g, beta, initial_state, cu_seqlens, scale):
+        return "native-fused"
+
+    def _forward_core(self, q, k, v, g, beta, initial_state, cu_seqlens, scale):
+        if AscendGatedDeltaNetAttention._probe_fused_chunk():
+            return AscendGatedDeltaNetAttention._chunk_gated_delta_rule_fused(
+                q=q, k=k, v=v, g=g, beta=beta, initial_state=initial_state,
+                cu_seqlens=cu_seqlens, scale=scale)
+        return "native-fallback"
+
+    def forward(self, *args, **kwargs):
+        return self._forward_core(*args, **kwargs)
+
+class QwenAttention:
+    prefix = "model.layers.0.linear_attn"
+    forward = AscendGatedDeltaNetAttention.forward
+    _forward_core = AscendGatedDeltaNetAttention._forward_core
+''', "fake_ascend_gdn.py", "exec"), vars(ascend_module))
+    return ascend_module.QwenAttention
+
+
+def prefill_inputs():
+    torch.manual_seed(29)
+    return dict(
+        q=torch.randn(1, 4, 1, 2, dtype=torch.bfloat16),
+        k=torch.randn(1, 4, 1, 2, dtype=torch.bfloat16),
+        v=torch.randn(1, 4, 2, 3, dtype=torch.bfloat16),
+        g=torch.full((1, 4, 2), -0.2),
+        beta=torch.full((1, 4, 2), 0.3),
+        initial_state=torch.randn(2, 2, 3, 2),
+        cu_seqlens=torch.tensor([0, 2, 4]),
+        scale=2 ** -0.5,
+    )
 
 
 class GDNTests(unittest.TestCase):
@@ -113,6 +161,207 @@ class GDNTests(unittest.TestCase):
         for got, want in zip(grads, expected_grads):
             torch.testing.assert_close(got, want, rtol=0, atol=0)
         self.assertFalse(gdn._policy_prefill.get())
+
+    def test_class_dispatch_on_qwen_instance_runs_reference_without_changing_rm(self):
+        os.environ["MINICPMO_GDN_PREFILL_REFERENCE"] = "1"
+        cls = class_dispatch_attention(self.ascend)
+        attention, another, rm = cls(), cls(), cls()
+        owner = self.ascend.AscendGatedDeltaNetAttention
+        self.assertFalse(hasattr(attention, "_chunk_gated_delta_rule_fused"))
+        self.assertFalse(hasattr(attention, "_probe_fused_chunk"))
+        model = native(attention)
+        model.llm.model.layers.append(SimpleNamespace(linear_attn=another))
+        with redirect_stdout(io.StringIO()) as installed:
+            gdn.install_reference_prefill(model)
+            first_forward, first_core = attention.forward, attention._forward_core
+            first_chunk = owner._chunk_gated_delta_rule_fused
+            first_probe = owner._probe_fused_chunk.__func__
+            gdn.install_reference_prefill(model)
+        self.assertIn("dispatch=ascend_class", installed.getvalue())
+        self.assertNotIn("phase=executed", installed.getvalue())
+        self.assertIs(attention.forward, first_forward)
+        self.assertIs(attention._forward_core, first_core)
+        self.assertIs(owner._chunk_gated_delta_rule_fused, first_chunk)
+        self.assertIs(owner._probe_fused_chunk.__func__, first_probe)
+        self.assertFalse(owner._fused_chunk_available)
+        inputs = prefill_inputs()
+        expected = whisper.reference_prefill(**inputs)
+        with redirect_stdout(io.StringIO()) as executed:
+            with torch.autocast("cpu", dtype=torch.bfloat16):
+                results = [attention.forward(**inputs), attention._forward_core(**inputs),
+                           another._forward_core(**inputs)]
+                self.assertTrue(torch.is_autocast_enabled("cpu"))
+        self.assertEqual(executed.getvalue().count("component=gdn_prefill phase=executed"), 1)
+        self.assertEqual(owner.probe_calls, 0)
+        for result in results:
+            self.assertEqual(result[0].dtype, torch.bfloat16)
+            self.assertEqual(result[1].dtype, torch.float32)
+            for got, want in zip(result, expected):
+                torch.testing.assert_close(got, want, rtol=0, atol=0)
+        self.assertFalse(gdn._policy_prefill.get())
+        self.assertFalse(owner._fused_chunk_available)
+        self.assertEqual(rm.forward(**inputs), "native-fallback")
+        self.assertEqual(rm._forward_core(**inputs), "native-fallback")
+        self.assertFalse(owner._probe_fused_chunk())
+        self.assertEqual(owner.probe_calls, 3)
+        self.assertEqual(owner._chunk_gated_delta_rule_fused(**inputs), "native-fused")
+        owner._fused_chunk_available = True
+        self.assertEqual(rm.forward(**inputs), "native-fused")
+
+    def test_class_dispatch_failure_restores_scope_and_does_not_report_execution(self):
+        os.environ["MINICPMO_GDN_PREFILL_REFERENCE"] = "1"
+        attention = class_dispatch_attention(self.ascend)()
+        gdn.install_reference_prefill(native(attention))
+        with redirect_stdout(io.StringIO()) as log:
+            with patch.object(gdn, "reference_prefill", side_effect=RuntimeError("reference failed")):
+                for method in (attention.forward, attention._forward_core):
+                    with self.assertRaisesRegex(RuntimeError, "reference failed"):
+                        method(**prefill_inputs())
+                    self.assertFalse(gdn._policy_prefill.get())
+        self.assertNotIn("phase=executed", log.getvalue())
+        self.assertFalse(self.ascend.AscendGatedDeltaNetAttention._probe_fused_chunk())
+
+    def test_class_dispatch_missing_probe_fails_before_mutating_layer(self):
+        os.environ["MINICPMO_GDN_PREFILL_REFERENCE"] = "1"
+        attention = class_dispatch_attention(self.ascend)()
+        owner = self.ascend.AscendGatedDeltaNetAttention
+        original_forward, original_core = attention.forward, attention._forward_core
+        original_chunk = owner._chunk_gated_delta_rule_fused
+        del owner._probe_fused_chunk
+        with redirect_stdout(io.StringIO()) as log:
+            with self.assertRaisesRegex(RuntimeError, "prefill/probe"):
+                gdn.install_reference_prefill(native(attention))
+        self.assertEqual(attention.forward, original_forward)
+        self.assertEqual(attention._forward_core, original_core)
+        self.assertIs(owner._chunk_gated_delta_rule_fused, original_chunk)
+        self.assertNotIn("phase=installed", log.getvalue())
+
+    def test_whisper_barrier_is_preserved_when_discovering_class_prefill(self):
+        os.environ.update(MINICPMO_GDN_PREFILL_REFERENCE="1", MINICPMO_GDN_CACHE_BARRIER="1")
+        cls = class_dispatch_attention(self.ascend)
+        attention, rm = cls(), cls()
+        for layer in (attention, rm):
+            layer.layer_idx = 0
+            layer.kv_cache = (None, torch.zeros(1))
+            whisper.install_mixed_cache_barrier(native(layer))
+        barrier = attention._forward_core
+        self.assertFalse(hasattr(barrier, "__wrapped__"))
+        context = ModuleType("vllm.forward_context")
+        context.get_forward_context = lambda: SimpleNamespace(attn_metadata={
+            attention.prefix: SimpleNamespace(num_prefills=1, num_decodes=2)})
+        npu = SimpleNamespace(synchronize=Mock())
+        inputs = prefill_inputs()
+        expected = whisper.reference_prefill(**inputs)
+        with patch.dict(sys.modules, {context.__name__: context}), patch.object(torch, "npu", npu, create=True):
+            with redirect_stdout(io.StringIO()) as installed:
+                gdn.install_reference_prefill(native(attention))
+                scoped = attention._forward_core
+                gdn.install_reference_prefill(native(attention))
+            self.assertIs(attention._forward_core, scoped)
+            self.assertIs(scoped.__wrapped__, barrier)
+            self.assertIn("dispatch=ascend_class", installed.getvalue())
+            with redirect_stdout(io.StringIO()) as executed:
+                for method in (attention.forward, attention._forward_core):
+                    result = method(**inputs)
+                    for got, want in zip(result, expected):
+                        torch.testing.assert_close(got, want, rtol=0, atol=0)
+            self.assertEqual(npu.synchronize.call_count, 4)
+            self.assertEqual(executed.getvalue().count("component=gdn_prefill phase=executed"), 1)
+            self.assertIn("mixed cache barrier executed", executed.getvalue())
+            self.assertFalse(gdn._policy_prefill.get())
+
+            # Re-discovery must also traverse Huanyu's wraps-decorated barrier.
+            gdn.install_mixed_cache_barrier(native(attention))
+            both_barriers = attention._forward_core
+            gdn.install_reference_prefill(native(attention))
+            gdn.install_mixed_cache_barrier(native(attention))
+            self.assertIs(attention._forward_core, both_barriers)
+            npu.synchronize.reset_mock()
+            attention._forward_core(**inputs)
+            self.assertEqual(npu.synchronize.call_count, 4)
+
+            npu.synchronize.reset_mock()
+            self.assertEqual(rm.forward(**inputs), "native-fallback")
+            self.assertEqual(npu.synchronize.call_count, 2)
+            self.assertFalse(self.ascend.AscendGatedDeltaNetAttention._fused_chunk_available)
+            self.assertFalse(gdn._policy_prefill.get())
+
+            gdn._EXECUTED.clear()
+            npu.synchronize.reset_mock()
+            with redirect_stdout(io.StringIO()) as failed:
+                with patch.object(gdn, "reference_prefill", side_effect=RuntimeError("reference failed")):
+                    for method in (attention.forward, attention._forward_core):
+                        with self.assertRaisesRegex(RuntimeError, "reference failed"):
+                            method(**inputs)
+                        self.assertFalse(gdn._policy_prefill.get())
+            self.assertEqual(npu.synchronize.call_count, 8)
+            self.assertNotIn("component=gdn_prefill phase=executed", failed.getvalue())
+
+    def test_unknown_unwrapped_closure_is_not_treated_as_whisper_barrier(self):
+        os.environ["MINICPMO_GDN_PREFILL_REFERENCE"] = "1"
+        attention = class_dispatch_attention(self.ascend)()
+        original = attention._forward_core
+
+        def unknown(self, *args, **kwargs):
+            return original(*args, **kwargs)
+
+        attention._forward_core = MethodType(unknown, attention)
+        attention._q36_mixed_cache_barrier = True  # A marker alone is insufficient.
+        core = attention._forward_core
+        with self.assertRaisesRegex(RuntimeError, "prefill"):
+            gdn.install_reference_prefill(native(attention))
+        self.assertIs(attention._forward_core, core)
+
+    def test_whisper_prefill_then_barrier_then_huanyu_uses_huanyu_reference(self):
+        os.environ.update(MINICPMO_GDN_PREFILL_REFERENCE="1", MINICPMO_GDN_CACHE_BARRIER="1")
+        cls = class_dispatch_attention(self.ascend)
+        upstream = ModuleType("vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn")
+        upstream.QwenGatedDeltaNetAttention = cls
+        with patch.dict(sys.modules, {upstream.__name__: upstream}):
+            whisper.install_reference_prefill()
+        attention, rm = cls(), cls()
+        attention.prefix = "thinker.llm.model.layers.0.linear_attn"
+        attention.layer_idx = 0
+        attention.kv_cache = (None, torch.zeros(1))
+        whisper.install_mixed_cache_barrier(native(attention))
+        barrier = attention._forward_core
+        self.assertFalse(hasattr(attention.forward, "__wrapped__"))
+        self.assertFalse(hasattr(barrier, "__wrapped__"))
+        context = ModuleType("vllm.forward_context")
+        context.get_forward_context = lambda: SimpleNamespace(attn_metadata={
+            attention.prefix: SimpleNamespace(num_prefills=1, num_decodes=2)})
+        npu = SimpleNamespace(synchronize=Mock())
+        inputs = prefill_inputs()
+        expected = gdn.reference_prefill(**inputs)
+        with patch.dict(sys.modules, {context.__name__: context}), patch.object(torch, "npu", npu, create=True):
+            gdn.install_reference_prefill(native(attention))
+            scoped = attention._forward_core
+            gdn.install_reference_prefill(native(attention))
+            self.assertIs(attention._forward_core, scoped)
+            self.assertIs(scoped.__wrapped__, barrier)
+            with patch.object(whisper, "reference_prefill", side_effect=AssertionError("foreign reference used")):
+                for method in (attention.forward, attention._forward_core):
+                    result = method(**inputs)
+                    for got, want in zip(result, expected):
+                        torch.testing.assert_close(got, want, rtol=0, atol=0)
+                    self.assertFalse(gdn._policy_prefill.get())
+                    self.assertFalse(whisper._policy_prefill.get())
+                self.assertEqual(rm.forward(**inputs), "native-fused")
+            self.assertEqual(npu.synchronize.call_count, 4)
+
+    def test_malformed_whisper_barrier_original_fails_without_hanging(self):
+        os.environ.update(MINICPMO_GDN_PREFILL_REFERENCE="1", MINICPMO_GDN_CACHE_BARRIER="1")
+        cls = class_dispatch_attention(self.ascend)
+        for bad_original in ("not_callable", "self_cycle"):
+            with self.subTest(original=bad_original):
+                attention = cls()
+                whisper.install_mixed_cache_barrier(native(attention))
+                core = attention._forward_core
+                cells = dict(zip(core.__code__.co_freevars, core.__closure__))
+                cells["original"].cell_contents = None if bad_original == "not_callable" else core
+                with self.assertRaisesRegex(RuntimeError, "(?i)(prefill|wrapper|barrier|cycle)"):
+                    gdn.install_reference_prefill(native(attention))
+                self.assertIs(attention._forward_core, core)
 
     def test_gate_and_l2_run_only_inside_huanyu_scope_and_log_after_success(self):
         os.environ.update(MINICPMO_GDN_GATING_REFERENCE="1", MINICPMO_GDN_L2NORM_REFERENCE="1")
