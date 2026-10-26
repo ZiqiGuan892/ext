@@ -4,7 +4,7 @@
 # Defaults: frozen Huanyu, 35B sampleall, precomputed q128 cache, actor16 + RM16.
 # HUANYU_JOB_MODE=aqa_unfreeze selects online AQA training via its own entry.
 # HUANYU_JOB_MODE=aqa_precision selects the dedicated full-precision AQA entry.
-# HUANYU_JOB_MODE=aqa_16k_24_8 selects the online 16K AQA entry with actor24 + RM8.
+# HUANYU_JOB_MODE=aqa_16k_sync_each selects actor16 + RM16 with per-microbatch gradient sync.
 # Precision defaults: the complete full policy, including FP32 training/GDN,
 # prefill/gating/conv/L2/barrier, private hybrid cache, stable linear, layerwise
 # IPC reload, logical KV zeroing, isolated media and FSDP pin_memory=0.
@@ -84,21 +84,21 @@ if (( ! _POOLS_FIT )); then
 fi
 if [[ "$_JOB_MODE" == aqa_unfreeze || "$_JOB_MODE" == aqa_precision ]] &&
     (( _ACTOR_PER_NODE != 16 || _ACTOR_NODES != 1 || _RM_PER_NODE != 16 || _RM_NODES != 1 )); then
-    echo 'FATAL: the 5K AQA job entries require actor16 + RM16; use the 16K AQA job for actor24 + RM8' >&2
+    echo 'FATAL: the 5K AQA job entries require actor16 + RM16' >&2
     exit 2
 fi
-if [[ "$_JOB_MODE" == aqa_16k_24_8 ]] &&
-    (( _ACTOR_PER_NODE != 12 || _ACTOR_NODES != 2 || _RM_PER_NODE != 4 || _RM_NODES != 2 ||
+if [[ "$_JOB_MODE" == aqa_16k_sync_each ]] &&
+    (( _ACTOR_PER_NODE != 16 || _ACTOR_NODES != 1 || _RM_PER_NODE != 16 || _RM_NODES != 1 ||
        ${_HUANYU_POOL_CONFIG[ROLLOUT_TP]} != 4 || ${_HUANYU_POOL_CONFIG[RM_TP]} != 4 )); then
-    echo 'FATAL: use run_huanyu_aqa_16k_24_8_job.sh to select actor12x2 + RM4x2 with TP4' >&2
+    echo 'FATAL: run_huanyu_aqa_16k_sync_each_job.sh now requires actor16x1 + RM16x1 with TP4' >&2
     exit 2
 fi
 case "$_JOB_MODE" in
     frozen_cache) _TRAIN_ENTRY=run_huanyu.sh ;;
     aqa_unfreeze) _TRAIN_ENTRY=run_huanyu_aqa_audio_train.sh ;;
     aqa_precision) _TRAIN_ENTRY=run_huanyu_aqa_precision.sh ;;
-    aqa_16k_24_8) _TRAIN_ENTRY=run_huanyu_aqa_16k_24_8.sh ;;
-    *) echo 'FATAL: HUANYU_JOB_MODE must be frozen_cache, aqa_unfreeze, aqa_precision or aqa_16k_24_8' >&2; exit 2 ;;
+    aqa_16k_sync_each) _TRAIN_ENTRY=run_huanyu_aqa_16k_sync_each.sh ;;
+    *) echo 'FATAL: HUANYU_JOB_MODE must be frozen_cache, aqa_unfreeze, aqa_precision or aqa_16k_sync_each' >&2; exit 2 ;;
 esac
 # Keep the component choices through site environment setup and into existing
 # Ray workers. The frozen-cache entry always freezes both audio components.
@@ -208,7 +208,7 @@ done
 # as its final Hydra arguments. Older site env files must not change preflight
 # lengths/batches or sampling defaults before that command is composed.
 declare -A _HUANYU_PROFILE_CONFIG=()
-if [[ "${HUANYU_JOB_PROFILE:-}" == whisper_aligned || "$_JOB_MODE" == aqa_16k_24_8 ]]; then
+if [[ "${HUANYU_JOB_PROFILE:-}" == whisper_aligned || "$_JOB_MODE" == aqa_16k_sync_each ]]; then
     for _key in TRAIN_BATCH_SIZE PPO_MINI_BATCH_SIZE PPO_MICRO_BATCH_SIZE_PER_GPU \
         ROLLOUT_N ACTOR_MODEL_DTYPE REF_MODEL_DTYPE ACTOR_OFFLOAD_POLICY \
         ACTOR_FORWARD_PREFETCH ACTIVATION_OFFLOAD FILTER_OVERLONG \
@@ -220,7 +220,7 @@ if [[ "${HUANYU_JOB_PROFILE:-}" == whisper_aligned || "$_JOB_MODE" == aqa_16k_24
         if [[ -v "$_key" ]]; then _HUANYU_PROFILE_CONFIG["$_key"]="${!_key}"; fi
     done
 fi
-if [[ "$_JOB_MODE" == aqa_16k_24_8 ]]; then
+if [[ "$_JOB_MODE" == aqa_16k_sync_each ]]; then
     for _key in HUANYU_16K_RESPONSE_LENGTH HUANYU_16K_ATTN_IMPLEMENTATION \
         HUANYU_AQA_TRAIN_FILE HUANYU_AQA_VAL_FILE; do
         if [[ -v "$_key" ]]; then _HUANYU_PROFILE_CONFIG["$_key"]="${!_key}"; fi
@@ -271,7 +271,7 @@ set +x
 set -euo pipefail
 # This dedicated entry always uses the reference precision kernels, including
 # on the worker node. A site's graph/custom defaults cannot replace its policy.
-if [[ "$_JOB_MODE" == aqa_precision || "$_JOB_MODE" == aqa_16k_24_8 ]]; then
+if [[ "$_JOB_MODE" == aqa_precision || "$_JOB_MODE" == aqa_16k_sync_each ]]; then
     export HUANYU_PRECISION_PROFILE=full HUANYU_GRAPH_MODE=0
     source "${_HUANYU_EXAMPLE_DIR}/graph_mode.sh"
 fi
@@ -304,7 +304,7 @@ case "$_JOB_MODE" in
             exit 1
         }
         ;;
-    aqa_unfreeze|aqa_precision|aqa_16k_24_8)
+    aqa_unfreeze|aqa_precision|aqa_16k_sync_each)
         # Apply before Ray starts on BOTH nodes, after the site environment.
         # Empty the cache path as well as disabling it, including runtime_env
         # below for workers launched by an already-running frozen-cache raylet.

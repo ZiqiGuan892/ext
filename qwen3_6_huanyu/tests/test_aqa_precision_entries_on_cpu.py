@@ -15,8 +15,8 @@ _spec.loader.exec_module(_aqa)
 EXAMPLES = _aqa.EXAMPLES
 JOB = "run_huanyu_aqa_precision_32card_job.sh"
 DIRECT = "run_huanyu_aqa_precision.sh"
-DIRECT_16K = "run_huanyu_aqa_16k_24_8.sh"
-JOB_16K = "run_huanyu_aqa_16k_24_8_job.sh"
+DIRECT_16K = "run_huanyu_aqa_16k_sync_each.sh"
+JOB_16K = "run_huanyu_aqa_16k_sync_each_job.sh"
 
 
 @unittest.skipUnless(_aqa._job.find_bash(), "Bash is required for launcher argv integration")
@@ -138,15 +138,38 @@ class AqaPrecisionEntryTests(unittest.TestCase):
         _aqa.pq.write_table(_aqa.pa.Table.from_pylist([self.aqa.row] * 12), self.aqa.train)
         (self.fixture.examples / "env_export_huanyu.sh").write_text("exit 91\n", encoding="utf-8")
 
-    def test_direct_16k_keeps_24_plus_8_and_full_precision_through_all_wrappers(self):
+    def assert_static_microbatch_sync(self, actual):
+        for key, value in {
+            "actor_rollout_ref.actor.use_dynamic_bsz": "false",
+            "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu": "1",
+            "actor_rollout_ref.ref.log_prob_use_dynamic_bsz": "false",
+            "actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu": "1",
+            "actor_rollout_ref.rollout.log_prob_use_dynamic_bsz": "false",
+            "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu": "1",
+            "actor_rollout_ref.model.override_config.huanyu_sync_each_microbatch": "true",
+        }.items():
+            self.assertEqual(actual[key], value, key)
+        sequences = int(actual["actor_rollout_ref.actor.ppo_mini_batch_size"]) * int(
+            actual["actor_rollout_ref.rollout.n"]
+        )
+        actor_world = int(actual["trainer.n_gpus_per_node"]) * int(actual["trainer.nnodes"])
+        self.assertEqual(sequences, actor_world)
+
+    def test_direct_16k_restores_16_plus_16_and_full_precision_through_all_wrappers(self):
         self.use_16k_entry()
         capture = self.aqa.launch(
-            {"NUM_NPUS": "16", "NNODES": "1", "RM_N_GPUS_PER_NODE": "16", "RM_NNODES": "1",
-             "RM_ENABLE": "0", "ROLLOUT_TP": "8", "RM_TP": "8", "TRAIN_BATCH_SIZE": "4",
+            {"NUM_NPUS": "12", "NNODES": "2", "RM_N_GPUS_PER_NODE": "4", "RM_NNODES": "2",
+             "RM_SPLIT_NODES": "0", "REWARD_POOL_NPUS": "8", "PPO_MINI_BATCH_SIZE": "6",
+             "RM_ENABLE": "0", "ROLLOUT_TP": "8", "RM_TP": "8", "TRAIN_BATCH_SIZE": "6",
              "HUANYU_PRECISION_PROFILE": "custom", "MINICPMO_STABLE_LINEAR": "0",
+             "HCCL_OP_EXPANSION_MODE": "AIV",
              "MAX_PROMPT_LENGTH": "3072", "RAY_ADDRESS": "192.0.2.10:6925"},
-            ("trainer.n_gpus_per_node=16", "trainer.nnodes=1", "reward.reward_model.n_gpus_per_node=16",
-             "reward.reward_model.nnodes=1", "reward.reward_model.enable=false",
+            ("trainer.n_gpus_per_node=12", "trainer.nnodes=2", "reward.reward_model.n_gpus_per_node=4",
+             "reward.reward_model.nnodes=2", "reward.reward_model.enable=false",
+             "actor_rollout_ref.actor.use_dynamic_bsz=true", "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4",
+             "actor_rollout_ref.ref.log_prob_use_dynamic_bsz=true", "actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4",
+             "actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=true", "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4",
+             "++actor_rollout_ref.model.override_config.huanyu_sync_each_microbatch=false",
              "data.max_prompt_length=3072", "actor_rollout_ref.rollout.max_model_len=5248",
              "actor_rollout_ref.rollout.tensor_model_parallel_size=8",
              "++ray_kwargs.ray_init.runtime_env.env_vars.MINICPMO_MM_PROMPT_BUDGET=3072",
@@ -158,13 +181,13 @@ class AqaPrecisionEntryTests(unittest.TestCase):
         for key, value in _aqa.PRECISION_ENV.items():
             self.assertEqual(json.loads(actual[_aqa.ENV_PREFIX + key]), value, key)
         expected = {
-            "trainer.n_gpus_per_node": "12", "trainer.nnodes": "2",
-            "reward.reward_model.n_gpus_per_node": "4", "reward.reward_model.nnodes": "2",
+            "trainer.n_gpus_per_node": "16", "trainer.nnodes": "1",
+            "reward.reward_model.n_gpus_per_node": "16", "reward.reward_model.nnodes": "1",
             "reward.reward_model.enable": "true", "reward.reward_model.enable_resource_pool": "true",
             "actor_rollout_ref.rollout.tensor_model_parallel_size": "4",
             "reward.reward_model.rollout.tensor_model_parallel_size": "4",
-            "actor_rollout_ref.rollout.agent.num_workers": "6",
-            "data.train_batch_size": "6", "actor_rollout_ref.actor.ppo_mini_batch_size": "6",
+            "actor_rollout_ref.rollout.agent.num_workers": "4",
+            "data.train_batch_size": "4", "actor_rollout_ref.actor.ppo_mini_batch_size": "4",
             "actor_rollout_ref.rollout.n": "4", "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu": "1",
             "data.max_prompt_length": "14336", "data.max_response_length": "2048",
             "actor_rollout_ref.rollout.prompt_length": "14336", "actor_rollout_ref.rollout.response_length": "2048",
@@ -185,8 +208,11 @@ class AqaPrecisionEntryTests(unittest.TestCase):
         }
         for key, value in expected.items():
             self.assertEqual(actual[key], value, key)
-        self.assertEqual(env["REWARD_POOL_NPUS"], "8")
-        self.assertEqual(env["RM_SPLIT_NODES"], "0")
+        self.assert_static_microbatch_sync(actual)
+        self.assertEqual(env["REWARD_POOL_NPUS"], "16")
+        self.assertEqual(env["RM_SPLIT_NODES"], "1")
+        self.assertEqual(env["HCCL_OP_EXPANSION_MODE"], "AIV")
+        self.assertEqual(json.loads(actual[_aqa.ENV_PREFIX + "HCCL_OP_EXPANSION_MODE"]), "AIV")
         self.assertEqual(env["HUANYU_USE_PRECOMPUTE"], "0")
         self.assertEqual(env["HUANYU_SKIP_EDITABLE_INSTALL"], "1")
         self.assertEqual(json.loads(actual[_aqa.ENV_PREFIX + "MINICPMO_MM_PROMPT_BUDGET"]), "14336")
@@ -224,50 +250,53 @@ class AqaPrecisionEntryTests(unittest.TestCase):
     def use_16k_job(self):
         self.fixture.entry = self.fixture.examples / JOB_16K
         _aqa.pq.write_table(_aqa.pa.Table.from_pylist([self.aqa.row] * 12), self.aqa.train)
-        # Simulate an older site environment with 5K, 16+16 and frozen defaults.
+        # Stale 24+8 site settings must not undo the entry's restored 16+16 pools.
         with (self.fixture.examples / "env_export_huanyu.sh").open("a", encoding="utf-8") as stream:
             stream.write(
                 "export HUANYU_JOB_MODE=frozen_cache HUANYU_PRECISION_PROFILE=custom HUANYU_GRAPH_MODE=1\n"
                 "export MINICPMO_STABLE_LINEAR=0 MINICPMO_PRIVATE_HYBRID_CACHE=0\n"
                 "export HUANYU_FREEZE_AUDIO=true HUANYU_USE_PRECOMPUTE=1 MINICPMO_TUNE_AUDIO=0\n"
-                "export NUM_NPUS=16 NNODES=1 RM_N_GPUS_PER_NODE=16 RM_NNODES=1 ROLLOUT_TP=8 RM_TP=8\n"
-                "export TRAIN_BATCH_SIZE=4 PPO_MINI_BATCH_SIZE=4 MAX_PROMPT_LENGTH=3072\n"
+                "export NUM_NPUS=12 NNODES=2 RM_N_GPUS_PER_NODE=4 RM_NNODES=2 ROLLOUT_TP=8 RM_TP=8\n"
+                "export RM_SPLIT_NODES=0 REWARD_POOL_NPUS=8 PPO_MICRO_BATCH_SIZE_PER_GPU=4\n"
+                "export TRAIN_BATCH_SIZE=6 PPO_MINI_BATCH_SIZE=6 MAX_PROMPT_LENGTH=3072\n"
                 "export MAX_RESPONSE_LENGTH=2048 ROLLOUT_MAX_MODEL_LEN=5248\n"
                 "export HUANYU_16K_RESPONSE_LENGTH=123 HUANYU_16K_ATTN_IMPLEMENTATION=invalid\n"
                 "export HUANYU_AQA_TRAIN_FILE=/old/train.parquet HUANYU_AQA_VAL_FILE=/old/validation.parquet\n"
-                "export HCCL_OP_EXPANSION_MODE=AIV HUANYU_HCCL_OP_EXPANSION_MODE=AIV\n"
             )
 
     def assert_16k_job_environment(self, env, response="2048"):
         self.aqa.assert_precision_environment(env)
         for key, value in dict(_aqa.MODE_ENV, **{
-            "HUANYU_JOB_MODE": "aqa_16k_24_8", "HUANYU_GRAPH_MODE": "0",
-            "NUM_NPUS": "12", "NNODES": "2", "RM_N_GPUS_PER_NODE": "4", "RM_NNODES": "2",
-            "ROLLOUT_TP": "4", "RM_TP": "4", "REWARD_POOL_NPUS": "8", "RM_SPLIT_NODES": "0",
-            "TRAIN_BATCH_SIZE": "6", "PPO_MINI_BATCH_SIZE": "6", "ROLLOUT_N": "4",
+            "HUANYU_JOB_MODE": "aqa_16k_sync_each", "HUANYU_GRAPH_MODE": "0",
+            "NUM_NPUS": "16", "NNODES": "1", "RM_N_GPUS_PER_NODE": "16", "RM_NNODES": "1",
+            "ROLLOUT_TP": "4", "RM_TP": "4", "REWARD_POOL_NPUS": "16", "RM_SPLIT_NODES": "1",
+            "TRAIN_BATCH_SIZE": "4", "PPO_MINI_BATCH_SIZE": "4", "ROLLOUT_N": "4",
             "MAX_PROMPT_LENGTH": str(16384 - int(response)), "MAX_RESPONSE_LENGTH": response,
             "ROLLOUT_MAX_MODEL_LEN": "16512", "HUANYU_16K_RESPONSE_LENGTH": response,
-            "HUANYU_HCCL_OP_EXPANSION_MODE": "auto", "HCCL_OP_EXPANSION_MODE": "AI_CPU",
         }).items():
             self.assertEqual(env[key], value, key)
 
-    def test_16k_job_bootstraps_then_head_runs_24_plus_8_training_once(self):
+    def test_16k_job_bootstraps_then_head_runs_16_plus_16_training_once(self):
         self.use_16k_job()
         capture = self.aqa.launch(arguments=(
-            "data.max_prompt_length=3072", "trainer.n_gpus_per_node=16",
+            "data.max_prompt_length=3072", "trainer.n_gpus_per_node=12", "trainer.nnodes=2",
             "actor_rollout_ref.rollout.tensor_model_parallel_size=8",
-            "reward.reward_model.n_gpus_per_node=16", "reward.reward_model.enable=false",
+            "reward.reward_model.n_gpus_per_node=4", "reward.reward_model.nnodes=2", "reward.reward_model.enable=false",
             "actor_rollout_ref.rollout.enforce_eager=false", "actor_rollout_ref.actor.optim.lr=2e-6",
+            "actor_rollout_ref.actor.use_dynamic_bsz=true", "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4",
+            "actor_rollout_ref.ref.log_prob_use_dynamic_bsz=true", "actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4",
+            "actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=true", "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4",
+            "++actor_rollout_ref.model.override_config.huanyu_sync_each_microbatch=false",
         ))
         self.assert_16k_job_environment(capture["env"])
         actual = _aqa.effective_arguments(capture)
         for key, value in {
-            "trainer.n_gpus_per_node": "12", "trainer.nnodes": "2",
-            "reward.reward_model.n_gpus_per_node": "4", "reward.reward_model.nnodes": "2",
+            "trainer.n_gpus_per_node": "16", "trainer.nnodes": "1",
+            "reward.reward_model.n_gpus_per_node": "16", "reward.reward_model.nnodes": "1",
             "reward.reward_model.enable": "true", "actor_rollout_ref.rollout.tensor_model_parallel_size": "4",
             "reward.reward_model.rollout.tensor_model_parallel_size": "4",
-            "actor_rollout_ref.rollout.agent.num_workers": "6", "data.train_batch_size": "6",
-            "actor_rollout_ref.actor.ppo_mini_batch_size": "6", "actor_rollout_ref.rollout.n": "4",
+            "actor_rollout_ref.rollout.agent.num_workers": "4", "data.train_batch_size": "4",
+            "actor_rollout_ref.actor.ppo_mini_batch_size": "4", "actor_rollout_ref.rollout.n": "4",
             "data.max_prompt_length": "14336", "data.max_response_length": "2048",
             "actor_rollout_ref.rollout.prompt_length": "14336", "actor_rollout_ref.rollout.max_model_len": "16512",
             "actor_rollout_ref.model.override_config.attn_implementation": "sdpa",
@@ -276,9 +305,9 @@ class AqaPrecisionEntryTests(unittest.TestCase):
             "data.val_files": _aqa._job.shell_path(self.aqa.validation),
         }.items():
             self.assertEqual(actual[key], value, key)
+        self.assert_static_microbatch_sync(actual)
         for key, value in dict(_aqa.PRECISION_ENV, **_aqa.MODE_ENV,
-                               MINICPMO_MM_PROMPT_BUDGET="14336",
-                               HUANYU_HCCL_OP_EXPANSION_MODE="auto", HCCL_OP_EXPANSION_MODE="AI_CPU").items():
+                               MINICPMO_MM_PROMPT_BUDGET="14336").items():
             self.assertEqual(json.loads(actual[_aqa.ENV_PREFIX + key]), value, key)
         self.assertEqual(len(self.fixture.events("train")), 1)
         self.assertEqual(len(self.fixture.events("pip")), 1)
@@ -332,21 +361,6 @@ class AqaPrecisionEntryTests(unittest.TestCase):
         self.assertIn("HUANYU_16K_RESPONSE_LENGTH", result.stdout + result.stderr)
         for kind in ("helper", "pip", "env-source", "ray", "train"):
             self.assertFalse(self.fixture.events(kind), kind)
-
-    def test_16k_explicit_host_survives_stale_site_env_and_reused_ray(self):
-        self.use_16k_job()
-        capture = self.aqa.launch({"HUANYU_HCCL_OP_EXPANSION_MODE": "HOST",
-                                   "HCCL_OP_EXPANSION_MODE": "AIV", "HUANYU_TEST_RAY_LIVE": "1"}, (
-            '++ray_kwargs.ray_init.runtime_env.env_vars.HCCL_OP_EXPANSION_MODE="AIV"',
-            '++ray_kwargs.ray_init.runtime_env.env_vars.HUANYU_HCCL_OP_EXPANSION_MODE="AIV"',
-        ))
-        actual = _aqa.effective_arguments(capture)
-        for key in ("HUANYU_HCCL_OP_EXPANSION_MODE", "HCCL_OP_EXPANSION_MODE"):
-            self.assertEqual(capture["env"][key], "HOST")
-            self.assertEqual(json.loads(actual[_aqa.ENV_PREFIX + key]), "HOST")
-            for event in self.fixture.events("runtime") + self.fixture.events("ray"):
-                self.assertEqual(event["env"][key], "HOST")
-        self.assertFalse(any("start" in event["args"] for event in self.fixture.events("ray")))
 
     def test_16k_job_cluster_readiness_failure_never_starts_training(self):
         self.use_16k_job()

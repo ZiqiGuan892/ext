@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Direct AQA entry for an already prepared two-node, 32-NPU Ray cluster.
 # Run ONCE on the head node after env_export / package installation / Ray setup.
-# Each physical 16-NPU node supplies actor12 + RM4; both rollouts use TP4.
+# Actor16 on one node, RM16 on the other; TP4, per-microbatch gradient sync.
 # Online audio, Huanyu unfrozen by default, full precision policy, graph off.
 # 16K = prompt14336 + response2048; engine budget16512 includes 128 spare tokens.
 # Optional: HUANYU_16K_RESPONSE_LENGTH=4096 (prompt becomes12288),
@@ -28,11 +28,11 @@ source "$_AQA_EXAMPLES/run_output.sh"
 
 # This entry owns pool sizes, TP, batching and the combined 16K length budget.
 # Override stale settings inherited from the site's shared environment file.
-export NUM_NPUS=12 NNODES=2 ROLLOUT_TP=4
-export RM_ENABLE=1 RM_N_GPUS_PER_NODE=4 RM_NNODES=2 RM_TP=4
-export REWARD_POOL_NPUS=8 RM_SPLIT_NODES=0
-export TRAIN_BATCH_SIZE=6 PPO_MINI_BATCH_SIZE=6 ROLLOUT_N=4
-# 6 prompts x 4 responses = 24 sequences: exactly one per actor rank/update.
+export NUM_NPUS=16 NNODES=1 ROLLOUT_TP=4
+export RM_ENABLE=1 RM_N_GPUS_PER_NODE=16 RM_NNODES=1 RM_TP=4
+export REWARD_POOL_NPUS=16 RM_SPLIT_NODES=1
+export TRAIN_BATCH_SIZE=4 PPO_MINI_BATCH_SIZE=4 ROLLOUT_N=4 PPO_MICRO_BATCH_SIZE_PER_GPU=1
+# 4 prompts x 4 responses = 16 sequences: exactly one per actor rank/update.
 export MAX_RESPONSE_LENGTH="$_AQA_RESPONSE"
 export MAX_PROMPT_LENGTH="$((16384 - MAX_RESPONSE_LENGTH))"
 export ROLLOUT_PROMPT_LENGTH="$MAX_PROMPT_LENGTH" MINICPMO_MM_PROMPT_BUDGET="$MAX_PROMPT_LENGTH"
@@ -41,7 +41,7 @@ export HUANYU_PRECISION_PROFILE=full HUANYU_GRAPH_MODE=0 HUANYU_SKIP_EDITABLE_IN
 export HUANYU_FREEZE_AUDIO="${HUANYU_FREEZE_AUDIO:-false}"
 export HUANYU_USE_PRECOMPUTE=0 MINICPMO_USE_PRECOMPUTE=0 HUANYU_EMBED_CACHE_DIR=""
 export WANDB_MODE="${WANDB_MODE:-offline}"
-export EXPERIMENT_NAME="${EXPERIMENT_NAME:-huanyu_aqa_16k_24_8_precision}"
+export EXPERIMENT_NAME="${EXPERIMENT_NAME:-huanyu_aqa_16k_16_16_precision}"
 if [[ "${DEFAULT_LOCAL_DIR:-}" == "$PROJECT_ROOT/checkpoints" ]]; then unset DEFAULT_LOCAL_DIR; fi
 if [[ "${TENSORBOARD_DIR:-}" == "$PROJECT_ROOT/tensorboard_log" ]]; then unset TENSORBOARD_DIR; fi
 export DEFAULT_LOCAL_DIR="${DEFAULT_LOCAL_DIR:-$HUANYU_RUN_DIR/checkpoints}"
@@ -61,8 +61,8 @@ if ! timeout --foreground "${_AQA_RAY_TIMEOUT}s" ray status --address="$RAY_ADDR
     echo 'FATAL: existing Ray is not reachable; prepare both 16-NPU nodes first' >&2
     exit 1
 fi
-echo "[huanyu-aqa-16k] actor=12x2=24NPU RM=4x2=8NPU rollout_TP=4 replicas=6 RM_TP=4 replicas=2"
-echo "[huanyu-aqa-16k] prompt=$MAX_PROMPT_LENGTH response=$MAX_RESPONSE_LENGTH total=16384 engine=16512 train_batch=6 mini_batch=6 rollout_n=4"
+echo "[huanyu-aqa-16k] actor=16x1=16NPU RM=16x1=16NPU rollout_TP=4 replicas=4 RM_TP=4 replicas=4"
+echo "[huanyu-aqa-16k] prompt=$MAX_PROMPT_LENGTH response=$MAX_RESPONSE_LENGTH total=16384 engine=16512 train_batch=4 mini_batch=4 rollout_n=4 dynamic_bsz=false micro_batch_size_per_gpu=1 sync_each_microbatch=true"
 echo "[huanyu-aqa-16k] precision=full graph=0 attention=$_AQA_ATTN freeze_audio=$HUANYU_FREEZE_AUDIO cache=off console=$HUANYU_CONSOLE_LOG"
 
 exec bash "$_AQA_EXAMPLES/run_huanyu_aqa_audio_train.sh" \
@@ -77,6 +77,13 @@ exec bash "$_AQA_EXAMPLES/run_huanyu_aqa_audio_train.sh" \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=16512 \
     actor_rollout_ref.actor.fsdp_config.fsdp_size=-1 \
     actor_rollout_ref.ref.fsdp_config.fsdp_size=-1 \
+    actor_rollout_ref.actor.use_dynamic_bsz=false \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
+    actor_rollout_ref.ref.log_prob_use_dynamic_bsz=false \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
+    actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=false \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
+    ++actor_rollout_ref.model.override_config.huanyu_sync_each_microbatch=true \
     "actor_rollout_ref.model.override_config.attn_implementation=$_AQA_ATTN" \
     actor_rollout_ref.rollout.max_num_seqs=32 \
     actor_rollout_ref.rollout.enable_chunked_prefill=false \

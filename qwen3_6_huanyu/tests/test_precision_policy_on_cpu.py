@@ -73,18 +73,6 @@ class PrecisionPolicyTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Unknown HUANYU_PRECISION_PROFILE"):
                 policy.report_policy("rollout")
 
-    def test_reports_actual_worker_communication_environment_once(self):
-        environment = {**self.full_environment(), "HCCL_OP_EXPANSION_MODE": "AI_CPU",
-                       "HUANYU_HCCL_OP_EXPANSION_MODE": "auto", "RANK": "14",
-                       "WORLD_SIZE": "24", "LOCAL_RANK": "2", "LOCAL_WORLD_SIZE": "12"}
-        with patch.dict(os.environ, environment, clear=True), redirect_stdout(io.StringIO()) as output:
-            policy.report_policy("actor/ref")
-            policy.report_policy("actor/ref")
-            self.assertEqual(output.getvalue().count("[huanyu-communication]"), 1)
-            for field in ("HCCL_OP_EXPANSION_MODE=AI_CPU", "RANK=14", "WORLD_SIZE=24",
-                          "LOCAL_WORLD_SIZE=12", "ASCEND_RT_VISIBLE_DEVICES=<unset>"):
-                self.assertIn(field, output.getvalue())
-
     def test_actual_policy_forces_positional_and_keyword_pin_false_once(self):
         target = SimpleNamespace(CPUOffloadPolicy=CPUOffloadPolicy)
         with patch.dict(sys.modules, {TARGET: target}):

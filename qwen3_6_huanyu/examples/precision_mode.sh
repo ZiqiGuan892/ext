@@ -5,7 +5,7 @@
 # custom retains individual switches for deliberate arithmetic/performance A/Bs.
 
 huanyu_configure_precision_mode() {
-    local _key _value _arg _tp="${ROLLOUT_TP:-4}" _actor_nodes="${NNODES:-1}"
+    local _key _value _arg _tp="${ROLLOUT_TP:-4}"
     local _profile="${HUANYU_PRECISION_PROFILE:-full}"
     case "$_profile" in
         full|custom) ;;
@@ -72,10 +72,6 @@ huanyu_configure_precision_mode() {
             _tp="${_arg#*=}"
             _tp="${_tp#\"}"; _tp="${_tp%\"}"
             _tp="${_tp#\'}"; _tp="${_tp%\'}"
-        elif [[ "$_key" == trainer.nnodes ]]; then
-            _actor_nodes="${_arg#*=}"
-            _actor_nodes="${_actor_nodes#\"}"; _actor_nodes="${_actor_nodes%\"}"
-            _actor_nodes="${_actor_nodes#\'}"; _actor_nodes="${_actor_nodes%\'}"
         fi
     done
     if [[ ! "$_tp" =~ ^[1-9][0-9]*$ ]]; then
@@ -83,31 +79,6 @@ huanyu_configure_precision_mode() {
         return 2
     fi
     export ROLLOUT_TP="$_tp" MINICPMO_HUANYU_ROLLOUT_TP="$_tp"
-    # 16+16 has a single-node actor group; 12x2+4x2 makes its FSDP
-    # broadcasts cross nodes. Do not inherit the single-node AIV setting.
-    # CANN's A2/A3 AIV Broadcast support is restricted to single-node use:
-    # https://www.hiascend.com/document/detail/en/CANNCommunityEdition/910/commlib/hcclug/docs/en/user_guide/hccl_env/HCCL_OP_EXPANSION_MODE.md
-    if [[ ! "$_actor_nodes" =~ ^[1-9][0-9]{0,4}$ ]]; then
-        echo "[huanyu-communication] FATAL: trainer.nnodes must be an integer in 1..99999" >&2
-        return 2
-    fi
-    export HUANYU_HCCL_OP_EXPANSION_MODE="${HUANYU_HCCL_OP_EXPANSION_MODE:-auto}"
-    case "$HUANYU_HCCL_OP_EXPANSION_MODE" in
-        auto)
-            if (( _actor_nodes > 1 )); then export HCCL_OP_EXPANSION_MODE=AI_CPU; fi ;;
-        AI_CPU|HOST|HOST_TS|AIV)
-            export HCCL_OP_EXPANSION_MODE="$HUANYU_HCCL_OP_EXPANSION_MODE" ;;
-        *) echo '[huanyu-communication] FATAL: HUANYU_HCCL_OP_EXPANSION_MODE must be auto, AI_CPU, HOST, HOST_TS or AIV' >&2; return 2 ;;
-    esac
-    if (( _actor_nodes > 1 )) && [[ "${HCCL_OP_EXPANSION_MODE:-}" == AIV ]]; then
-        echo '[huanyu-communication] FATAL: cross-node FSDP Broadcast must not use AIV; set HUANYU_HCCL_OP_EXPANSION_MODE=auto or AI_CPU' >&2
-        return 2
-    fi
-    local _communication="actor_nodes=$_actor_nodes policy=$HUANYU_HCCL_OP_EXPANSION_MODE HCCL_OP_EXPANSION_MODE=${HCCL_OP_EXPANSION_MODE:-<unset>}"
-    if [[ "${_HUANYU_COMMUNICATION_LAST_REPORT:-}" != "$_communication" ]]; then
-        echo "[huanyu-communication] $_communication"
-        _HUANYU_COMMUNICATION_LAST_REPORT="$_communication"
-    fi
     for _key in MINICPMO_MOE_TP_REFERENCE MINICPMO_ROW_TP_REFERENCE; do
         _value="${!_key:-0}"
         case "$_value" in
@@ -130,8 +101,7 @@ huanyu_configure_precision_mode() {
     # The two-node job snapshots these defaults/caller overrides across the
     # site env file. Cache mode, TP and HCCL are resolved later by the launcher.
     HUANYU_PRECISION_KEYS=(HUANYU_PRECISION_PROFILE "${_on[@]}" "${_full[@]}" "${_off[@]}" \
-        MINICPMO_FSDP2_PIN_MEMORY MINICPMO_MOE_TP_REFERENCE MINICPMO_ROW_TP_REFERENCE \
-        HUANYU_HCCL_OP_EXPANSION_MODE)
+        MINICPMO_FSDP2_PIN_MEMORY MINICPMO_MOE_TP_REFERENCE MINICPMO_ROW_TP_REFERENCE)
     HUANYU_PRECISION_ARGS=()
     # Keep the outer actor engine kwargs consistent with stage-0 engine_extras:
     # native deploy merging must not restore the generic colocated extension.

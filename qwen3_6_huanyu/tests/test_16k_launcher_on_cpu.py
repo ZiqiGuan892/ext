@@ -178,10 +178,7 @@ class Huanyu16KLauncherTests(unittest.TestCase):
         self.assertNotIn("--head", args)
 
     def test_24_plus_8_worker_keeps_physical_16_cards_and_only_joins_ray(self):
-        with (self.fixture.examples / "env_export_huanyu.sh").open("a", encoding="utf-8") as stream:
-            stream.write("export HCCL_OP_EXPANSION_MODE=AIV\n")
-        result = self.fixture.run_launcher({"VC_TASK_INDEX": "1", "HUANYU_16K_POOL_LAYOUT": "24+8",
-                                             "HCCL_OP_EXPANSION_MODE": "AIV"})
+        result = self.fixture.run_launcher({"VC_TASK_INDEX": "1", "HUANYU_16K_POOL_LAYOUT": "24+8"})
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertFalse(self.fixture.events("train"))
         self.assertFalse(self.fixture.capture_file.exists())
@@ -191,9 +188,6 @@ class Huanyu16KLauncherTests(unittest.TestCase):
         self.assertIn("--address=192.0.2.10:6925", args)
         self.assertIn("--block", args)
         self.assertNotIn("--head", args)
-        for event in self.fixture.events("runtime") + self.fixture.events("ray"):
-            self.assertEqual(event["precision"]["HCCL_OP_EXPANSION_MODE"], "AI_CPU")
-            self.assertEqual(event["precision"]["HUANYU_HCCL_OP_EXPANSION_MODE"], "auto")
 
     def test_external_entry_uses_project_backend_not_adjacent_script(self):
         # Both script location and cwd differ from PROJECT_ROOT. A sibling
@@ -344,17 +338,8 @@ class Huanyu16KLauncherTests(unittest.TestCase):
 
     def test_opt_in_24_plus_8_reaches_final_backend(self):
         self.use_real_training_composition()
-        with (self.fixture.examples / "env_export_huanyu.sh").open("a", encoding="utf-8") as stream:
-            stream.write("export HCCL_OP_EXPANSION_MODE=AIV\n")
-        capture = self.launch({"HUANYU_16K_POOL_LAYOUT": "24+8", "HCCL_OP_EXPANSION_MODE": "AIV"}, (
-            '++ray_kwargs.ray_init.runtime_env.env_vars.HCCL_OP_EXPANSION_MODE="AIV"',
-        ))
+        capture = self.launch({"HUANYU_16K_POOL_LAYOUT": "24+8"})
         self.assert_24_plus_8_backend(capture)
-        self.assertEqual(capture["env"]["HCCL_OP_EXPANSION_MODE"], "AI_CPU")
-        actual = effective_arguments(capture)
-        self.assertEqual(json.loads(actual[ENV_PREFIX + "HCCL_OP_EXPANSION_MODE"]), "AI_CPU")
-        for event in self.fixture.events("runtime") + self.fixture.events("ray"):
-            self.assertEqual(event["precision"]["HCCL_OP_EXPANSION_MODE"], "AI_CPU")
 
     def test_24_plus_8_preserves_upper_pool_and_tp_through_site_environment(self):
         self.use_real_training_composition()
