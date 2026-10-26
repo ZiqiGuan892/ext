@@ -15,6 +15,7 @@ _spec.loader.exec_module(_aqa)
 EXAMPLES = _aqa.EXAMPLES
 JOB = "run_huanyu_aqa_precision_32card_job.sh"
 DIRECT = "run_huanyu_aqa_precision.sh"
+DIRECT_16K = "run_huanyu_aqa_16k_24_8.sh"
 
 
 @unittest.skipUnless(_aqa._job.find_bash(), "Bash is required for launcher argv integration")
@@ -24,7 +25,7 @@ class AqaPrecisionEntryTests(unittest.TestCase):
         self.addCleanup(self.aqa.doCleanups)
         self.aqa.setUp()
         self.fixture = self.aqa.fixture
-        for name in (JOB, DIRECT):
+        for name in (JOB, DIRECT, DIRECT_16K):
             shutil.copyfile(EXAMPLES / name, self.fixture.examples / name)
         shutil.copyfile(EXAMPLES.parent / "rule_based_reward.py", self.fixture.package / "rule_based_reward.py")
         self.fixture.entry = self.fixture.examples / JOB
@@ -130,6 +131,94 @@ class AqaPrecisionEntryTests(unittest.TestCase):
         self.assertEqual(self.fixture.events("ray")[0]["args"], ["status", "--address=auto"])
         for kind in ("train", "pip", "git", "runtime", "env-source"):
             self.assertFalse(self.fixture.events(kind), kind)
+
+    def use_16k_entry(self):
+        self.fixture.entry = self.fixture.examples / DIRECT_16K
+        _aqa.pq.write_table(_aqa.pa.Table.from_pylist([self.aqa.row] * 12), self.aqa.train)
+        (self.fixture.examples / "env_export_huanyu.sh").write_text("exit 91\n", encoding="utf-8")
+
+    def test_direct_16k_keeps_24_plus_8_and_full_precision_through_all_wrappers(self):
+        self.use_16k_entry()
+        capture = self.aqa.launch(
+            {"NUM_NPUS": "16", "NNODES": "1", "RM_N_GPUS_PER_NODE": "16", "RM_NNODES": "1",
+             "RM_ENABLE": "0", "ROLLOUT_TP": "8", "RM_TP": "8", "TRAIN_BATCH_SIZE": "4",
+             "HUANYU_PRECISION_PROFILE": "custom", "MINICPMO_STABLE_LINEAR": "0",
+             "MAX_PROMPT_LENGTH": "3072", "RAY_ADDRESS": "192.0.2.10:6925"},
+            ("trainer.n_gpus_per_node=16", "trainer.nnodes=1", "reward.reward_model.n_gpus_per_node=16",
+             "reward.reward_model.nnodes=1", "reward.reward_model.enable=false",
+             "data.max_prompt_length=3072", "actor_rollout_ref.rollout.max_model_len=5248",
+             "actor_rollout_ref.rollout.tensor_model_parallel_size=8",
+             "++ray_kwargs.ray_init.runtime_env.env_vars.MINICPMO_MM_PROMPT_BUDGET=3072",
+             "++ray_kwargs.ray_init.runtime_env.env_vars.MINICPMO_STABLE_LINEAR=0",
+             "actor_rollout_ref.actor.optim.lr=2e-6"),
+        )
+        env, actual = capture["env"], _aqa.effective_arguments(capture)
+        self.aqa.assert_precision_environment(env)
+        for key, value in _aqa.PRECISION_ENV.items():
+            self.assertEqual(json.loads(actual[_aqa.ENV_PREFIX + key]), value, key)
+        expected = {
+            "trainer.n_gpus_per_node": "12", "trainer.nnodes": "2",
+            "reward.reward_model.n_gpus_per_node": "4", "reward.reward_model.nnodes": "2",
+            "reward.reward_model.enable": "true", "reward.reward_model.enable_resource_pool": "true",
+            "actor_rollout_ref.rollout.tensor_model_parallel_size": "4",
+            "reward.reward_model.rollout.tensor_model_parallel_size": "4",
+            "actor_rollout_ref.rollout.agent.num_workers": "6",
+            "data.train_batch_size": "6", "actor_rollout_ref.actor.ppo_mini_batch_size": "6",
+            "actor_rollout_ref.rollout.n": "4", "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu": "1",
+            "data.max_prompt_length": "14336", "data.max_response_length": "2048",
+            "actor_rollout_ref.rollout.prompt_length": "14336", "actor_rollout_ref.rollout.response_length": "2048",
+            "actor_rollout_ref.rollout.max_model_len": "16512",
+            "actor_rollout_ref.rollout.max_num_batched_tokens": "16512",
+            "actor_rollout_ref.actor.ppo_max_token_len_per_gpu": "16512",
+            "actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu": "16512",
+            "actor_rollout_ref.ref.log_prob_max_token_len_per_gpu": "16512",
+            "actor_rollout_ref.model.override_config.attn_implementation": "sdpa",
+            "actor_rollout_ref.model.override_config.huanyu_freeze_audio": "false",
+            "actor_rollout_ref.actor.use_dynamic_bsz": "false",
+            "actor_rollout_ref.actor.fsdp_config.fsdp_size": "-1",
+            "actor_rollout_ref.ref.fsdp_config.fsdp_size": "-1",
+            "actor_rollout_ref.rollout.max_num_seqs": "32",
+            "actor_rollout_ref.rollout.enforce_eager": "true",
+            "reward.reward_model.rollout.enforce_eager": "true",
+            "actor_rollout_ref.actor.optim.lr": "2e-6",
+        }
+        for key, value in expected.items():
+            self.assertEqual(actual[key], value, key)
+        self.assertEqual(env["REWARD_POOL_NPUS"], "8")
+        self.assertEqual(env["RM_SPLIT_NODES"], "0")
+        self.assertEqual(env["HUANYU_USE_PRECOMPUTE"], "0")
+        self.assertEqual(env["HUANYU_SKIP_EDITABLE_INSTALL"], "1")
+        self.assertEqual(json.loads(actual[_aqa.ENV_PREFIX + "MINICPMO_MM_PROMPT_BUDGET"]), "14336")
+        self.assertEqual(actual["data.train_files"], _aqa._job.shell_path(self.aqa.train))
+        self.assertIn("genrm_verifier", actual["reward.custom_reward_function.path"])
+        for kind in ("pip", "git", "env-source", "helper"):
+            self.assertFalse(self.fixture.events(kind), kind)
+        self.assertEqual([event["args"] for event in self.fixture.events("ray")],
+                         [["status", "--address=192.0.2.10:6925"]])
+
+    def test_direct_16k_response_split_and_frozen_audio_comparison(self):
+        self.use_16k_entry()
+        capture = self.aqa.launch({"HUANYU_16K_RESPONSE_LENGTH": "4096",
+                                   "HUANYU_16K_ATTN_IMPLEMENTATION": "eager", "HUANYU_FREEZE_AUDIO": "true"})
+        actual = _aqa.effective_arguments(capture)
+        self.assertEqual(actual["data.max_prompt_length"], "12288")
+        self.assertEqual(actual["data.max_response_length"], "4096")
+        self.assertEqual(actual["actor_rollout_ref.rollout.prompt_length"], "12288")
+        self.assertEqual(actual["actor_rollout_ref.rollout.response_length"], "4096")
+        self.assertEqual(actual["actor_rollout_ref.model.override_config.attn_implementation"], "eager")
+        self.assertEqual(actual["actor_rollout_ref.model.override_config.huanyu_freeze_audio"], "true")
+        self.assertEqual(json.loads(actual[_aqa.ENV_PREFIX + "MINICPMO_MM_PROMPT_BUDGET"]), "12288")
+
+    def test_direct_16k_rejects_invalid_length_or_unreachable_cluster(self):
+        self.use_16k_entry()
+        for updates in ({"HUANYU_16K_RESPONSE_LENGTH": "16384"}, {"HUANYU_16K_RESPONSE_LENGTH": "02048"},
+                        {"HUANYU_16K_ATTN_IMPLEMENTATION": "invalid"}, {"RAY_ADDRESS": "local"},
+                        {"HUANYU_TEST_FAIL_RAY": "1"}):
+            with self.subTest(updates=updates):
+                result = self.fixture.run_launcher(updates)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                for kind in ("train", "pip", "git", "runtime", "env-source"):
+                    self.assertFalse(self.fixture.events(kind), kind)
 
 
 if __name__ == "__main__":

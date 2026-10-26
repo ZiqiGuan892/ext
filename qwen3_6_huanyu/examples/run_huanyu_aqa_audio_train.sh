@@ -2,7 +2,8 @@
 # Copy the contents of this examples directory to:
 #   ${PROJECT_ROOT}/examples/qwen3_6_huanyu/
 # Source the environment and start Ray on all nodes before running this entry.
-# RM_ENABLE=1 retains the 32-card GenRM path; RM_ENABLE=0 uses 16 cards and rules.
+# Default pools: actor16 + RM16; upper entries may supply another topology.
+# RM_ENABLE=0 uses the actor pool and rules, without allocating RM devices.
 set -euo pipefail
 
 export PROJECT_ROOT="${PROJECT_ROOT:-/opt/huawei/dataset/hfy-model-gy/verl_omni_qwen36_gzq_new}"
@@ -11,13 +12,37 @@ cd "${PROJECT_ROOT}"
 _HUANYU_MODEL_DIR="${PROJECT_ROOT}/verl_omni_ext/models/qwen3_6_huanyu"
 source "${_HUANYU_EXAMPLE_DIR}/run_output.sh" || exit $?
 export RM_ENABLE="${RM_ENABLE:-1}"
+export NUM_NPUS="${NUM_NPUS:-16}" NNODES="${NNODES:-1}" ROLLOUT_TP="${ROLLOUT_TP:-4}"
+for _huanyu_key in NUM_NPUS NNODES ROLLOUT_TP; do
+    [[ "${!_huanyu_key}" =~ ^[1-9][0-9]{0,4}$ ]] || {
+        echo "[huanyu-aqa] FATAL: ${_huanyu_key} must be an integer in 1..99999" >&2; exit 2;
+    }
+done
+if (( NUM_NPUS % ROLLOUT_TP != 0 )); then
+    echo '[huanyu-aqa] FATAL: ROLLOUT_TP must divide the per-node actor pool' >&2
+    exit 2
+fi
+_huanyu_actor_world=$((NUM_NPUS * NNODES))
+_huanyu_rollout_replicas=$((_huanyu_actor_world / ROLLOUT_TP))
 case "${RM_ENABLE}" in
     1)
         _HUANYU_BACKEND="${PROJECT_ROOT}/examples/qwen3_6_huanyu/run_qwen36_huanyu_32card.sh"
-        export REWARD_POOL_NPUS=16
+        export RM_N_GPUS_PER_NODE="${RM_N_GPUS_PER_NODE:-16}" RM_NNODES="${RM_NNODES:-1}"
+        export RM_TP="${RM_TP:-4}" RM_SPLIT_NODES="${RM_SPLIT_NODES:-1}"
+        for _huanyu_key in RM_N_GPUS_PER_NODE RM_NNODES RM_TP; do
+            [[ "${!_huanyu_key}" =~ ^[1-9][0-9]{0,4}$ ]] || {
+                echo "[huanyu-aqa] FATAL: ${_huanyu_key} must be an integer in 1..99999" >&2; exit 2;
+            }
+        done
+        if (( RM_N_GPUS_PER_NODE % RM_TP != 0 )); then
+            echo '[huanyu-aqa] FATAL: RM_TP must divide the per-node reward pool' >&2
+            exit 2
+        fi
+        export REWARD_POOL_NPUS=$((RM_N_GPUS_PER_NODE * RM_NNODES))
         _huanyu_reward_args=(
-            reward.reward_model.n_gpus_per_node=16
-            reward.reward_model.nnodes=1
+            "reward.reward_model.n_gpus_per_node=${RM_N_GPUS_PER_NODE}"
+            "reward.reward_model.nnodes=${RM_NNODES}"
+            "reward.reward_model.rollout.tensor_model_parallel_size=${RM_TP}"
         )
         ;;
     0)
@@ -87,10 +112,8 @@ echo "[huanyu-aqa] train=$TRAIN_FILE validation=$VAL_FILE"
 export MODEL_PATH="${MODEL_PATH:-/opt/huawei/dataset/hfy-model-gy/downloaded_models/Qwen3.6-35B-A3B-huanyu06b-iter2000-omni4b-hf-huanyu7tokens}"
 export RM_MODEL_PATH="${RM_MODEL_PATH:-/opt/huawei/dataset/hfy-model-gy/downloaded_models/Qwen3.5-35B-A3B}"
 
-# Both paths use 16 actor/rollout NPUs; only GenRM needs another 16 NPUs.
 # One sequence per actor rank avoids retaining full unsharded gradients during
 # FSDP2 no_sync accumulation. More train samples may form multiple mini-batches.
-export NUM_NPUS=16 NNODES=1 ROLLOUT_TP=4
 export TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-4}"
 export PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-4}"
 export ROLLOUT_N="${ROLLOUT_N:-4}"
@@ -101,9 +124,9 @@ for _huanyu_integer in "${TRAIN_BATCH_SIZE}" "${PPO_MINI_BATCH_SIZE}" "${ROLLOUT
         exit 2
     fi
 done
-if (( PPO_MINI_BATCH_SIZE * ROLLOUT_N != 16 || ROLLOUT_N < 2 ||
-      PPO_MINI_BATCH_SIZE % 4 != 0 || TRAIN_BATCH_SIZE % PPO_MINI_BATCH_SIZE != 0 )); then
-    echo "[huanyu-aqa] FATAL: require ppo_mini_batch*rollout.n=16, rollout.n>=2, ppo_mini_batch%4=0 and train_batch%ppo_mini_batch=0" >&2
+if (( PPO_MINI_BATCH_SIZE * ROLLOUT_N != _huanyu_actor_world || ROLLOUT_N < 2 ||
+      PPO_MINI_BATCH_SIZE % _huanyu_rollout_replicas != 0 || TRAIN_BATCH_SIZE % PPO_MINI_BATCH_SIZE != 0 )); then
+    echo "[huanyu-aqa] FATAL: require ppo_mini_batch*rollout.n=${_huanyu_actor_world}, rollout.n>=2, ppo_mini_batch%${_huanyu_rollout_replicas}=0 and train_batch%ppo_mini_batch=0" >&2
     exit 2
 fi
 
@@ -129,7 +152,7 @@ fi
 export PROJECT_NAME="${PROJECT_NAME:-huanyu_aqa}"
 _huanyu_experiment="audio_freeze_${HUANYU_FREEZE_AUDIO}_online"
 if [[ "${RM_ENABLE}" == 0 ]]; then
-    _huanyu_experiment+="_rule_based_16card"
+    _huanyu_experiment+="_rule_based_${_huanyu_actor_world}card"
 fi
 export EXPERIMENT_NAME="${EXPERIMENT_NAME:-${_huanyu_experiment}}"
 export DEFAULT_LOCAL_DIR="${DEFAULT_LOCAL_DIR:-${PROJECT_ROOT}/runs/${PROJECT_NAME}/${EXPERIMENT_NAME}/checkpoints}"
@@ -182,9 +205,9 @@ fi
 
 # The direct AQA entry (including RM_ENABLE=0) must establish the same policy
 # before its first native import. Do not rely only on the final backend or a
-# previously started Raylet. TP4 below is also enforced in the final overrides.
+# previously started Raylet. The chosen TP is enforced in the final overrides.
 source "${_HUANYU_EXAMPLE_DIR}/precision_mode.sh" "$@" \
-    actor_rollout_ref.rollout.tensor_model_parallel_size=4 || exit $?
+    "actor_rollout_ref.rollout.tensor_model_parallel_size=${ROLLOUT_TP}" || exit $?
 echo "[huanyu-aqa] precision train_GDN=$MINICPMO_HUANYU_GDN_FP32_TRAINING rollout_GDN=$MINICPMO_GDN_FP32_REFERENCE reload=$MINICPMO_HUANYU_LAYERWISE_RELOAD KV_zero=$MINICPMO_HYBRID_BLOCK_ZERO_REFERENCE hooks=$VLLM_OMNI_EXTERNAL_MODULES"
 
 # Check all rows without decoding audio; a validation split containing mixed
@@ -218,7 +241,7 @@ for _huanyu_env_key in PYTHONPATH HUANYU_VLLM_OMNI_ROOT HUANYU_FREEZE_AUDIO \
     _huanyu_ray_args+=("++ray_kwargs.ray_init.runtime_env.env_vars.${_huanyu_env_key}=${_huanyu_env_json}")
 done
 
-echo "[huanyu-aqa] freeze_audio=${HUANYU_FREEZE_AUDIO} cache=off visual=frozen; actor=16NPU RM=${REWARD_POOL_NPUS}NPU RM_ENABLE=${RM_ENABLE}"
+echo "[huanyu-aqa] freeze_audio=${HUANYU_FREEZE_AUDIO} cache=off visual=frozen; actor=${_huanyu_actor_world}NPU RM=${REWARD_POOL_NPUS}NPU RM_ENABLE=${RM_ENABLE} actor_pool=${NUM_NPUS}x${NNODES}"
 if [[ "${RM_ENABLE}" == 0 ]]; then
     echo "[huanyu-aqa] reward=rule_based (character bigram Dice against ground_truth; no model/API)"
 fi
@@ -266,12 +289,13 @@ exec bash "${_HUANYU_BACKEND}" "${_huanyu_backend_defaults[@]}" "$@" \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=false \
     actor_rollout_ref.rollout.n="${ROLLOUT_N}" \
-    actor_rollout_ref.rollout.tensor_model_parallel_size=4 \
+    "actor_rollout_ref.rollout.tensor_model_parallel_size=${ROLLOUT_TP}" \
+    "actor_rollout_ref.rollout.agent.num_workers=${_huanyu_rollout_replicas}" \
     actor_rollout_ref.rollout.enable_prefix_caching=false \
     ++actor_rollout_ref.rollout.engine_kwargs.vllm_omni.pipeline_name=qwen3_6_huanyu \
     ++actor_rollout_ref.rollout.engine_kwargs.vllm_omni.mm_processor_cache_gb=0 \
     "${_huanyu_reward_args[@]}" \
-    trainer.n_gpus_per_node=16 \
-    trainer.nnodes=1 \
+    "trainer.n_gpus_per_node=${NUM_NPUS}" \
+    "trainer.nnodes=${NNODES}" \
     trainer.total_training_steps="${_huanyu_steps}" \
     "${_huanyu_ray_args[@]}" "${HUANYU_PRECISION_ARGS[@]}"
