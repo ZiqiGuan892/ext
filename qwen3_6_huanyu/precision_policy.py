@@ -34,12 +34,21 @@ def report_policy(role):
         if os.environ.get("HUANYU_GRAPH_MODE", "0").lower() not in {"0", "false", "off", "no"}:
             raise RuntimeError("Huanyu full precision references require eager mode (HUANYU_GRAPH_MODE=0)")
     snapshot = tuple((key, os.environ.get(key, "<unset>")) for key in expected)
-    marker = (role, profile, snapshot)
+    communication = tuple((key, os.environ.get(key, "<unset>")) for key in (
+        "HCCL_OP_EXPANSION_MODE", "HUANYU_HCCL_OP_EXPANSION_MODE",
+        "RANK", "LOCAL_RANK", "WORLD_SIZE", "LOCAL_WORLD_SIZE", "ASCEND_RT_VISIBLE_DEVICES",
+    ))
+    marker = (role, profile, snapshot, communication)
     if marker not in _REPORTED:
         _REPORTED.add(marker)
         print(f"[huanyu-precision] phase=configured role={role} profile={profile} "
               f"host={socket.gethostname()} pid={os.getpid()} source={__file__} "
               + " ".join(f"{key}={value}" for key, value in snapshot), flush=True)
+        # Report the worker's own environment, including reused Ray workers.
+        # This confirms propagation, not successful HCCL communication.
+        print(f"[huanyu-communication] event=environment role={role} "
+              f"host={socket.gethostname()} pid={os.getpid()} "
+              + " ".join(f"{key}={value}" for key, value in communication), flush=True)
     return profile
 
 

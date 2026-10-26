@@ -235,6 +235,7 @@ class AqaPrecisionEntryTests(unittest.TestCase):
                 "export MAX_RESPONSE_LENGTH=2048 ROLLOUT_MAX_MODEL_LEN=5248\n"
                 "export HUANYU_16K_RESPONSE_LENGTH=123 HUANYU_16K_ATTN_IMPLEMENTATION=invalid\n"
                 "export HUANYU_AQA_TRAIN_FILE=/old/train.parquet HUANYU_AQA_VAL_FILE=/old/validation.parquet\n"
+                "export HCCL_OP_EXPANSION_MODE=AIV HUANYU_HCCL_OP_EXPANSION_MODE=AIV\n"
             )
 
     def assert_16k_job_environment(self, env, response="2048"):
@@ -246,6 +247,7 @@ class AqaPrecisionEntryTests(unittest.TestCase):
             "TRAIN_BATCH_SIZE": "6", "PPO_MINI_BATCH_SIZE": "6", "ROLLOUT_N": "4",
             "MAX_PROMPT_LENGTH": str(16384 - int(response)), "MAX_RESPONSE_LENGTH": response,
             "ROLLOUT_MAX_MODEL_LEN": "16512", "HUANYU_16K_RESPONSE_LENGTH": response,
+            "HUANYU_HCCL_OP_EXPANSION_MODE": "auto", "HCCL_OP_EXPANSION_MODE": "AI_CPU",
         }).items():
             self.assertEqual(env[key], value, key)
 
@@ -275,7 +277,8 @@ class AqaPrecisionEntryTests(unittest.TestCase):
         }.items():
             self.assertEqual(actual[key], value, key)
         for key, value in dict(_aqa.PRECISION_ENV, **_aqa.MODE_ENV,
-                               MINICPMO_MM_PROMPT_BUDGET="14336").items():
+                               MINICPMO_MM_PROMPT_BUDGET="14336",
+                               HUANYU_HCCL_OP_EXPANSION_MODE="auto", HCCL_OP_EXPANSION_MODE="AI_CPU").items():
             self.assertEqual(json.loads(actual[_aqa.ENV_PREFIX + key]), value, key)
         self.assertEqual(len(self.fixture.events("train")), 1)
         self.assertEqual(len(self.fixture.events("pip")), 1)
@@ -329,6 +332,21 @@ class AqaPrecisionEntryTests(unittest.TestCase):
         self.assertIn("HUANYU_16K_RESPONSE_LENGTH", result.stdout + result.stderr)
         for kind in ("helper", "pip", "env-source", "ray", "train"):
             self.assertFalse(self.fixture.events(kind), kind)
+
+    def test_16k_explicit_host_survives_stale_site_env_and_reused_ray(self):
+        self.use_16k_job()
+        capture = self.aqa.launch({"HUANYU_HCCL_OP_EXPANSION_MODE": "HOST",
+                                   "HCCL_OP_EXPANSION_MODE": "AIV", "HUANYU_TEST_RAY_LIVE": "1"}, (
+            '++ray_kwargs.ray_init.runtime_env.env_vars.HCCL_OP_EXPANSION_MODE="AIV"',
+            '++ray_kwargs.ray_init.runtime_env.env_vars.HUANYU_HCCL_OP_EXPANSION_MODE="AIV"',
+        ))
+        actual = _aqa.effective_arguments(capture)
+        for key in ("HUANYU_HCCL_OP_EXPANSION_MODE", "HCCL_OP_EXPANSION_MODE"):
+            self.assertEqual(capture["env"][key], "HOST")
+            self.assertEqual(json.loads(actual[_aqa.ENV_PREFIX + key]), "HOST")
+            for event in self.fixture.events("runtime") + self.fixture.events("ray"):
+                self.assertEqual(event["env"][key], "HOST")
+        self.assertFalse(any("start" in event["args"] for event in self.fixture.events("ray")))
 
     def test_16k_job_cluster_readiness_failure_never_starts_training(self):
         self.use_16k_job()

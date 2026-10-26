@@ -41,9 +41,13 @@ class PrecisionModeTests(unittest.TestCase):
         self.fixture = fixture_module.HuanyuGraphModeTests(methodName="test_unset_mode_defaults_to_eager_and_overrides_inherited_graph_flags")
         self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
+        self.fixture.env.pop("NNODES", None)
+        self.fixture.env.pop("HCCL_OP_EXPANSION_MODE", None)
+        self.fixture.env.pop("HCCL_DETERMINISTIC", None)
         keys = CORE + FULL + OPTIONAL + ("HUANYU_PRECISION_PROFILE", "MINICPMO_FSDP2_PIN_MEMORY",
                                    "MINICPMO_HUANYU_ROLLOUT_TP", "VLLM_OMNI_EXTERNAL_MODULES",
-                                   "HUANYU_USE_PRECOMPUTE", "HCCL_OP_EXPANSION_MODE", "HCCL_DETERMINISTIC", "ROLLOUT_TP")
+                                   "HUANYU_USE_PRECOMPUTE", "HCCL_OP_EXPANSION_MODE", "HCCL_DETERMINISTIC", "ROLLOUT_TP",
+                                   "HUANYU_HCCL_OP_EXPANSION_MODE")
         self.fixture.capture_script.write_text(
             "import json, os, pathlib, sys\n"
             + "keys = " + repr(keys) + "\n"
@@ -138,6 +142,37 @@ class PrecisionModeTests(unittest.TestCase):
         self.assertEqual(capture["env"]["MINICPMO_HUANYU_ROLLOUT_TP"], "2")
         self.assertEqual(json.loads(self.overrides(capture)[PREFIX + "MINICPMO_HUANYU_ROLLOUT_TP"]), "2")
 
+    def test_cross_node_auto_replaces_inherited_and_late_site_aiv(self):
+        capture = self.capture(
+            SOURCE + 'export HCCL_OP_EXPANSION_MODE=AIV\n'
+            + 'huanyu_configure_precision_mode "$@"\npython3 "${HUANYU_PRECISION_ARGS[@]}"\n',
+            updates={"NNODES": "2", "HCCL_OP_EXPANSION_MODE": "AIV"},
+        )
+        self.assertEqual(capture["env"]["HCCL_OP_EXPANSION_MODE"], "AI_CPU")
+        self.assertEqual(capture["env"]["HUANYU_HCCL_OP_EXPANSION_MODE"], "auto")
+        self.assertEqual(json.loads(self.overrides(capture)[PREFIX + "HCCL_OP_EXPANSION_MODE"]), "AI_CPU")
+        self.assertEqual(json.loads(self.overrides(capture)[PREFIX + "HUANYU_HCCL_OP_EXPANSION_MODE"]), "auto")
+
+    def test_last_trainer_node_override_selects_actual_hccl_policy(self):
+        for shell_nodes, arguments, expected in (
+            ("1", ("trainer.nnodes=1", "++trainer.nnodes=2"), "AI_CPU"),
+            ("2", ("+trainer.nnodes=2", "trainer.nnodes=1"), "AIV"),
+        ):
+            with self.subTest(arguments=arguments):
+                capture = self.capture(updates={"NNODES": shell_nodes, "HCCL_OP_EXPANSION_MODE": "AIV"},
+                                       arguments=arguments)
+                self.assertEqual(capture["env"]["HCCL_OP_EXPANSION_MODE"], expected)
+                self.assertEqual(json.loads(self.overrides(capture)[PREFIX + "HCCL_OP_EXPANSION_MODE"]), expected)
+
+    def test_explicit_cross_node_communication_policy_wins_over_inherited_aiv(self):
+        for mode in ("AI_CPU", "HOST", "HOST_TS"):
+            with self.subTest(mode=mode):
+                capture = self.capture(updates={"NNODES": "2", "HCCL_OP_EXPANSION_MODE": "AIV",
+                                               "HUANYU_HCCL_OP_EXPANSION_MODE": mode})
+                self.assertEqual(capture["env"]["HCCL_OP_EXPANSION_MODE"], mode)
+                for key in ("HCCL_OP_EXPANSION_MODE", "HUANYU_HCCL_OP_EXPANSION_MODE"):
+                    self.assertEqual(json.loads(self.overrides(capture)[PREFIX + key]), mode)
+
     def test_invalid_flags_or_tp_fail_before_python(self):
         for updates, arguments in (
             ({"HUANYU_PRECISION_PROFILE": "custom", "MINICPMO_GDN_FP32_REFERENCE": "False"}, ()),
@@ -145,6 +180,11 @@ class PrecisionModeTests(unittest.TestCase):
             ({"HUANYU_USE_PRECOMPUTE": "yes"}, ()),
             ({"MINICPMO_ROW_TP_REFERENCE": "4"}, ("actor_rollout_ref.rollout.tensor_model_parallel_size=2",)),
             ({}, ("actor_rollout_ref.rollout.tensor_model_parallel_size=0",)),
+            ({"HUANYU_HCCL_OP_EXPANSION_MODE": "invalid"}, ()),
+            ({"NNODES": "2", "HUANYU_HCCL_OP_EXPANSION_MODE": "AIV"}, ()),
+            ({"HUANYU_HCCL_OP_EXPANSION_MODE": "AIV"}, ("trainer.nnodes=2",)),
+            ({"NNODES": "0"}, ()),
+            ({}, ("trainer.nnodes=invalid",)),
         ):
             with self.subTest(updates=updates, arguments=arguments):
                 result = self.fixture.run_shell(SOURCE + 'python3 "${HUANYU_PRECISION_ARGS[@]}"\n', updates, arguments)
@@ -153,9 +193,13 @@ class PrecisionModeTests(unittest.TestCase):
 
     def test_backend_exports_before_first_python_import(self):
         text = (EXAMPLES / "run_qwen36_huanyu_gspo_npu.sh").read_text(encoding="utf-8")
-        first_python = re.search(r"^python3 -m pip install[^\n]*\n", text, re.MULTILINE)
+        first_python = re.search(r"^\s*python3 -m pip install[^\n]*\n", text, re.MULTILINE)
         self.assertIsNotNone(first_python)
-        capture = self.capture("git() { return 0; }\n" + text[:first_python.end()])
+        # Installation now lives in a case statement; execute the complete
+        # setup prefix so the shell parses the matching esac as well.
+        setup_end = text.index("\nesac\n", first_python.end()) + len("\nesac\n")
+        capture = self.capture("git() { return 0; }\n" + text[:setup_end],
+                               updates={"HUANYU_SKIP_EDITABLE_INSTALL": "0"})
         self.assertEqual(capture["argv"][:3], ["-m", "pip", "install"])
         for key in CORE:
             self.assertEqual(capture["env"][key], "1")
