@@ -13,15 +13,15 @@
 # Never stops an existing Ray cluster or deletes an old checkout.
 set -euo pipefail
 
-export PROJECT_ROOT="${PROJECT_ROOT:-/opt/huawei/dataset/hfy-model-gy/verl_omni_qwen36_gzq_new}"
+export PROJECT_ROOT="${PROJECT_ROOT:-/opt/huawei/dataset/infra_data/verl_omni_qwen36_gzq_new}"
 _HUANYU_EXAMPLE_DIR="${PROJECT_ROOT}/examples/qwen3_6_huanyu"
 cd "$PROJECT_ROOT"
 # Resolve deployment paths once. Site environment files may still contain old
 # defaults; neither they nor downstream wrappers should replace caller paths.
 declare -A _HUANYU_PATH_CONFIG=(
     [PROJECT_ROOT]="$PROJECT_ROOT"
-    [MODEL_PATH]="${MODEL_PATH:-/opt/huawei/dataset/hfy-model-gy/downloaded_models/Qwen3.6-35B-A3B-huanyu06b-iter2000-omni4b-hf-huanyu7tokens}"
-    [RM_MODEL_PATH]="${RM_MODEL_PATH:-/opt/huawei/dataset/hfy-model-gy/downloaded_models/Qwen3.5-35B-A3B}"
+    [MODEL_PATH]="${MODEL_PATH:-/opt/huawei/dataset/model_gy/downloaded_models/Qwen3.6-35B-A3B-huanyu06b-iter2000-omni4b-hf-huanyu7tokens}"
+    [RM_MODEL_PATH]="${RM_MODEL_PATH:-/opt/huawei/dataset/model_gy/downloaded_models/Qwen3.5-35B-A3B}"
     [TRAIN_FILE]="${TRAIN_FILE:-/opt/huawei/dataset/infra_data/data/train.parquet}"
     [VAL_FILE]="${VAL_FILE:-/opt/huawei/dataset/infra_data/data/validation.parquet}"
 )

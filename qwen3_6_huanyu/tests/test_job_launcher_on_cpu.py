@@ -13,12 +13,12 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 EXAMPLES = ROOT / "examples"
 LAUNCHER = EXAMPLES / "run_huanyu_32card_job.sh"
-DEFAULT_PROJECT_ROOT = "/opt/huawei/dataset/hfy-model-gy/verl_omni_qwen36_gzq_new"
+DEFAULT_PROJECT_ROOT = "/opt/huawei/dataset/infra_data/verl_omni_qwen36_gzq_new"
 DEFAULT_MODEL_PATH = (
-    "/opt/huawei/dataset/hfy-model-gy/downloaded_models/"
+    "/opt/huawei/dataset/model_gy/downloaded_models/"
     "Qwen3.6-35B-A3B-huanyu06b-iter2000-omni4b-hf-huanyu7tokens"
 )
-DEFAULT_RM_MODEL_PATH = "/opt/huawei/dataset/hfy-model-gy/downloaded_models/Qwen3.5-35B-A3B"
+DEFAULT_RM_MODEL_PATH = "/opt/huawei/dataset/model_gy/downloaded_models/Qwen3.5-35B-A3B"
 DEFAULT_TRAIN_FILE = "/opt/huawei/dataset/infra_data/data/train.parquet"
 DEFAULT_VAL_FILE = "/opt/huawei/dataset/infra_data/data/validation.parquet"
 

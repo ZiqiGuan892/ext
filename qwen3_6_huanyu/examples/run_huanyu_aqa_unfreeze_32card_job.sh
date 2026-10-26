@@ -30,7 +30,7 @@
 # Smoke run: TOTAL_TRAINING_STEPS=2 bash /path/to/this/script.sh
 set -euo pipefail
 
-export PROJECT_ROOT="${PROJECT_ROOT:-/opt/huawei/dataset/hfy-model-gy/verl_omni_qwen36_gzq_new}"
+export PROJECT_ROOT="${PROJECT_ROOT:-/opt/huawei/dataset/infra_data/verl_omni_qwen36_gzq_new}"
 if [[ "$PROJECT_ROOT" != /* ]]; then
     echo 'FATAL: set PROJECT_ROOT to the absolute training-project path' >&2
     exit 2

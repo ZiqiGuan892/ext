@@ -30,7 +30,7 @@
 set -euo pipefail
 
 # 支持从任意目录启动；依赖脚本统一从 PROJECT_ROOT 读取。
-export PROJECT_ROOT="${PROJECT_ROOT:-/opt/huawei/dataset/hfy-model-gy/verl_omni_qwen36_gzq_new}"
+export PROJECT_ROOT="${PROJECT_ROOT:-/opt/huawei/dataset/infra_data/verl_omni_qwen36_gzq_new}"
 _REPO_ROOT="${PROJECT_ROOT}"
 cd "$_REPO_ROOT"
 
@@ -62,7 +62,7 @@ unset _huanyu_vllm_omni_root _huanyu_retained_pythonpath _huanyu_python_entries 
 
 # ---------------------------------------------------------------- 1) 模型
 # 默认选择 Huanyu，保留调用方显式传入的 checkpoint。
-export MODEL_PATH="${MODEL_PATH:-/opt/huawei/dataset/hfy-model-gy/downloaded_models/Qwen3.6-35B-A3B-huanyu06b-iter2000-omni4b-hf-huanyu7tokens}"
+export MODEL_PATH="${MODEL_PATH:-/opt/huawei/dataset/model_gy/downloaded_models/Qwen3.6-35B-A3B-huanyu06b-iter2000-omni4b-hf-huanyu7tokens}"
 
 # ---------------------------------------------------------------- 2) 尺寸口径
 # Direct-entry defaults only. An upper job/profile can supply every value;

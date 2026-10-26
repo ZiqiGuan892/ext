@@ -12,7 +12,7 @@
 # Deploy all companion scripts to PROJECT_ROOT/examples/qwen3_6_huanyu/.
 set -euo pipefail
 
-export PROJECT_ROOT="${PROJECT_ROOT:-/opt/huawei/dataset/hfy-model-gy/verl_omni_qwen36_gzq_new}"
+export PROJECT_ROOT="${PROJECT_ROOT:-/opt/huawei/dataset/infra_data/verl_omni_qwen36_gzq_new}"
 [[ "$PROJECT_ROOT" == /* ]] || { echo 'FATAL: PROJECT_ROOT must be absolute' >&2; exit 2; }
 _AQA_EXAMPLES="$PROJECT_ROOT/examples/qwen3_6_huanyu"
 for _file in run_huanyu_aqa_audio_train.sh run_output.sh graph_mode.sh precision_mode.sh; do

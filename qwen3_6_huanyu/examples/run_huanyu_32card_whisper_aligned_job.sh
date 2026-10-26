@@ -28,7 +28,7 @@
 # Keep related length values consistent when overriding individual Hydra keys.
 set -euo pipefail
 
-export PROJECT_ROOT="${PROJECT_ROOT:-/opt/huawei/dataset/hfy-model-gy/verl_omni_qwen36_gzq_new}"
+export PROJECT_ROOT="${PROJECT_ROOT:-/opt/huawei/dataset/infra_data/verl_omni_qwen36_gzq_new}"
 if [[ "$PROJECT_ROOT" != /* ]]; then
     echo 'FATAL: PROJECT_ROOT must be an absolute training-project path' >&2
     exit 2

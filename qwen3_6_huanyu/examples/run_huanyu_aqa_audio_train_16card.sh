@@ -4,7 +4,7 @@
 # ${PROJECT_ROOT}/examples/qwen3_6_huanyu/. Prepare the environment and Ray first.
 set -euo pipefail
 
-export PROJECT_ROOT="${PROJECT_ROOT:-/opt/huawei/dataset/hfy-model-gy/verl_omni_qwen36_gzq_new}"
+export PROJECT_ROOT="${PROJECT_ROOT:-/opt/huawei/dataset/infra_data/verl_omni_qwen36_gzq_new}"
 _HUANYU_EXAMPLE_DIR="${PROJECT_ROOT}/examples/qwen3_6_huanyu"
 export RM_ENABLE=0
 export REWARD_POOL_NPUS=0

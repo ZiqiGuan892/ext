@@ -10,7 +10,7 @@
 # PROJECT_ROOT locates dependencies even when this script is stored elsewhere.
 set -euo pipefail
 
-export PROJECT_ROOT="${PROJECT_ROOT:-/opt/huawei/dataset/hfy-model-gy/verl_omni_qwen36_gzq_new}"
+export PROJECT_ROOT="${PROJECT_ROOT:-/opt/huawei/dataset/infra_data/verl_omni_qwen36_gzq_new}"
 [[ "$PROJECT_ROOT" == /* ]] || { echo 'FATAL: PROJECT_ROOT must be absolute' >&2; exit 2; }
 _AQA_EXAMPLES="$PROJECT_ROOT/examples/qwen3_6_huanyu"
 for _file in run_huanyu_32card_job.sh run_huanyu_aqa_precision.sh precision_mode.sh; do

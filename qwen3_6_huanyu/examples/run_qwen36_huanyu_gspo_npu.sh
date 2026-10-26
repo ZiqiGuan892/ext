@@ -37,7 +37,7 @@
 # Direct launches bypass run_q36_job.sh, which installs the local entry points.
 # A source checkout on sys.path is insufficient: plugin discovery uses installed
 # distribution metadata. Install before the first Python/plugin import.
-export PROJECT_ROOT="${PROJECT_ROOT:-/opt/huawei/dataset/hfy-model-gy/verl_omni_qwen36_gzq_new}"
+export PROJECT_ROOT="${PROJECT_ROOT:-/opt/huawei/dataset/infra_data/verl_omni_qwen36_gzq_new}"
 _HUANYU_EXAMPLE_DIR="${PROJECT_ROOT}/examples/qwen3_6_huanyu"
 EXT_ROOT="${PROJECT_ROOT}"
 source "${_HUANYU_EXAMPLE_DIR}/run_output.sh" || exit $?
@@ -305,7 +305,7 @@ set -eo pipefail
 # §4. 路径与规模参数
 # =============================================================================
 # [MiniCPM 改动 1/6] 模型路径
-MODEL_PATH=${MODEL_PATH:-"/opt/huawei/dataset/hfy-model-gy/downloaded_models/Qwen3.6-35B-A3B-huanyu06b-iter2000-omni4b-hf-huanyu7tokens"}
+MODEL_PATH=${MODEL_PATH:-"/opt/huawei/dataset/model_gy/downloaded_models/Qwen3.6-35B-A3B-huanyu06b-iter2000-omni4b-hf-huanyu7tokens"}
 
 # 默认使用当前部署数据；显式 TRAIN_FILE / VAL_FILE 可选择其他兼容 parquet。
 TRAIN_FILE=${TRAIN_FILE:-"/opt/huawei/dataset/infra_data/data/train.parquet"}

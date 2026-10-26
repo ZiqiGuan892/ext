@@ -6,9 +6,9 @@ source "${_huanyu_env_example_dir}/precision_mode.sh" || {
 }
 
 # Huanyu 环境；在每个节点 ray start 前 source 本文件。
-# source 前 export PROJECT_ROOT 可覆盖部署目录；默认使用 hfy-model-gy 下的新项目。
+# source 前 export PROJECT_ROOT 可覆盖部署目录；默认使用 infra_data 下的新项目。
 # ext 从 PROJECT_ROOT 加载，verl / verl-omni 继续使用公共安装。
-export PROJECT_ROOT="${PROJECT_ROOT:-/opt/huawei/dataset/hfy-model-gy/verl_omni_qwen36_gzq_new}"
+export PROJECT_ROOT="${PROJECT_ROOT:-/opt/huawei/dataset/infra_data/verl_omni_qwen36_gzq_new}"
 # 兼容旧 Huanyu 入口；唯一需要配置的代码根目录是 PROJECT_ROOT。
 export QWEN36_HUANYU_ROOT="${PROJECT_ROOT}"
 export HUANYU_VLLM_OMNI_ROOT=/vllm-workspace/vllm-omni
@@ -103,8 +103,8 @@ pip install zarr
 
 export TORCH_EXTENSIONS_DIR=/cache/.torch_extension
 export NPUS_PER_NODE=16
-export MODEL_PATH="${MODEL_PATH:-/opt/huawei/dataset/hfy-model-gy/downloaded_models/Qwen3.6-35B-A3B-huanyu06b-iter2000-omni4b-hf-huanyu7tokens}"
-export RM_MODEL_PATH="${RM_MODEL_PATH:-/opt/huawei/dataset/hfy-model-gy/downloaded_models/Qwen3.5-35B-A3B}"
+export MODEL_PATH="${MODEL_PATH:-/opt/huawei/dataset/model_gy/downloaded_models/Qwen3.6-35B-A3B-huanyu06b-iter2000-omni4b-hf-huanyu7tokens}"
+export RM_MODEL_PATH="${RM_MODEL_PATH:-/opt/huawei/dataset/model_gy/downloaded_models/Qwen3.5-35B-A3B}"
 export TRAIN_FILE="${TRAIN_FILE:-/opt/huawei/dataset/infra_data/data/train.parquet}"
 export VAL_FILE="${VAL_FILE:-/opt/huawei/dataset/infra_data/data/validation.parquet}"
 export Q36_CKPT_DIR="${MODEL_PATH}"

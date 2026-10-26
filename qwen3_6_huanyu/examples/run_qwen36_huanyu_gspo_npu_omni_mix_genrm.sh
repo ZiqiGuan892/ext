@@ -21,12 +21,12 @@
 # =============================================================================
 
 set -eo pipefail
-export PROJECT_ROOT="${PROJECT_ROOT:-/opt/huawei/dataset/hfy-model-gy/verl_omni_qwen36_gzq_new}"
+export PROJECT_ROOT="${PROJECT_ROOT:-/opt/huawei/dataset/infra_data/verl_omni_qwen36_gzq_new}"
 _HERE="${PROJECT_ROOT}/examples/qwen3_6_huanyu"
 
 # ---- GenRM 配置 ----
 export RM_ENABLE=1
-export RM_MODEL_PATH=${RM_MODEL_PATH:-"/opt/huawei/dataset/hfy-model-gy/downloaded_models/Qwen3.5-35B-A3B"}
+export RM_MODEL_PATH=${RM_MODEL_PATH:-"/opt/huawei/dataset/model_gy/downloaded_models/Qwen3.5-35B-A3B"}
 
 
 # Resource sizes come from the upper entry. This layer only composes GenRM
@@ -52,7 +52,7 @@ export TRAIN_FILE=${TRAIN_FILE:-"/opt/huawei/dataset/infra_data/data/train.parqu
 export VAL_FILE=${VAL_FILE:-"/opt/huawei/dataset/infra_data/data/validation.parquet"}
 
 # ---- 模型路径：Qwen3.6-35B-A3B-huanyu06b-iter2000-omni4b-hf-huanyu7tokens ----
-export MODEL_PATH=${MODEL_PATH:-"/opt/huawei/dataset/hfy-model-gy/downloaded_models/Qwen3.6-35B-A3B-huanyu06b-iter2000-omni4b-hf-huanyu7tokens"}
+export MODEL_PATH=${MODEL_PATH:-"/opt/huawei/dataset/model_gy/downloaded_models/Qwen3.6-35B-A3B-huanyu06b-iter2000-omni4b-hf-huanyu7tokens"}
 
 # ---- 预计算缓存：本模型默认**不走** ----
 # 2026-10-14：原来这里默认指向 embed_cache_qwen36_sampleall_empty —— 一个**不存在**
