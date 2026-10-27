@@ -26,6 +26,30 @@ def _field(value, key):
     return getattr(value, key, _MISSING)
 
 
+def _sampling_overrides(server):
+    """Bridge controls omitted by Omni's AR SamplingParams construction.
+
+    Use the server's serialized rollout config, not driver environment variables:
+    an existing Ray cluster does not inherit later shell exports. Defaults remain
+    untouched, and the Huanyu processor guard keeps reward servers out of scope.
+    """
+    config = _field(server, "config")
+    overrides = {}
+    ignore_eos = _field(config, "ignore_eos")
+    if ignore_eos is not _MISSING:
+        if not isinstance(ignore_eos, bool):
+            raise ValueError("Huanyu rollout.ignore_eos must be a boolean")
+        if ignore_eos:
+            overrides["ignore_eos"] = True
+    side = _field(_field(config, "engine_kwargs"), "q36_sampling")
+    min_tokens = _field(side, "min_tokens")
+    if min_tokens is not _MISSING:
+        if isinstance(min_tokens, bool) or not isinstance(min_tokens, Integral) or min_tokens < 0:
+            raise ValueError("Huanyu engine_kwargs.q36_sampling.min_tokens must be a nonnegative integer")
+        overrides["min_tokens"] = int(min_tokens)
+    return overrides
+
+
 def _require_autoregressive_mode(server):
     # _ar_mode is a private implementation detail, absent in some servers.
     # An explicit AR rollout config can establish the mode without this flag;
@@ -223,6 +247,22 @@ def _install_on_server_class(server_class):
         _require_autoregressive_mode(self)
         bound = signature.bind(self, *args, **kwargs)
         bound.apply_defaults()
+        sampling_overrides = _sampling_overrides(self)
+        if sampling_overrides:
+            params = bound.arguments.get("sampling_params")
+            if not isinstance(params, Mapping):
+                raise RuntimeError("Huanyu EOS/length controls require a sampling_params mapping on the server call")
+            # Do not mutate a request dictionary shared by sibling generations.
+            params = dict(params)
+            for key, value in sampling_overrides.items():
+                params.setdefault(key, value)
+            bound.arguments["sampling_params"] = params
+            if not getattr(self, "_huanyu_sampling_reported", False):
+                print(f"[huanyu-sampling] ignore_eos={params.get('ignore_eos', False)} "
+                      f"min_tokens={params.get('min_tokens', 0)} "
+                      f"response_length={_field(_field(self, 'config'), 'response_length')} "
+                      "source=rollout_config/q36_sampling scope=huanyu", flush=True)
+                self._huanyu_sampling_reported = True
         if method_name == "_preprocess_input":
             media = bound.arguments["multi_modal_data"]
         else:

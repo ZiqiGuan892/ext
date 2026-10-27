@@ -2,10 +2,13 @@
 
 import errno
 import importlib.util
+import io
+from contextlib import redirect_stdout
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -37,7 +40,7 @@ class AudioMigrationTests(unittest.TestCase):
         return path
 
     def mapped(self, source):
-        return self.destination / "data" / source.relative_to(self.source)
+        return self.destination / "audios" / source.relative_to(self.source)
 
     def parquet(self, audio_rows, path=None):
         path = path or self.input
@@ -136,6 +139,104 @@ class AudioMigrationTests(unittest.TestCase):
         self.assertEqual(result["unique_files"], 1)
         self.assertFalse(self.destination.exists())
 
+    def test_many_archive_members_share_filesystem_checks_across_splits(self):
+        archive = self.media()
+        validation = self.input.with_name("validation.parquet")
+        self.parquet([[archive.as_posix() + f"::train-{index}"] for index in range(200)])
+        self.parquet([[archive.as_posix() + f"::validation-{index}"] for index in range(200)], validation)
+        resolutions = []
+        original_resolve = Path.resolve
+
+        def traced_resolve(path, *args, **kwargs):
+            resolutions.append(path)
+            return original_resolve(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "resolve", traced_resolve):
+            with mock.patch.object(migration, "_destination_size", wraps=migration._destination_size) as checked:
+                with redirect_stdout(io.StringIO()) as log:
+                    result = self.migrate([self.input, validation], dry_run=True)
+
+        self.assertEqual(result["rows"], 400)
+        self.assertEqual(result["unique_files"], 1)
+        self.assertEqual(resolutions.count(archive), 1)
+        self.assertEqual(checked.call_count, 1)
+        self.assertIn("scan split=train.parquet rows=100/200", log.getvalue())
+        self.assertLess(log.getvalue().index("scan_complete " + str(validation)),
+                        log.getvalue().index("check_destinations"))
+        self.assertFalse(self.destination.exists())
+
+    def test_absent_destination_parent_skips_individual_remote_lookups(self):
+        archives = [self.media(f"same/folder/{index}.zip") for index in range(20)]
+        self.parquet([[archive.as_posix() + "::uuid"] for archive in archives])
+        targets = {self.mapped(archive) for archive in archives}
+        parent = next(iter(targets)).parent
+        original_resolve = Path.resolve
+        original_lstat = Path.lstat
+        resolutions, file_lookups = [], []
+
+        def traced_resolve(path, *args, **kwargs):
+            resolutions.append(path)
+            return original_resolve(path, *args, **kwargs)
+
+        def traced_lstat(path, *args, **kwargs):
+            if path in targets:
+                file_lookups.append(path)
+            return original_lstat(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "resolve", traced_resolve):
+            with mock.patch.object(Path, "lstat", traced_lstat):
+                with redirect_stdout(io.StringIO()):
+                    self.migrate(dry_run=True)
+
+        self.assertEqual(resolutions.count(parent), 1)
+        self.assertEqual(file_lookups, [])
+        self.assertFalse(self.destination.exists())
+
+    def test_destination_parent_escape_is_rejected_before_copy(self):
+        archive = self.media()
+        self.parquet([[archive.as_posix() + "::uuid"]])
+        parent = self.mapped(archive).parent
+        original_resolve = Path.resolve
+
+        def escaped_parent(path, *args, **kwargs):
+            if path == parent:
+                return self.root / "outside-target"
+            return original_resolve(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "resolve", escaped_parent):
+            with mock.patch.object(migration, "_copy_media") as copy:
+                with self.assertRaisesRegex(ValueError, "escapes data directory"):
+                    self.migrate()
+                copy.assert_not_called()
+        self.assertFalse(self.destination.exists())
+
+    def test_heartbeat_reports_target_while_main_thread_waits(self):
+        archive = self.media()
+        self.parquet([[archive.as_posix() + "::uuid"]])
+        entered = threading.Event()
+        heartbeat = threading.Event()
+        original_print = print
+
+        def observe_print(*args, **kwargs):
+            text = " ".join(str(arg) for arg in args)
+            if (entered.is_set() and threading.current_thread() is not threading.main_thread()
+                    and "stat_destination " + str(self.mapped(archive)) in text):
+                heartbeat.set()
+            return original_print(*args, **kwargs)
+
+        def slow_destination(*_):
+            entered.set()
+            self.assertTrue(heartbeat.wait(timeout=3), "No heartbeat while destination lookup was blocked")
+            return None
+
+        with mock.patch.object(migration, "_destination_size", side_effect=slow_destination):
+            with mock.patch("builtins.print", side_effect=observe_print):
+                with redirect_stdout(io.StringIO()) as log:
+                    self.migrate(dry_run=True, progress_interval=0.02)
+        self.assertTrue(heartbeat.is_set())
+        self.assertIn("operation_elapsed=", log.getvalue())
+        self.assertFalse(self.destination.exists())
+
     def test_old_server_paths_read_from_local_mount_but_output_uses_server_root(self):
         archive = self.media(content=b"local archive bytes")
         old = "/opt/huawei/dataset/" + archive.relative_to(self.root).as_posix()
@@ -144,45 +245,45 @@ class AudioMigrationTests(unittest.TestCase):
 
         result = self.migrate(
             reference_prefix="/opt/huawei/dataset", local_prefix=self.root,
-            output_reference_root="/opt/huawei/dataset/hfy-infra-gy",
+            output_reference_root="/opt/huawei/dataset/hfy-infra-gy/data/aqa_dataset",
         )
 
         self.assertEqual(result["unique_files"], 1)
         self.assertEqual(result["copied"], 1)
         self.assertEqual(self.mapped(archive).read_bytes(), b"local archive bytes")
-        expected = "/opt/huawei/dataset/hfy-infra-gy/data/" + archive.relative_to(self.source).as_posix()
+        expected = "/opt/huawei/dataset/hfy-infra-gy/data/aqa_dataset/audios/" + archive.relative_to(self.source).as_posix()
         migrated = pq.read_table(self.destination / "train.parquet")
         self.assertEqual(migrated["audios"].to_pylist(), [[expected + "::server-uuid", expected + "::local-uuid"]])
         self.assertEqual(migrated["prompt"].to_pylist(), source_table["prompt"].to_pylist())
         self.assertTrue(migrated.schema.equals(source_table.schema, check_metadata=True))
         self.assertEqual(self.input.read_bytes(), original_parquet)
 
-    def test_cli_defaults_keep_training_server_prefix(self):
+    def test_cli_defaults_read_directly_and_store_actual_destination(self):
         archive = self.media()
-        self.parquet([["/opt/huawei/dataset/" + archive.relative_to(self.root).as_posix() + "::uuid"]])
+        self.parquet([[archive.as_posix() + "::uuid"]])
 
         result = subprocess.run([
             sys.executable, "-B", str(SCRIPT), "--parquet", str(self.input),
             "--source-root", str(self.source), "--destination-root", str(self.destination),
-            "--local-prefix", str(self.root),
         ], capture_output=True, text=True, encoding="utf-8")
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.mapped(archive).read_bytes(), archive.read_bytes())
         self.assertEqual(
             pq.read_table(self.destination / "train.parquet")["audios"].to_pylist(),
-            [["/opt/huawei/dataset/hfy-infra-gy/data/" + archive.relative_to(self.source).as_posix() + "::uuid"]],
+            [[self.mapped(archive).as_posix() + "::uuid"]],
         )
+        self.assertNotIn("read_prefix=", result.stdout)
 
     def test_cli_without_parquet_migrates_train_and_validation(self):
         archive = self.media(content=b"one shared audio archive")
         validation = self.input.with_name("validation.parquet")
-        original_reference = "/opt/huawei/dataset/" + archive.relative_to(self.root).as_posix()
+        original_reference = archive.as_posix()
         self.parquet([[original_reference + "::train-uuid"]])
         self.parquet([[original_reference + "::validation-uuid"]], validation)
         arguments = [
             str(SCRIPT), "--source-root", str(self.source),
-            "--destination-root", str(self.destination), "--local-prefix", str(self.root),
+            "--destination-root", str(self.destination),
         ]
 
         with mock.patch.object(migration, "DEFAULT_PARQUET", str(self.input)):
@@ -190,14 +291,12 @@ class AudioMigrationTests(unittest.TestCase):
                 with mock.patch.object(sys, "argv", arguments):
                     migration.main()
 
-        expected_reference = (
-            "/opt/huawei/dataset/hfy-infra-gy/data/" + archive.relative_to(self.source).as_posix()
-        )
+        expected_reference = self.mapped(archive).as_posix()
         for split, member in (("train", "train-uuid"), ("validation", "validation-uuid")):
             with self.subTest(split=split):
                 output = pq.read_table(self.destination / (split + ".parquet"))
                 self.assertEqual(output["audios"].to_pylist(), [[expected_reference + "::" + member]])
-        copied = [path for path in (self.destination / "data").rglob("*") if path.is_file()]
+        copied = [path for path in (self.destination / "audios").rglob("*") if path.is_file()]
         self.assertEqual(copied, [self.mapped(archive)])
         self.assertEqual(copied[0].read_bytes(), b"one shared audio archive")
 
@@ -305,7 +404,7 @@ class AudioMigrationTests(unittest.TestCase):
             self.migrate()
 
         self.assertEqual(output.read_bytes(), b"existing output must survive")
-        self.assertFalse((self.destination / "data").exists())
+        self.assertFalse((self.destination / "audios").exists())
 
     def test_mount_rejecting_links_still_copies_media_and_parquet(self):
         archive = self.media(content=b"audio on a mount without hard links")

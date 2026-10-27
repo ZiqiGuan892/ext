@@ -2,9 +2,11 @@
 
 import asyncio
 from collections import UserDict
+from contextlib import redirect_stdout
 from copy import deepcopy
 import importlib.util
 import inspect
+from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
@@ -433,6 +435,147 @@ class RolloutInputsTest(unittest.TestCase):
         for candidate in candidates:
             with self.subTest(server=candidate), self.assertRaises(RuntimeError):
                 rollout._install_on_server_class(candidate)
+
+
+class SamplingControlsTest(unittest.TestCase):
+    @staticmethod
+    def server(config, *, asynchronous=False, huanyu=True):
+        class Server:
+            def _preprocess_input(self, prompt_ids, sampling_params, multi_modal_data):
+                self.calls += 1
+                return prompt_ids, sampling_params
+
+        class AsyncServer:
+            async def generate(self, prompt_ids, sampling_params, image_data=None, audio_data=None):
+                self.calls += 1
+                return prompt_ids, sampling_params
+
+        cls = AsyncServer if asynchronous else Server
+        rollout._install_on_server_class(cls)
+        server = cls()
+        server.calls = 0
+        server.model_config = SimpleNamespace(processor=Processor() if huanyu else object())
+        server._ar_mode = True
+        server.config = config
+        return server
+
+    @staticmethod
+    def invoke(server, params, *, asynchronous=False):
+        if asynchronous:
+            return asyncio.run(server.generate(audio_span(12), params, audio_data=[Waveform(16000)]))
+        return server._preprocess_input(audio_span(12), params, {"audio": [Waveform(16000)]})
+
+    def test_length_controls_reach_both_server_apis_without_mutating_requests(self):
+        for asynchronous in (False, True):
+            # The serialized config may expose mapping or dataclass attributes.
+            config = {"ignore_eos": True, "response_length": 10240,
+                      "engine_kwargs": {"q36_sampling": {"min_tokens": 10240}}}
+            if asynchronous:
+                config = SimpleNamespace(**config)
+            with self.subTest(asynchronous=asynchronous):
+                server = self.server(config, asynchronous=asynchronous)
+                params = {"temperature": 1.0, "max_tokens": 10240}
+                before = deepcopy(params)
+                with redirect_stdout(StringIO()) as logs:
+                    ids, actual = self.invoke(server, params, asynchronous=asynchronous)
+                    self.invoke(server, params, asynchronous=asynchronous)
+                self.assertEqual(ids, [200, 201])
+                self.assertEqual(actual, {**before, "ignore_eos": True, "min_tokens": 10240})
+                self.assertIsNot(actual, params)
+                self.assertEqual(params, before)
+                self.assertEqual(logs.getvalue().count("[huanyu-sampling]"), 1)
+                self.assertIn("ignore_eos=True min_tokens=10240 response_length=10240", logs.getvalue())
+                self.assertEqual(server.calls, 2)
+
+    def test_request_controls_override_server_defaults(self):
+        for asynchronous in (False, True):
+            with self.subTest(asynchronous=asynchronous):
+                server = self.server(
+                    {"ignore_eos": True, "engine_kwargs": {"q36_sampling": {"min_tokens": 10240}}},
+                    asynchronous=asynchronous,
+                )
+                params = {"ignore_eos": False, "min_tokens": 0, "max_tokens": 8}
+                with redirect_stdout(StringIO()):
+                    _, actual = self.invoke(server, params, asynchronous=asynchronous)
+                self.assertEqual(actual, params)
+                self.assertIsNot(actual, params)
+
+    def test_unconfigured_or_false_defaults_preserve_parameter_identity(self):
+        for config in (None, {}, {"ignore_eos": False}, {"engine_kwargs": {"q36_sampling": {}}}):
+            for asynchronous in (False, True):
+                with self.subTest(config=config, asynchronous=asynchronous):
+                    server = self.server(config, asynchronous=asynchronous)
+                    params = {"max_tokens": 31}
+                    with redirect_stdout(StringIO()) as logs:
+                        _, actual = self.invoke(server, params, asynchronous=asynchronous)
+                    self.assertIs(actual, params)
+                    self.assertNotIn("[huanyu-sampling]", logs.getvalue())
+
+    def test_min_tokens_can_be_selected_without_enabling_ignore_eos(self):
+        config = UserDict(engine_kwargs=SimpleNamespace(q36_sampling=UserDict(min_tokens=0)))
+        server = self.server(config)
+        params = {"max_tokens": 17}
+        with redirect_stdout(StringIO()):
+            _, actual = self.invoke(server, params)
+        self.assertEqual(actual, {"max_tokens": 17, "min_tokens": 0})
+        self.assertNotIn("ignore_eos", actual)
+
+    def test_other_model_servers_ignore_even_invalid_huanyu_controls(self):
+        for asynchronous in (False, True):
+            with self.subTest(asynchronous=asynchronous):
+                server = self.server(
+                    {"ignore_eos": "bad", "engine_kwargs": {"q36_sampling": {"min_tokens": -1}}},
+                    asynchronous=asynchronous, huanyu=False,
+                )
+                params = {"max_tokens": 1024}
+                with redirect_stdout(StringIO()) as logs:
+                    ids, actual = self.invoke(server, params, asynchronous=asynchronous)
+                self.assertEqual(ids, audio_span(12))
+                self.assertIs(actual, params)
+                self.assertNotIn("[huanyu-sampling]", logs.getvalue())
+
+    def test_invalid_config_values_fail_before_the_native_server_call(self):
+        configs = [{"ignore_eos": value} for value in ("true", 1, None)]
+        configs += [{"engine_kwargs": {"q36_sampling": {"min_tokens": value}}}
+                    for value in (-1, 1.5, "10240", True, None)]
+        for config in configs:
+            for asynchronous in (False, True):
+                with self.subTest(config=config, asynchronous=asynchronous):
+                    server = self.server(config, asynchronous=asynchronous)
+                    with self.assertRaises(ValueError):
+                        self.invoke(server, {}, asynchronous=asynchronous)
+                    self.assertEqual(server.calls, 0)
+
+    def test_configured_controls_require_a_mapping_request(self):
+        for asynchronous in (False, True):
+            for params in (None, object(), []):
+                with self.subTest(asynchronous=asynchronous, params=params):
+                    server = self.server({"ignore_eos": True}, asynchronous=asynchronous)
+                    with self.assertRaisesRegex(RuntimeError, "sampling_params mapping"):
+                        self.invoke(server, params, asynchronous=asynchronous)
+                    self.assertEqual(server.calls, 0)
+
+    def test_configured_controls_reject_an_api_without_sampling_params(self):
+        class Server:
+            def _preprocess_input(self, prompt_ids, multi_modal_data):
+                raise AssertionError("must reject before native preprocessing")
+
+        class AsyncServer:
+            async def generate(self, prompt_ids, image_data=None, audio_data=None):
+                raise AssertionError("must reject before native generation")
+
+        for cls in (Server, AsyncServer):
+            with self.subTest(server=cls.__name__):
+                rollout._install_on_server_class(cls)
+                server = cls()
+                server.model_config = SimpleNamespace(processor=Processor())
+                server._ar_mode = True
+                server.config = {"ignore_eos": True}
+                with self.assertRaisesRegex(RuntimeError, "sampling_params mapping"):
+                    if cls is Server:
+                        server._preprocess_input([7], {})
+                    else:
+                        asyncio.run(server.generate([7]))
 
 
 if __name__ == "__main__":
