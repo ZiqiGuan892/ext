@@ -341,6 +341,9 @@ bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/run_huanyu_stem.sh"
 | `check_runtime.py` | 必填 `--model-path`，检查导入/processor/合成音频图片/mRoPE；不加载权重、不启Ray |
 | `check_aqa_audio_train.py` | `--train`、`--validation`、`--train-batch-size`，检查AQA来源/字段/媒体路径；不解码音频、不检查归档内部成员 |
 | `migrate_aqa_audio.py` | 复制音频归档并改写parquet，支持预检查、批量读取和进度日志，不执行训练 |
+| `external_audio.py` | 按需读取外部音频文件、TAR成员或Zarr ZIP数组，返回音频字节并可回填样本的audio_buffer；作为Python模块调用 |
+| `export_aqa_validation_wav.py` | 将AQA Parquet按行导出prompt、参考答案、对应WAV及索引；可生成vLLM Chat Completions请求JSON |
+| `request_aqa_validation_wav.py` | 读取已导出的prompt和WAV，逐条调用HTTP Chat Completions，将回复TXT与完整结果JSON保存在row目录同级 |
 | `prepare_stem_jsonl_to_parquet.py` | STEM JSONL转Parquet，默认train.jsonl/val.jsonl；Optional类型注解兼容Python 3.8/3.9 |
 
 AQA检查会读取train和validation全部行，即使关闭训练前验证也要提供AQA音频验证集。它要求 `raw_source=aqa_real`、非空prompt/ground_truth/audio且无image/video。归档引用使用 `archive.zarr.zip::member_id`。
@@ -356,6 +359,111 @@ python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/migrate_aqa_audio.py" \
 ```
 
 正式写入去掉 `--dry-run`。目标根目录下写同名parquet，音频复制到 `audios/`，默认parquet写实际目标音频路径，不做 `/home` → `/opt` 转换。脚本默认目标仍是 `/opt/huawei/dataset/hfy-infra-gy/data/aqa_dataset`，与训练默认路径不同，因此示例显式指定目标。归档成员引用保留，已有输出parquet拒绝覆盖；等待 `COMPLETE` 后再使用产物。可用 `--batch-size`、`--log-every`、`--progress-interval` 调整读取与日志频率。
+
+### 外部音频按需读取：external_audio.py
+
+该文件基于附件收录，补充了AQA采样率组属性及标量数组支持，用于样本只保存音频位置、音频实际存放在外部文件或归档中的场景。调用方先完成rank分配和样本筛选，再读取选中样本的音频；模块本身不读取SSTable/Parquet、不做分布式筛选，也没有命令行入口，目前未接入Huanyu训练调用链。
+
+- `ExternalAudioReference`：记录会话/内容下标、绝对路径、相对路径和归档成员key。优先使用存在的 `absolute_path`；找不到时尝试 `audio_root/relative_path`，未指定root则读环境变量 `AL_AUDIO_ROOT`。
+- `read_external_audio()`：普通文件直接返回原始字节；TAR按key提取成员字节；`.zarr.zip`读取成员的 `audio` 数组，采样率优先使用组属性 `sampling_rate` / `sample_rate`，其次使用 `sample_rate` 数组（单元素或标量）。在内存中编码为PCM16 WAV，不解压整个归档到磁盘、不重采样；采样率缺失或无效时明确报错。
+- `materialize_external_audio()`：原地将字节填入 `train_unit.conversations[i].content[j].audio_buffer`，要求该内容的 `type` 为 `audio`。数据错误通过带 `error_type` 和路径信息的 `ExternalMediaError` 报告。
+
+依赖 `pydantic`；Zarr ZIP分支另需 `numpy`、`numcodecs`、`soundfile`。该分支支持代码所约定的Zarr v2一维数组结构，并非任意ZIP文件都可读取。按需读取仍会将选中的整段音频载入内存，代码没有显式的字节数或时长上限。
+
+在本目录下的Python程序中，可这样提取一条归档音频用于测试（路径与key替换为真实值）：
+
+```python
+from pathlib import Path
+from external_audio import ExternalAudioReference, read_external_audio
+
+ref = ExternalAudioReference(
+    conversation_index=0,
+    content_index=0,
+    absolute_path="/opt/huawei/dataset/infra_data/data/aqa_dataset/audios/example.zarr.zip",
+    relative_path="example.zarr.zip",
+    archive_key="sample_id",
+)
+wav_bytes = read_external_audio(ref, audio_root=None)
+Path("sample.wav").write_bytes(wav_bytes)
+```
+
+若原始引用是 `archive.zarr.zip::member_id`，需将两部分分别传入 `absolute_path` 和 `archive_key`；该模块不自动拆分 `::`。
+
+### 导出AQA验证集，逐条对应prompt、答案和WAV
+
+将 `export_aqa_validation_wav.py` 与 `external_audio.py` 放在同一目录，安装 `pyarrow pydantic numpy numcodecs soundfile` 后执行：
+
+```bash
+python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/export_aqa_validation_wav.py" \
+  --parquet /opt/huawei/dataset/infra_data/data/aqa_dataset/validation.parquet \
+  --output-dir /opt/huawei/dataset/infra_data/data/validation_vllm \
+  --model huanyu --max-tokens 2048
+```
+
+默认导出全部行；先试少量可加 `--limit 5`，输出目录必须不存在。`--model` 填服务实际的模型名称（与 `--served-model-name` 一致）；省略它则只导出数据，不生成请求。脚本不启动或调用推理服务，也不修改源Parquet和归档。
+
+```text
+validation_vllm/
+  manifest.jsonl                 # 每行包含原Parquet行号、prompt、答案、WAV对应路径
+  summary.json                  # status=complete才表示所选行全部完成
+  samples/row_000000/
+    prompt.json                 # 完整原始消息列表
+    ground_truth.txt            # 原始参考答案
+    audio_00.wav                # audios[0]，多音频另有audio_01.wav等
+    sample.json                 # 本条索引与音频采样率/声道数/时长
+    request.json                # 仅指定--model时生成，含base64 WAV
+  samples/row_000001/...
+```
+
+编号使用Parquet的零基行号；原 `extra_info.index/problem_id` 另行记录，避免源索引重复覆盖。音频按 `audios` 顺序完整导出为PCM16 WAV，保留采样率和声道数。失败会停止，写入 `error.json` 与 `status=failed`；manifest只记录完整导出的行，重跑请换新目录。
+
+请求JSON按原prompt中的 `<audio>` 顺序替换为 `input_audio`，保留system和问题文本，参考答案仅保存在数据文件中。占位符数量与音频数不一致时拒绝生成请求。格式参考[vLLM音频输入文档](https://docs.vllm.ai/en/latest/features/multimodal_inputs/#audio-inputs_1)，需要服务端模型支持音频Chat Completions；生成请求并不验证该服务器的模型适配。base64请求会额外占用磁盘，但无需让服务器访问导出端的WAV路径。
+
+向已经启动的服务测试第一条（地址/端口按实际修改）：
+
+```bash
+curl --fail-with-body http://localhost:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  --data-binary @/opt/huawei/dataset/infra_data/data/validation_vllm/samples/row_000000/request.json
+```
+
+### 使用导出的WAV请求模型，并保存每条回复
+
+`request_aqa_validation_wav.py` 使用 Python 3.8+ 标准库，无需安装OpenAI SDK、PyArrow或启动Ray。在能访问已启动的vLLM服务的机器上运行：
+
+```bash
+python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/request_aqa_validation_wav.py" \
+  --export-dir /opt/huawei/dataset/infra_data/data/validation_vllm \
+  --url http://localhost:28889/v1/chat/completions \
+  --model qwen3.8 \
+  --max-tokens 2048 \
+  --timeout-s 300 \
+  --limit 50
+```
+
+默认地址为 `http://localhost:28889/v1/chat/completions`，模型名为 `qwen3.8`，测试前50条，对应服务启动参数 `--port 28889 --served-model-name qwen3.8`；这三项可省略。请求脚本与服务不在同一机器时，使用 `--url` 将localhost替换为服务机器IP。客户端模型名使用服务别名，不填服务端实际权重目录 `/opt/huawei/dataset/model_gy/downloaded_models/2748`。这里选择HTTP问答接口，将原始prompt中的问题与WAV一起发送；与 `realtime_duplex_demo.py` 的WebSocket双工协议不同，不需要设置回复音色的 `--ref-audio`，服务端必须支持音频Chat Completions。
+
+脚本从 `manifest.jsonl` 取行号与有序WAV路径，从每个row目录读取 `prompt.json` 和 `ground_truth.txt`，将 `<audio>` 按顺序替换为base64 WAV。无需已有 `request.json`，本次命令的模型名和生成参数直接生效。保留音频采样率和声道，发送完整文件；**ground_truth仅保存到本地结果，不发送给模型**。
+
+```text
+validation_vllm/samples/
+  row_000000/                 # 原导出的prompt、ground_truth、WAV
+  row_000000.response.txt      # 模型回复正文
+  row_000000.response.json     # 行号、prompt、参考答案、WAV路径、模型回复、完整响应
+  row_000001/
+  row_000001.response.txt
+  row_000001.response.json
+```
+
+结果与 `row_XXXXXX/` **同级**，不写入row目录。JSON中另存 `reasoning_content`、`usage`、`finish_reason` 和耗时；`finish_reason=length` 时标记 `truncated=true`，表示服务返回的回复被长度限制截断。正文为空（例如只返回推理内容）记为失败，原始响应仍保留在JSON中。
+
+- `--limit` 默认50：测试前50条，不足50条则测试全部已有行；`--limit 5` 可先测5条，`--limit 0` 才表示测试全部已导出的行。`--start-row 100` 从原Parquet零基行号100开始。
+- `--skip-existing`：续跑时只跳过请求地址、模型、参数、prompt、WAV字节与参考答案都匹配的成功结果；失败、损坏或输入变化的结果会报错，避免混用。
+- `--result-tag after_rl`：另存 `row_000000.after_rl.txt/json`，适合比较不同模型。`--overwrite` 则明确替换选中行的旧结果；不能与 `--skip-existing` 同用。
+- 默认逐条请求、遇错停止，不自动重试；`--continue-on-error` 可记录失败后继续，其最终退出码仍非零。HTTP错误、超时等写入对应结果JSON，不伪造回复。
+- 若服务要求API Key，运行前 `export VLLM_API_KEY=...`。该值仅放入请求头，不保存到结果。
+
+先测50条后，使用原命令改为 `--limit 0` 并加 `--skip-existing` 可继续请求其余数据；若要重试失败行，可使用 `--start-row N --limit 1 --overwrite`。客户端CPU测试覆盖请求与文件处理，实际模型适配需要在目标服务上验证。
 
 ## 7. 日志与生效确认
 
