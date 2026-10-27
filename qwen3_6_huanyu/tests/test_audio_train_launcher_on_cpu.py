@@ -148,6 +148,7 @@ class AudioTrainingLauncherTests(unittest.TestCase):
             "check_native_runtime.py",
             "run_output.sh",
             "precision_mode.sh",
+            "graph_mode.sh",
             "audio_train_mode.sh",
         ):
             shutil.copyfile(EXAMPLES / name, self.examples / name)
@@ -165,6 +166,11 @@ class AudioTrainingLauncherTests(unittest.TestCase):
         python_stub = self.bin / "python3"
         python_stub.write_text('#!/usr/bin/env bash\nexec "$HUANYU_TEST_PYTHON" "$@"\n', encoding="utf-8")
         python_stub.chmod(0o755)
+        # The prepared-environment entry probes an existing Ray cluster. Keep
+        # the CLI boundary, without importing Ray or connecting to a real one.
+        ray_stub = self.bin / "ray"
+        ray_stub.write_text('#!/usr/bin/env bash\n[[ "$1" == status ]]\n', encoding="utf-8")
+        ray_stub.chmod(0o755)
         self.capture = self.project / "capture.json"
         capture = (
             "import json, os, pathlib, sys; "
@@ -248,8 +254,9 @@ class AudioTrainingLauncherTests(unittest.TestCase):
         self.assertEqual(actual["reward.reward_model.n_gpus_per_node"], "16")
         self.assertEqual(actual["reward.reward_model.nnodes"], "1")
         self.assertEqual(actual["trainer.total_training_steps"], "2")
-        self.assertNotIn("trainer.rollout_data_dir", actual)
-        self.assertNotIn("trainer.logger", actual)
+        self.assertTrue(actual["trainer.rollout_data_dir"].endswith("/rollout_dump"))
+        self.assertTrue(actual["trainer.validation_data_dir"].endswith("/validation_dump"))
+        self.assertEqual(actual["trainer.logger"], "[console]")
         for key, value in (
             ("HUANYU_USE_PRECOMPUTE", "0"),
             ("MINICPMO_USE_PRECOMPUTE", "0"),

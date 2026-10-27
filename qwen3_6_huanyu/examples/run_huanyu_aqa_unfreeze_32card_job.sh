@@ -27,6 +27,9 @@
 # Optional AQA paths (checked by check_aqa_audio_train.py before training):
 #   HUANYU_AQA_TRAIN_FILE=/path/to/aqa/train.parquet
 #   HUANYU_AQA_VAL_FILE=/path/to/aqa/validation.parquet
+# Save all training batches and each validation run as per-step JSONL files.
+# Optional overrides: ROLLOUT_DATA_DIR, VALIDATION_DATA_DIR, TEST_FREQ (10),
+# VAL_BEFORE_TRAIN (true), or the corresponding trailing trainer.* arguments.
 # Smoke run: TOTAL_TRAINING_STEPS=2 bash /path/to/this/script.sh
 set -euo pipefail
 
@@ -72,6 +75,15 @@ export MAX_TOKEN_LEN_PER_GPU=5248 MINICPMO_MM_PROMPT_BUDGET=3072
 export PROJECT_NAME="${PROJECT_NAME:-huanyu_aqa}"
 export EXPERIMENT_NAME="${EXPERIMENT_NAME:-huanyu_aqa_unfreeze_5k_32card}"
 
+# Only the head submits training and writes samples. Give each launch a fresh
+# directory so step numbers from another run cannot overwrite these defaults.
+# Resolve paths before the site env is sourced and pass them as trainer options.
+_HUANYU_AQA_DUMP_ROOT="$PROJECT_ROOT/runs/$EXPERIMENT_NAME/samples_$(date +%Y%m%d_%H%M%S)_${BASHPID}"
+_HUANYU_AQA_ROLLOUT_DIR="${ROLLOUT_DATA_DIR:-$_HUANYU_AQA_DUMP_ROOT/rollout_dump}"
+_HUANYU_AQA_VALIDATION_DIR="${VALIDATION_DATA_DIR:-$_HUANYU_AQA_DUMP_ROOT/validation_dump}"
+_HUANYU_AQA_TEST_FREQ="${TEST_FREQ:-10}"
+_HUANYU_AQA_VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-true}"
+
 # Use the same policy on both nodes, even when this wrapper lives elsewhere.
 # The AQA training entry requires TP4; resolve that effective TP before Ray as
 # well, rather than validating an inherited frozen-profile TP which is ignored.
@@ -79,12 +91,17 @@ source "$_HUANYU_AQA_PRECISION" "$@" actor_rollout_ref.rollout.tensor_model_para
 echo "[huanyu-aqa-job] train=$TRAIN_FILE validation=$VAL_FILE"
 echo "[huanyu-aqa-job] freeze_audio=$HUANYU_FREEZE_AUDIO train_audio_encoder=$HUANYU_TRAIN_AUDIO_ENCODER train_audio_projector=$HUANYU_TRAIN_AUDIO_PROJECTOR cache=off actor=16NPU GenRM=16NPU prompt=3072 response=2048"
 echo "[huanyu-aqa-job] precision train_GDN=$MINICPMO_HUANYU_GDN_FP32_TRAINING rollout_GDN=$MINICPMO_GDN_FP32_REFERENCE reload=$MINICPMO_HUANYU_LAYERWISE_RELOAD KV_zero=$MINICPMO_HYBRID_BLOCK_ZERO_REFERENCE hooks=$VLLM_OMNI_EXTERNAL_MODULES"
+echo "[huanyu-aqa-job] dump defaults: rollout=$_HUANYU_AQA_ROLLOUT_DIR validation=$_HUANYU_AQA_VALIDATION_DIR test_freq=$_HUANYU_AQA_TEST_FREQ val_before_train=$_HUANYU_AQA_VAL_BEFORE_TRAIN (trailing trainer overrides take precedence)"
 
 # Length/attention defaults precede caller Hydra overrides. AQA's checked
 # dataset, audio component modes and synchronized microbatch settings are enforced
 # by run_huanyu_aqa_audio_train.sh after caller arguments. TOTAL_TRAINING_STEPS
 # is its supported run-length control. Logs/GenRM retain unique runs folders.
 exec bash "$_HUANYU_AQA_JOB" \
+    "trainer.rollout_data_dir=$_HUANYU_AQA_ROLLOUT_DIR" \
+    "trainer.validation_data_dir=$_HUANYU_AQA_VALIDATION_DIR" \
+    "trainer.test_freq=$_HUANYU_AQA_TEST_FREQ" \
+    "trainer.val_before_train=$_HUANYU_AQA_VAL_BEFORE_TRAIN" \
     data.max_prompt_length=3072 \
     data.max_response_length=2048 \
     actor_rollout_ref.rollout.prompt_length=3072 \

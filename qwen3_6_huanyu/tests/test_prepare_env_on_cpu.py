@@ -277,20 +277,20 @@ exit "$prepare_status"
         }.items():
             self.assertEqual(env[key], expected, key)
 
-    def test_precision_modes_force_full_before_native_import(self):
-        for mode in ("aqa_precision", "aqa_16k_sync_each"):
-            with self.subTest(mode=mode):
+    def test_aqa_precision_selection_survives_setup_before_native_import(self):
+        for profile, stable in (("full", "1"), ("custom", "0")):
+            with self.subTest(profile=profile):
                 result = self.run_prepare({
-                    "HUANYU_JOB_MODE": mode, "HUANYU_PRECISION_PROFILE": "custom",
+                    "HUANYU_JOB_MODE": "aqa_unfreeze", "HUANYU_PRECISION_PROFILE": profile,
                     "HUANYU_GRAPH_MODE": "0", "MINICPMO_STABLE_LINEAR": "0",
                 })
                 self.assert_success(result)
                 env = self.prepared()["env"]
-                self.assertEqual(env["HUANYU_PRECISION_PROFILE"], "full")
-                self.assertEqual(env["MINICPMO_STABLE_LINEAR"], "1")
+                self.assertEqual(env["HUANYU_PRECISION_PROFILE"], profile)
+                self.assertEqual(env["MINICPMO_STABLE_LINEAR"], stable)
                 self.assertEqual(env["HUANYU_USE_PRECOMPUTE"], "0")
                 self.assertEqual(env["HUANYU_GRAPH_MODE"], "0")
-                self.assertEqual(self.fixture.events("runtime")[-1]["precision"]["HUANYU_PRECISION_PROFILE"], "full")
+                self.assertEqual(self.fixture.events("runtime")[-1]["precision"]["HUANYU_PRECISION_PROFILE"], profile)
 
     def test_cache_failure_does_not_publish_a_ready_environment(self):
         self.fixture.cache.joinpath("manifest.json").unlink()

@@ -15,17 +15,15 @@
 | 冻结缓存训练，16K | `run_huanyu_32card_16k_job.sh` | 两节点 | prompt14336 + response2048，SDPA，默认16+16 |
 | 冻结缓存训练，对照 Whisper 启动参数 | `run_huanyu_32card_whisper_aligned_job.sh` | 两节点 | 保留 Huanyu 接口；Actor BF16、rollout TP2、RM TP4，5K |
 | AQA 在线训练，encoder/projector 可分别开关 | `run_huanyu_aqa_unfreeze_32card_job.sh` | 两节点 | 默认二者都训练，关闭缓存，16+16，5K |
-| AQA 在线训练，强制完整精度修复 | `run_huanyu_aqa_precision_32card_job.sh` | 两节点 | `full`、graph=0、16+16、5K |
-| AQA 在线训练，16K、逐 micro-batch 同步 | `run_huanyu_aqa_16k_sync_each_job.sh` | 两节点 | 固定16+16、TP4、静态 micro=1、逐 micro-batch 梯度同步 |
+| AQA 一键启动，自定义长度/同步 | `HUANYU_JOB_MODE=aqa_unfreeze bash run_huanyu_32card_job.sh` | 两节点 | 直接转入共用AQA入口，长度、精度和同步由参数配置 |
 | 已准备环境和 Ray，冻结/缓存训练 | `run_huanyu.sh` | 仅主节点 | 需提前配置冻结与缓存环境；复用通用训练链 |
 | 已准备环境和 Ray，AQA 自定义长度/参数 | `run_huanyu_aqa_audio_train.sh` | 仅主节点 | 在线音频，默认4096+2048，16+16，静态 micro=1 |
-| 已准备环境和 Ray，AQA 完整精度修复 | `run_huanyu_aqa_precision.sh` | 仅主节点 | 强制 `full`、graph=0，默认3072+2048；跳过安装 |
-| 已准备环境和 Ray，AQA 16K 同步模式 | `run_huanyu_aqa_16k_sync_each.sh` | 仅主节点 | 与对应一键入口相同的训练配置；跳过安装 |
+| 已准备环境和 Ray，STEM 纯文本 | `run_huanyu_stem.sh` | 仅主节点 | 默认5K、16+16、full、冻结音频、micro1、逐micro同步；支持12K及更长 |
 | 单机16卡 AQA，关闭模型奖励 | `run_huanyu_aqa_audio_train_16card.sh` | 仅主节点 | Actor16、RM0，规则奖励；默认4096+2048 |
 
-当前所有训练链通过 `precision_mode.sh` 默认选择 `full`。名称不带 `precision` 并不表示关闭精度修复；AQA precision 和 sync_each 专用入口还会强制 `full` 和 graph=0。
+当前所有训练链通过 `precision_mode.sh` 默认选择 `full`。名称不带 `precision` 并不表示关闭精度修复。AQA统一用环境变量 `HUANYU_PRECISION_PROFILE=full HUANYU_GRAPH_MODE=0` 明确选择完整修复。
 
-旧的 AQA `run_huanyu_aqa_16k_24_8*.sh` 已改名为 `run_huanyu_aqa_16k_sync_each*.sh`，当前配置是 **16+16**。冻结版 `run_huanyu_32card_16k_job.sh` 仍保留 `HUANYU_16K_POOL_LAYOUT=24+8` 可选配置；选项存在不代表此前跨节点 HCCL 问题已经解决。
+AQA的precision、16K sync_each四个专用入口已移除，改用本文共用入口命令；旧job模式也已移除。一键AQA统一设置 `HUANYU_JOB_MODE=aqa_unfreeze`，默认 **16+16**。冻结版 `run_huanyu_32card_16k_job.sh` 仍保留 `HUANYU_16K_POOL_LAYOUT=24+8` 可选配置；选项存在不代表此前跨节点HCCL问题已经解决。
 
 ## 2. 部署目录与默认路径
 
@@ -89,14 +87,8 @@ run_huanyu_aqa_unfreeze_32card_job.sh
   → run_huanyu_32card_job.sh（mode=aqa_unfreeze）
   → run_huanyu_aqa_audio_train.sh
 
-run_huanyu_aqa_precision_32card_job.sh
-  → run_huanyu_32card_job.sh（mode=aqa_precision）
-  → run_huanyu_aqa_precision.sh
-  → run_huanyu_aqa_audio_train.sh
-
-run_huanyu_aqa_16k_sync_each_job.sh
-  → run_huanyu_32card_job.sh（mode=aqa_16k_sync_each）
-  → run_huanyu_aqa_16k_sync_each.sh
+自定义5K/12K/16K、精度和梯度同步参数
+  → run_huanyu_32card_job.sh（mode=aqa_unfreeze）
   → run_huanyu_aqa_audio_train.sh
 ```
 
@@ -104,7 +96,7 @@ run_huanyu_aqa_16k_sync_each_job.sh
 
 ```text
 run_huanyu_aqa_audio_train.sh
-  ├─ audio_train_mode.sh / precision_mode.sh / run_output.sh
+  ├─ audio_train_mode.sh / graph_mode.sh / precision_mode.sh / run_output.sh
   ├─ check_aqa_audio_train.py：检查训练和验证集
   ├─ check_native_runtime.py：检查实际导入的原生运行时
   └─ RM_ENABLE=1
@@ -127,7 +119,7 @@ run_huanyu_aqa_audio_train_16card.sh
 
 奖励为 Huanyu `rule_based_reward.compute_score`，计算最终答案与 ground truth 的字符二元组集合 Dice，不加载 RM、不调用外部 API。它是词面相似度奖励，与 GenRM 语义判分不同。默认 thinking 模式下，未输出结束思考标记的答案记0；`ENABLE_THINKING=0` 会同步调整模板与规则要求。
 
-`RM_ENABLE=0` 适用于普通 AQA、普通 precision 或16卡规则入口。32卡一键入口及 GenRM 包装层会重新启用 RM，不能只在它们前面 export 0来关闭奖励池。
+`RM_ENABLE=0` 适用于共用 AQA 或16卡规则入口。32卡一键入口及 GenRM 包装层会重新启用 RM，不能只在它们前面 export 0来关闭奖励池。
 
 ## 4. 启动命令
 
@@ -164,7 +156,7 @@ export HUANYU_TRAIN_AUDIO_ENCODER=true HUANYU_TRAIN_AUDIO_PROJECTOR=true
 source "$PROJECT_ROOT/examples/qwen3_6_huanyu/prepare_huanyu_env.sh"
 ```
 
-支持 `frozen_cache`、`aqa_unfreeze`、`aqa_precision`、`aqa_16k_sync_each`；后两者强制full精度和graph=0。AQA准备关闭embedding cache，默认使用AQA的train/validation路径。模式只选择环境、音频和精度策略；长度、batch与梯度同步仍由后续普通启动脚本配置，选择 `aqa_16k_sync_each` 后应运行 `run_huanyu_aqa_16k_sync_each.sh`。
+支持 `frozen_cache`、`aqa_unfreeze` 两种模式。AQA准备关闭embedding cache，默认使用AQA的train/validation路径；通过 `HUANYU_PRECISION_PROFILE=full HUANYU_GRAPH_MODE=0` 选择完整修复。准备完成后统一运行 `run_huanyu_aqa_audio_train.sh`，长度、batch与梯度同步由启动参数配置。
 
 默认环境文件是本目录的 `env_export_huanyu.sh`。如站点文件叫 `source_env_export.sh`，在准备前 `export HUANYU_ENV_FILE=/绝对路径/source_env_export.sh`。项目/模型/数据路径、显式的输出目录与缓存路径会在source后恢复。不要用一个会主动启动Ray或训练的文件作为环境文件。
 
@@ -191,7 +183,7 @@ HUANYU_EMBED_CACHE_DIR=/opt/huawei/dataset/ccb_data/data/omni/embed_cache_huanyu
 bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/run_huanyu_32card_job.sh"
 ```
 
-切换场景时，两节点使用同一个最外层脚本和相同配置。例如冻结16K改用 `run_huanyu_32card_16k_job.sh`；AQA 16K改用 `run_huanyu_aqa_16k_sync_each_job.sh`。AQA 数据优先用下节的专用变量指定。
+切换场景时，两节点使用同一个最外层脚本和相同配置。例如冻结16K改用 `run_huanyu_32card_16k_job.sh`；自定义长度的AQA用 `HUANYU_JOB_MODE=aqa_unfreeze bash run_huanyu_32card_job.sh`，传入5.3节的长度和同步参数。AQA数据优先用下节的专用变量指定。
 
 jemalloc 先查 `HUANYU_JEMALLOC_LIBRARY` / `Q36_JEMALLOC_LIBRARY`，再查 `LD_PRELOAD` 和系统常见目录。找不到时设置两节点各自可读的绝对库路径，例如 `export HUANYU_JEMALLOC_LIBRARY=/实际路径/libjemalloc.so.2`。
 
@@ -201,10 +193,15 @@ jemalloc 先查 `HUANYU_JEMALLOC_LIBRARY` / `Q36_JEMALLOC_LIBRARY`，再查 `LD_
 
 ```bash
 RAY_ADDRESS=auto TOTAL_TRAINING_STEPS=2 \
-bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/run_huanyu_aqa_precision.sh"
+HUANYU_PRECISION_PROFILE=full HUANYU_GRAPH_MODE=0 \
+MAX_PROMPT_LENGTH=3072 MAX_RESPONSE_LENGTH=2048 \
+ROLLOUT_PROMPT_LENGTH=3072 ROLLOUT_MAX_MODEL_LEN=5248 \
+MAX_TOKEN_LEN_PER_GPU=5248 MINICPMO_MM_PROMPT_BUDGET=3072 \
+TRAIN_BATCH_SIZE=4 PPO_MINI_BATCH_SIZE=4 ROLLOUT_N=4 \
+bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/run_huanyu_aqa_audio_train.sh"
 ```
 
-正式训练将 `TOTAL_TRAINING_STEPS` 改为 `-1`（不限制总步数，仍受 epoch 限制）。AQA precision / sync_each 普通入口不 source 环境、不安装包、不启停 Ray，并检查现有集群；通用普通入口下游可能执行 editable 安装，已安装好时可设 `HUANYU_SKIP_EDITABLE_INSTALL=1`。
+正式训练将 `TOTAL_TRAINING_STEPS` 改为 `-1`（不限制总步数，仍受epoch限制）。共用AQA入口跳过editable安装、不加载环境、不启停Ray，并先检查现有集群。冻结普通入口下游可能执行editable安装，已安装好时可设 `HUANYU_SKIP_EDITABLE_INSTALL=1`。
 
 普通冻结入口 `run_huanyu.sh` 要求在两节点启动 Ray 前配置 `HUANYU_FREEZE_AUDIO=true`、两个组件训练开关为 `false`、`HUANYU_USE_PRECOMPUTE=1` 和缓存目录。一键冻结入口自动完成这些设置。
 
@@ -221,8 +218,8 @@ bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/run_huanyu_aqa_precision.sh"
 | 冻结一键入口 | 固定冻结两个音频组件、启用缓存和 RM；默认full，可显式选custom。路径、卡池、音频和精度值在加载环境文件后恢复 |
 | 冻结16K / Whisper 对照 | 默认长度等 Hydra 参数在用户参数前；改长度仍需对齐 Shell 预算、rollout 预算和媒体预算 |
 | AQA 共用入口 | 数据、组件、batch、TP、micro=1、dynamic=false等在用户参数后追加；通过对应环境变量调整可配置项 |
-| AQA unfreeze / precision 5K | Shell 长度设置为3072/2048；只export新长度不会改变默认。可同步覆盖完整 Hydra 长度组，任意长度实验更适合共用 AQA 入口 |
-| AQA sync_each | 固定16+16、TP4、batch4/mini4/n4、micro1、静态 batching、逐micro同步、full、graph0。总长度16K，通过 `HUANYU_16K_RESPONSE_LENGTH` 改输入/输出分配 |
+| AQA unfreeze 5K包装 | Shell长度设置为3072/2048；自定义长度直接调用共用AQA入口，或设置mode=aqa_unfreeze调用通用job |
+| 通用job的AQA模式 | 保留显式长度、batch、精度、输出目录和总步数，加载站点环境后恢复，再转入共用AQA入口 |
 | 最底层后端 | 用户参数后再次追加graph和precision参数；应使用 `HUANYU_GRAPH_MODE`、`HUANYU_PRECISION_PROFILE` 控制 |
 
 ### 5.2 数据、模型和音频冻结
@@ -256,20 +253,20 @@ bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/run_huanyu_aqa_unfreeze_32card_job.s
 | `ROLLOUT_PROMPT_LENGTH` / `ROLLOUT_MAX_MODEL_LEN` | rollout输入预算/引擎总长度；总长度应覆盖输入和输出 |
 | `MAX_TOKEN_LEN_PER_GPU` | Actor、rollout/ref log-prob的token预算；静态batching时不能代替micro-batch控制 |
 | `MINICPMO_MM_PROMPT_BUDGET` | 多模态prompt预算，需与rollout输入上限一致 |
-| `HUANYU_16K_RESPONSE_LENGTH` | 两种16K入口的输出长度，默认2048；输入自动为 `16384 - 输出`，引擎16512 |
-| `HUANYU_16K_ATTN_IMPLEMENTATION` | 两种16K入口的训练attention，默认sdpa，可选eager |
+| `HUANYU_16K_RESPONSE_LENGTH` | 冻结16K入口的输出长度，默认2048；输入自动为 `16384 - 输出`，引擎16512；AQA使用MAX_PROMPT_LENGTH/MAX_RESPONSE_LENGTH |
+| `HUANYU_16K_ATTN_IMPLEMENTATION` | 冻结16K入口的训练attention，默认sdpa，可选eager；AQA使用对应Hydra参数 |
 | `TRAIN_BATCH_SIZE` / `PPO_MINI_BATCH_SIZE` / `ROLLOUT_N` | 每批prompt、PPO mini-batch prompt、每prompt生成数 |
 | `PPO_MICRO_BATCH_SIZE_PER_GPU` | 静态训练的每卡micro-batch；AQA强制1 |
-| `actor_rollout_ref.rollout.max_num_seqs` | 推理并发，与训练micro-batch不同；冻结16K也支持 `HUANYU_16K_MAX_NUM_SEQS`，AQA sync_each固定32 |
+| `actor_rollout_ref.rollout.max_num_seqs` | 推理并发，与训练micro-batch不同；冻结16K也支持 `HUANYU_16K_MAX_NUM_SEQS`，AQA可通过Hydra配置 |
 | `actor_rollout_ref.rollout.gpu_memory_utilization` | Actor推理内存比例；GenRM包装层默认0.5会覆盖基础环境默认，最终修改用Hydra；RM可用 `RM_GPU_MEM_UTIL` |
 
 | 入口 | prompt / response | rollout prompt / engine |
 |---|---|---|
 | 冻结通用、Whisper对照 | 3072 / 2048 | 3104 / 5248 |
 | AQA共用、16卡规则 | 4096 / 2048 | 4096 / 6272 |
-| AQA unfreeze一键、precision | 3072 / 2048 | 3072 / 5248 |
+| AQA unfreeze一键 | 3072 / 2048 | 3072 / 5248 |
 | 冻结16K | 14336 / 2048 | 14368 / 16512 |
-| AQA 16K sync_each | 14336 / 2048 | 14336 / 16512 |
+| AQA 16K命令行示例 | 14336 / 2048 | 14336 / 16512 |
 
 AQA共用入口要求 `PPO_MINI_BATCH_SIZE × ROLLOUT_N = Actor总卡数`、`ROLLOUT_N >= 2`、mini-batch能被rollout副本数整除、train batch能被mini-batch整除。16+16默认 `4×4=16`，每个Actor rank每次mini-batch一条序列。冻结通用默认train32/mini32/n4，Whisper对照为32/16/8，不要直接套到AQA。
 
@@ -293,17 +290,35 @@ bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/run_huanyu_aqa_audio_train.sh" \
 
 共用AQA入口已经关闭Actor、rollout log-prob、ref log-prob的dynamic batching，并固定micro=1。同步开关要求部署模型目录中的 `microbatch_sync.py` 等Python代码；让每次micro-batch反向传播同步梯度，不改变optimizer更新频率。它不保证任意长序列不OOM，也不控制vLLM初始化内存。
 
+替代原16K入口：将上例长度改成 `MAX_PROMPT_LENGTH=14336 MAX_RESPONSE_LENGTH=2048 ROLLOUT_PROMPT_LENGTH=14336 ROLLOUT_MAX_MODEL_LEN=16512 MAX_TOKEN_LEN_PER_GPU=16512 MINICPMO_MM_PROMPT_BUDGET=14336`，response_length参数改为2048，保留SDPA和逐micro同步，并添加 `actor_rollout_ref.actor.fsdp_config.fsdp_size=-1 actor_rollout_ref.ref.fsdp_config.fsdp_size=-1`。需要一键准备和Ray时，在两节点设置同样参数，将执行文件换为 `run_huanyu_32card_job.sh` 并在bash前添加 `HUANYU_JOB_MODE=aqa_unfreeze`。
+
 忽略EOS可追加 `actor_rollout_ref.rollout.ignore_eos=true`；需要最小生成10240再加 `++actor_rollout_ref.rollout.engine_kwargs.q36_sampling.min_tokens=10240`。这依赖当前 `rollout_inputs.py` 的透传，需连同Python包部署；字段名不是 `ignore_eos_token`。显式停止条件、请求中断或长度预算仍可能终止生成。
 
 ### 5.4 精度、卡数、学习率与步数
 
 - `HUANYU_PRECISION_PROFILE=full` 启用训练/推理GDN FP32、prefill/gating/conv/L2/barrier、私有hybrid cache、stable linear、逐层权重同步、KV清零和媒体隔离，并设FSDP pin_memory=0；不表示所有模型运算都变成FP32。
-- full会把上述精度开关重新设为1，单独export某项为0不生效。单项对照需在允许的入口选择 `HUANYU_PRECISION_PROFILE=custom`；custom保留显式开关和各项默认，并非全部关闭。AQA precision / sync_each会强制full。
+- full会把上述精度开关重新设为1，单独export某项为0不生效。单项对照选择 `HUANYU_PRECISION_PROFILE=custom`；custom保留显式开关和各项默认，并非全部关闭。
 - `HUANYU_GRAPH_MODE=0` 为eager推理；full不能搭配graph=1。graph只控制Actor/RM推理，不开启Actor FSDP编译。
 - `NUM_NPUS × NNODES` 是Actor池，`RM_N_GPUS_PER_NODE × RM_NNODES` 是RM池。16+16的两池各用一个节点，故双方NNODES=1，整个Ray集群仍有两节点。默认rollout/RM TP4，各4个推理副本；Actor/ref训练使用FSDP2，TP值不表示训练也按TP4切分。
 - GenRM长度独立：默认总长32768、输出1024、输入31744，可用 `RM_MAX_MODEL_LEN`、`RM_RESPONSE_LENGTH`、`RM_PROMPT_LENGTH` 调整。
 - 学习率、epoch、保存/验证间隔用Hydra，例如末尾加 `actor_rollout_ref.actor.optim.lr=5e-7 trainer.total_epochs=3 trainer.save_freq=20 trainer.test_freq=10`。
 - AQA总步数用 `TOTAL_TRAINING_STEPS=2`，正式训练用 `-1` 或 `null`；AQA会在用户参数后追加总步数配置。冻结链短跑直接加 `trainer.total_training_steps=2`。AQA不使用 `DEBUG_MODE` / `DEBUG_SAMPLES`。
+
+### 5.5 STEM纯文本训练
+
+环境和Ray已准备后，仅在主节点执行 `run_huanyu_stem.sh`。默认Actor16 + GenRM16、TP4、full精度、关闭缓存、冻结encoder/projector、micro=1且逐micro同步。数学奖励由GenRM按答案等价性给出二值判断；parquet中的 `style=rule` 不会覆盖这个显式奖励配置。
+
+```bash
+# 默认5K：2048输入 + 3072输出；STEM长度变量支持k后缀（1k=1024）。
+bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/run_huanyu_stem.sh"
+# 12K：2048输入 + 10240输出，可设TOTAL_TRAINING_STEPS=3短跑。
+STEM_CONTEXT_LENGTH=12k TOTAL_TRAINING_STEPS=3 VAL_BEFORE_TRAIN=false \
+bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/run_huanyu_stem.sh"
+```
+
+数据目录默认 `/opt/huawei/dataset/infra_data/data/rl_stem_data`，可用 `STEM_DATA_DIR` 改目录，或 `STEM_TRAIN_FILE` / `STEM_VAL_FILE` 改文件。默认读取train.parquet与val.parquet，后者不存在时尝试validation.parquet。启动时为GenRM在本次运行目录写入带 `extra_info.question` 的parquet副本，源数据保持不变；该运行目录必须能被所有节点读取。
+
+更长测试使用 `STEM_CONTEXT_LENGTH=16k STEM_PROMPT_LENGTH=4096` 等组合；默认遇到EOS可以提前结束，`STEM_IGNORE_EOS=true` 可用于长度压力测试。长度不保证显存可容纳，GenRM的 `RM_MAX_MODEL_LEN` 预算独立配置。默认训练前验证、每10步验证，保存rollout和validation dump；可用 `VAL_BEFORE_TRAIN` / `TEST_FREQ` 调整。
 
 ## 6. 全部辅助脚本说明
 
@@ -326,6 +341,7 @@ bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/run_huanyu_aqa_audio_train.sh" \
 | `check_runtime.py` | 必填 `--model-path`，检查导入/processor/合成音频图片/mRoPE；不加载权重、不启Ray |
 | `check_aqa_audio_train.py` | `--train`、`--validation`、`--train-batch-size`，检查AQA来源/字段/媒体路径；不解码音频、不检查归档内部成员 |
 | `migrate_aqa_audio.py` | 复制音频归档并改写parquet，支持预检查、批量读取和进度日志，不执行训练 |
+| `prepare_stem_jsonl_to_parquet.py` | STEM JSONL转Parquet，默认train.jsonl/val.jsonl；Optional类型注解兼容Python 3.8/3.9 |
 
 AQA检查会读取train和validation全部行，即使关闭训练前验证也要提供AQA音频验证集。它要求 `raw_source=aqa_real`、非空prompt/ground_truth/audio且无image/video。归档引用使用 `archive.zarr.zip::member_id`。
 
@@ -346,7 +362,7 @@ python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/migrate_aqa_audio.py" \
 - 独立环境准备：`$PROJECT_ROOT/runs/environment/prepare_<时间>_<随机串>/prepare.log`，可用 `HUANYU_PREPARE_LOG_ROOT` 覆盖根目录；`[huanyu-env] READY` 表示检查通过。
 - 一键节点日志：`$PROJECT_ROOT/runs/$EXPERIMENT_NAME/cluster/rank_0.log` / `rank_1.log`，可用 `HUANYU_JOB_LOG_DIR` 覆盖。
 - 训练控制台：`[huanyu-output] console=...` 指出的 `$PROJECT_ROOT/runs/huanyu_<时间>_<随机串>/console.log`；GenRM dump在同一目录。
-- checkpoint/TensorBoard由 `DEFAULT_LOCAL_DIR` / `TENSORBOARD_DIR` 或最终trainer配置决定。env文件会设为项目固定目录；AQA precision和sync_each普通入口默认改为独立运行目录。自定义路径需注意source顺序，不要假定所有入口保存位置一致。
+- checkpoint/TensorBoard由 `DEFAULT_LOCAL_DIR` / `TENSORBOARD_DIR` 或最终trainer配置决定。共用AQA入口会将共享环境中的固定默认目录改为独立运行目录，并默认保存rollout_dump和validation_dump。显式环境目录与trainer参数优先；验证数据只在实际运行验证时产生。
 
 ```bash
 LOG=/本次运行目录/console.log

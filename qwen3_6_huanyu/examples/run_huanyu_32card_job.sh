@@ -3,8 +3,7 @@
 # Deploy to ${PROJECT_ROOT}/examples/qwen3_6_huanyu/ with the Huanyu package.
 # Defaults: frozen Huanyu, 35B sampleall, precomputed q128 cache, actor16 + RM16.
 # HUANYU_JOB_MODE=aqa_unfreeze selects online AQA training via its own entry.
-# HUANYU_JOB_MODE=aqa_precision selects the dedicated full-precision AQA entry.
-# HUANYU_JOB_MODE=aqa_16k_sync_each selects actor16 + RM16 with per-microbatch gradient sync.
+# AQA length and gradient-sync settings are supplied by environment/Hydra args.
 # Precision defaults: the complete full policy, including FP32 training/GDN,
 # prefill/gating/conv/L2/barrier, private hybrid cache, stable linear, layerwise
 # IPC reload, logical KV zeroing, isolated media and FSDP pin_memory=0.
@@ -22,19 +21,6 @@ case "$_PREPARE_ONLY" in
             echo 'FATAL: use prepare_huanyu_env.sh for environment-only preparation' >&2
             exit 2
         }
-        # These profile choices normally come from the outer job wrappers.
-        case "${HUANYU_JOB_MODE:-frozen_cache}" in
-            aqa_precision|aqa_16k_sync_each)
-                export HUANYU_PRECISION_PROFILE=full HUANYU_GRAPH_MODE=0 ;;
-        esac
-        case "${HUANYU_JOB_MODE:-frozen_cache}" in
-            aqa_unfreeze|aqa_precision|aqa_16k_sync_each)
-                if [[ "${TRAIN_FILE:-}" == /opt/huawei/dataset/infra_data/data/train.parquet ]]; then unset TRAIN_FILE; fi
-                if [[ "${VAL_FILE:-}" == /opt/huawei/dataset/infra_data/data/validation.parquet ]]; then unset VAL_FILE; fi
-                export TRAIN_FILE="${HUANYU_AQA_TRAIN_FILE:-${TRAIN_FILE:-/opt/huawei/dataset/infra_data/data/aqa_dataset/train.parquet}}"
-                export VAL_FILE="${HUANYU_AQA_VAL_FILE:-${VAL_FILE:-/opt/huawei/dataset/infra_data/data/aqa_dataset/validation.parquet}}"
-                ;;
-        esac
         ;;
     *) echo 'FATAL: HUANYU_PREPARE_ONLY must be 0 or 1' >&2; exit 2 ;;
 esac
@@ -42,6 +28,12 @@ esac
 export PROJECT_ROOT="${PROJECT_ROOT:-/opt/huawei/dataset/infra_data/verl_omni_qwen36_gzq_new}"
 _HUANYU_EXAMPLE_DIR="${PROJECT_ROOT}/examples/qwen3_6_huanyu"
 cd "$PROJECT_ROOT"
+if [[ "${HUANYU_JOB_MODE:-frozen_cache}" == aqa_unfreeze ]]; then
+    if [[ "${TRAIN_FILE:-}" == /opt/huawei/dataset/infra_data/data/train.parquet ]]; then unset TRAIN_FILE; fi
+    if [[ "${VAL_FILE:-}" == /opt/huawei/dataset/infra_data/data/validation.parquet ]]; then unset VAL_FILE; fi
+    export TRAIN_FILE="${HUANYU_AQA_TRAIN_FILE:-${TRAIN_FILE:-/opt/huawei/dataset/infra_data/data/aqa_dataset/train.parquet}}"
+    export VAL_FILE="${HUANYU_AQA_VAL_FILE:-${VAL_FILE:-/opt/huawei/dataset/infra_data/data/aqa_dataset/validation.parquet}}"
+fi
 # Resolve deployment paths once. Site environment files may still contain old
 # defaults; neither they nor downstream wrappers should replace caller paths.
 declare -A _HUANYU_PATH_CONFIG=(
@@ -114,24 +106,16 @@ if (( ! _POOLS_FIT )); then
     echo 'FATAL: per-node pools cannot fit on two 16-card nodes; for actor24 + RM8 use actor12x2 and RM4x2' >&2
     exit 2
 fi
-if [[ "$_JOB_MODE" == aqa_unfreeze || "$_JOB_MODE" == aqa_precision ]] &&
+if [[ "$_JOB_MODE" == aqa_unfreeze ]] &&
     (( _ACTOR_PER_NODE != 16 || _ACTOR_NODES != 1 || _RM_PER_NODE != 16 || _RM_NODES != 1 )); then
-    echo 'FATAL: the 5K AQA job entries require actor16 + RM16' >&2
-    exit 2
-fi
-if [[ "$_JOB_MODE" == aqa_16k_sync_each ]] &&
-    (( _ACTOR_PER_NODE != 16 || _ACTOR_NODES != 1 || _RM_PER_NODE != 16 || _RM_NODES != 1 ||
-       ${_HUANYU_POOL_CONFIG[ROLLOUT_TP]} != 4 || ${_HUANYU_POOL_CONFIG[RM_TP]} != 4 )); then
-    echo 'FATAL: run_huanyu_aqa_16k_sync_each_job.sh now requires actor16x1 + RM16x1 with TP4' >&2
+    echo 'FATAL: AQA jobs require actor16 + RM16' >&2
     exit 2
 fi
 fi  # Pool packing is checked when launching the job, not during standalone setup.
 case "$_JOB_MODE" in
     frozen_cache) _TRAIN_ENTRY=run_huanyu.sh ;;
     aqa_unfreeze) _TRAIN_ENTRY=run_huanyu_aqa_audio_train.sh ;;
-    aqa_precision) _TRAIN_ENTRY=run_huanyu_aqa_precision.sh ;;
-    aqa_16k_sync_each) _TRAIN_ENTRY=run_huanyu_aqa_16k_sync_each.sh ;;
-    *) echo 'FATAL: HUANYU_JOB_MODE must be frozen_cache, aqa_unfreeze, aqa_precision or aqa_16k_sync_each' >&2; exit 2 ;;
+    *) echo 'FATAL: HUANYU_JOB_MODE must be frozen_cache or aqa_unfreeze; configure AQA precision/length/sync through environment and training arguments' >&2; exit 2 ;;
 esac
 # Keep the component choices through site environment setup and into existing
 # Ray workers. The frozen-cache entry always freezes both audio components.
@@ -241,11 +225,11 @@ for _arg in "$@"; do
     esac
 done
 
-# The Whisper comparison and 16K AQA entries own these shell-side settings as well
-# as its final Hydra arguments. Older site env files must not change preflight
+# Preserve explicit AQA and Whisper settings across site environment setup.
+# Older site env files must not change preflight
 # lengths/batches or sampling defaults before that command is composed.
 declare -A _HUANYU_PROFILE_CONFIG=()
-if [[ "${HUANYU_JOB_PROFILE:-}" == whisper_aligned || "$_JOB_MODE" == aqa_16k_sync_each ]]; then
+if [[ "${HUANYU_JOB_PROFILE:-}" == whisper_aligned || "$_JOB_MODE" == aqa_unfreeze ]]; then
     for _key in TRAIN_BATCH_SIZE PPO_MINI_BATCH_SIZE PPO_MICRO_BATCH_SIZE_PER_GPU \
         ROLLOUT_N ACTOR_MODEL_DTYPE REF_MODEL_DTYPE ACTOR_OFFLOAD_POLICY \
         ACTOR_FORWARD_PREFETCH ACTIVATION_OFFLOAD FILTER_OVERLONG \
@@ -253,13 +237,15 @@ if [[ "${HUANYU_JOB_PROFILE:-}" == whisper_aligned || "$_JOB_MODE" == aqa_16k_sy
         ROLLOUT_MAX_MODEL_LEN MAX_TOKEN_LEN_PER_GPU MINICPMO_MM_PROMPT_BUDGET \
         ROLLOUT_TEMPERATURE ROLLOUT_TOP_P ROLLOUT_TOP_K ROLLOUT_REPETITION_PENALTY \
         ROLLOUT_FREQUENCY_PENALTY ROLLOUT_PRESENCE_PENALTY ROLLOUT_LOGPROBS_MODE \
-        ROLLOUT_GPU_MEM_UTIL HUANYU_GRAPH_MODE EXPERIMENT_NAME; do
+        ROLLOUT_GPU_MEM_UTIL HUANYU_GRAPH_MODE EXPERIMENT_NAME TOTAL_TRAINING_STEPS \
+        DEFAULT_LOCAL_DIR TENSORBOARD_DIR ROLLOUT_DATA_DIR VALIDATION_DATA_DIR \
+        TEST_FREQ VAL_BEFORE_TRAIN; do
         if [[ -v "$_key" ]]; then _HUANYU_PROFILE_CONFIG["$_key"]="${!_key}"; fi
     done
 fi
-if [[ "$_JOB_MODE" == aqa_16k_sync_each ]]; then
-    for _key in HUANYU_16K_RESPONSE_LENGTH HUANYU_16K_ATTN_IMPLEMENTATION \
-        HUANYU_AQA_TRAIN_FILE HUANYU_AQA_VAL_FILE; do
+if [[ "$_JOB_MODE" == aqa_unfreeze ]]; then
+    _HUANYU_PROFILE_CONFIG[HUANYU_GRAPH_MODE]="${HUANYU_GRAPH_MODE:-0}"
+    for _key in HUANYU_AQA_TRAIN_FILE HUANYU_AQA_VAL_FILE; do
         if [[ -v "$_key" ]]; then _HUANYU_PROFILE_CONFIG["$_key"]="${!_key}"; fi
     done
 fi
@@ -315,12 +301,6 @@ set +u
 source "$_ENV_FILE"
 set +x
 set -euo pipefail
-# This dedicated entry always uses the reference precision kernels, including
-# on the worker node. A site's graph/custom defaults cannot replace its policy.
-if [[ "$_JOB_MODE" == aqa_precision || "$_JOB_MODE" == aqa_16k_sync_each ]]; then
-    export HUANYU_PRECISION_PROFILE=full HUANYU_GRAPH_MODE=0
-    source "${_HUANYU_EXAMPLE_DIR}/graph_mode.sh"
-fi
 for _key in "${!_HUANYU_PATH_CONFIG[@]}"; do
     export "$_key=${_HUANYU_PATH_CONFIG[$_key]}"
 done
@@ -350,7 +330,7 @@ case "$_JOB_MODE" in
             exit 1
         }
         ;;
-    aqa_unfreeze|aqa_precision|aqa_16k_sync_each)
+    aqa_unfreeze)
         # Apply before Ray starts on BOTH nodes, after the site environment.
         # Empty the cache path as well as disabling it, including runtime_env
         # below for workers launched by an already-running frozen-cache raylet.

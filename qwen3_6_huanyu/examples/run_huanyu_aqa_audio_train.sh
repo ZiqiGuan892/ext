@@ -11,6 +11,17 @@ _HUANYU_EXAMPLE_DIR="${PROJECT_ROOT}/examples/qwen3_6_huanyu"
 cd "${PROJECT_ROOT}"
 _HUANYU_MODEL_DIR="${PROJECT_ROOT}/verl_omni_ext/models/qwen3_6_huanyu"
 source "${_HUANYU_EXAMPLE_DIR}/run_output.sh" || exit $?
+# Prepared-environment entry: do not repeat installation or create a local Ray
+# cluster when the requested cluster is unavailable. Job setup happens upstream.
+export HUANYU_SKIP_EDITABLE_INSTALL=1
+export RAY_ADDRESS="${RAY_ADDRESS:-auto}"
+[[ "$RAY_ADDRESS" != local ]] || { echo 'FATAL: use RAY_ADDRESS=auto or head_ip:port for the prepared cluster' >&2; exit 2; }
+_HUANYU_RAY_TIMEOUT="${HUANYU_RAY_STATUS_TIMEOUT:-30}"
+[[ "$_HUANYU_RAY_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || { echo 'FATAL: HUANYU_RAY_STATUS_TIMEOUT must be positive seconds' >&2; exit 2; }
+if ! timeout --foreground "${_HUANYU_RAY_TIMEOUT}s" ray status --address="$RAY_ADDRESS"; then
+    echo 'FATAL: existing Ray is not reachable; prepare the cluster before training' >&2
+    exit 1
+fi
 export RM_ENABLE="${RM_ENABLE:-1}"
 export NUM_NPUS="${NUM_NPUS:-16}" NNODES="${NNODES:-1}" ROLLOUT_TP="${ROLLOUT_TP:-4}"
 for _huanyu_key in NUM_NPUS NNODES ROLLOUT_TP; do
@@ -73,7 +84,7 @@ case "${RM_ENABLE}" in
 esac
 for _huanyu_file in "${_HUANYU_EXAMPLE_DIR}/check_native_runtime.py" "${_HUANYU_BACKEND}" \
     "${_HUANYU_EXAMPLE_DIR}/check_aqa_audio_train.py" "${_HUANYU_EXAMPLE_DIR}/precision_mode.sh" \
-    "${_HUANYU_EXAMPLE_DIR}/audio_train_mode.sh"; do
+    "${_HUANYU_EXAMPLE_DIR}/audio_train_mode.sh" "${_HUANYU_EXAMPLE_DIR}/graph_mode.sh"; do
     if [[ ! -f "${_huanyu_file}" ]]; then
         echo "[huanyu-aqa] FATAL: missing ${_huanyu_file}; deploy to PROJECT_ROOT/examples/qwen3_6_huanyu" >&2
         exit 2
@@ -138,6 +149,7 @@ export MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-2048}"
 export ROLLOUT_PROMPT_LENGTH="${ROLLOUT_PROMPT_LENGTH:-${MAX_PROMPT_LENGTH}}"
 export ROLLOUT_MAX_MODEL_LEN="${ROLLOUT_MAX_MODEL_LEN:-$((ROLLOUT_PROMPT_LENGTH + MAX_RESPONSE_LENGTH + 128))}"
 export MAX_TOKEN_LEN_PER_GPU="${MAX_TOKEN_LEN_PER_GPU:-${ROLLOUT_MAX_MODEL_LEN}}"
+export MINICPMO_MM_PROMPT_BUDGET="${MINICPMO_MM_PROMPT_BUDGET:-${ROLLOUT_PROMPT_LENGTH}}"
 _huanyu_steps="${TOTAL_TRAINING_STEPS:--1}"
 if [[ "${_huanyu_steps}" == -1 || "${_huanyu_steps}" == null ]]; then
     _huanyu_steps=null
@@ -154,8 +166,11 @@ if [[ "${RM_ENABLE}" == 0 ]]; then
     _huanyu_experiment+="_rule_based_${_huanyu_actor_world}card"
 fi
 export EXPERIMENT_NAME="${EXPERIMENT_NAME:-${_huanyu_experiment}}"
-export DEFAULT_LOCAL_DIR="${DEFAULT_LOCAL_DIR:-${PROJECT_ROOT}/runs/${PROJECT_NAME}/${EXPERIMENT_NAME}/checkpoints}"
-export TENSORBOARD_DIR="${TENSORBOARD_DIR:-${PROJECT_ROOT}/runs/${PROJECT_NAME}/${EXPERIMENT_NAME}/tensorboard}"
+if [[ "${DEFAULT_LOCAL_DIR:-}" == "$PROJECT_ROOT/checkpoints" ]]; then unset DEFAULT_LOCAL_DIR; fi
+if [[ "${TENSORBOARD_DIR:-}" == "$PROJECT_ROOT/tensorboard_log" ]]; then unset TENSORBOARD_DIR; fi
+export DEFAULT_LOCAL_DIR="${DEFAULT_LOCAL_DIR:-$HUANYU_RUN_DIR/checkpoints}"
+export TENSORBOARD_DIR="${TENSORBOARD_DIR:-$HUANYU_RUN_DIR/tensorboard}"
+export WANDB_MODE="${WANDB_MODE:-offline}"
 export VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-false}"
 
 # Preserve the non-reward OmniMix settings when calling the base backend
@@ -205,6 +220,7 @@ fi
 # The direct AQA entry (including RM_ENABLE=0) must establish the same policy
 # before its first native import. Do not rely only on the final backend or a
 # previously started Raylet. The chosen TP is enforced in the final overrides.
+source "${_HUANYU_EXAMPLE_DIR}/graph_mode.sh" || exit $?
 source "${_HUANYU_EXAMPLE_DIR}/precision_mode.sh" "$@" \
     "actor_rollout_ref.rollout.tensor_model_parallel_size=${ROLLOUT_TP}" || exit $?
 echo "[huanyu-aqa] precision train_GDN=$MINICPMO_HUANYU_GDN_FP32_TRAINING rollout_GDN=$MINICPMO_GDN_FP32_REFERENCE reload=$MINICPMO_HUANYU_LAYERWISE_RELOAD KV_zero=$MINICPMO_HYBRID_BLOCK_ZERO_REFERENCE hooks=$VLLM_OMNI_EXTERNAL_MODULES"
@@ -241,6 +257,9 @@ for _huanyu_env_key in PYTHONPATH HUANYU_VLLM_OMNI_ROOT HUANYU_FREEZE_AUDIO \
     _huanyu_ray_args+=("++ray_kwargs.ray_init.runtime_env.env_vars.${_huanyu_env_key}=${_huanyu_env_json}")
 done
 
+# Defaults precede caller arguments, so explicit trainer paths and media budget
+# remain overridable without separate length/precision entry scripts.
+_huanyu_budget_json="$(python3 -c 'import json, os; print(json.dumps(os.environ["MINICPMO_MM_PROMPT_BUDGET"]))')"
 echo "[huanyu-aqa] freeze_audio=${HUANYU_FREEZE_AUDIO} cache=off visual=frozen; actor=${_huanyu_actor_world}NPU RM=${REWARD_POOL_NPUS}NPU RM_ENABLE=${RM_ENABLE} actor_pool=${NUM_NPUS}x${NNODES}"
 echo "[huanyu-aqa] train_audio_encoder=$HUANYU_TRAIN_AUDIO_ENCODER train_audio_projector=$HUANYU_TRAIN_AUDIO_PROJECTOR"
 if [[ "${RM_ENABLE}" == 0 ]]; then
@@ -253,7 +272,13 @@ echo "[huanyu-aqa] forward_prefetch=off Q36_BACKWARD_PREFETCH=${Q36_BACKWARD_PRE
 # Required settings follow user arguments so the checked datasets and execution
 # contract cannot be bypassed by stale command-line options. Model selection is
 # the verl alias; the checkpoint's HF architecture and RM alias remain intact.
-exec bash "${_HUANYU_BACKEND}" "${_huanyu_backend_defaults[@]}" "$@" \
+exec bash "${_HUANYU_BACKEND}" "${_huanyu_backend_defaults[@]}" \
+    "actor_rollout_ref.rollout.response_length=${MAX_RESPONSE_LENGTH}" \
+    "++ray_kwargs.ray_init.runtime_env.env_vars.MINICPMO_MM_PROMPT_BUDGET=${_huanyu_budget_json}" \
+    'trainer.logger=[console]' \
+    "trainer.rollout_data_dir=${ROLLOUT_DATA_DIR:-$HUANYU_RUN_DIR/rollout_dump}" \
+    "trainer.validation_data_dir=${VALIDATION_DATA_DIR:-$HUANYU_RUN_DIR/validation_dump}" \
+    "trainer.test_freq=${TEST_FREQ:-10}" "$@" \
     "data.train_files=${TRAIN_FILE}" \
     "data.val_files=${VAL_FILE}" \
     data.train_batch_size="${TRAIN_BATCH_SIZE}" \
