@@ -123,8 +123,11 @@ echo "[huanyu-paths] train=$TRAIN_FILE validation=$VAL_FILE"
 # export MINICPMO_LEGACY_IMAGE_SPAN_ACK=1     # 只有它也在 worker env 里，上面那个才被尊重
 export MINICPMO_DISABLE_IMAGE_EXPAND=0
 
-MASTER_ADDR="${VC_WORKER_HOSTS%%,*}"
-MASTER_ADDR=$(getent hosts "$MASTER_ADDR" | awk '{print $1; exit}')
+MASTER_ADDR="${VC_WORKER_HOSTS:-${MASTER_ADDR:-}}"
+MASTER_ADDR="${MASTER_ADDR%%,*}"
+if [[ -n "$MASTER_ADDR" ]]; then
+    MASTER_ADDR=$(getent hosts "$MASTER_ADDR" | awk '{print $1; exit}')
+fi
 RAY_PORT=6925
 RAY_DASHBOARD_PORT=8960
 

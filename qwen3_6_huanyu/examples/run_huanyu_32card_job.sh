@@ -13,6 +13,32 @@
 # Never stops an existing Ray cluster or deletes an old checkout.
 set -euo pipefail
 
+_PREPARE_ONLY="${HUANYU_PREPARE_ONLY:-0}"
+case "$_PREPARE_ONLY" in
+    0) ;;
+    1)
+        [[ -r "${HUANYU_PREPARE_SNAPSHOT:-}" && -n "${HUANYU_PREPARED_ENV_FILE:-}" &&
+           -d "${HUANYU_PREPARE_LOG_DIR:-}" ]] || {
+            echo 'FATAL: use prepare_huanyu_env.sh for environment-only preparation' >&2
+            exit 2
+        }
+        # These profile choices normally come from the outer job wrappers.
+        case "${HUANYU_JOB_MODE:-frozen_cache}" in
+            aqa_precision|aqa_16k_sync_each)
+                export HUANYU_PRECISION_PROFILE=full HUANYU_GRAPH_MODE=0 ;;
+        esac
+        case "${HUANYU_JOB_MODE:-frozen_cache}" in
+            aqa_unfreeze|aqa_precision|aqa_16k_sync_each)
+                if [[ "${TRAIN_FILE:-}" == /opt/huawei/dataset/infra_data/data/train.parquet ]]; then unset TRAIN_FILE; fi
+                if [[ "${VAL_FILE:-}" == /opt/huawei/dataset/infra_data/data/validation.parquet ]]; then unset VAL_FILE; fi
+                export TRAIN_FILE="${HUANYU_AQA_TRAIN_FILE:-${TRAIN_FILE:-/opt/huawei/dataset/infra_data/data/aqa_dataset/train.parquet}}"
+                export VAL_FILE="${HUANYU_AQA_VAL_FILE:-${VAL_FILE:-/opt/huawei/dataset/infra_data/data/aqa_dataset/validation.parquet}}"
+                ;;
+        esac
+        ;;
+    *) echo 'FATAL: HUANYU_PREPARE_ONLY must be 0 or 1' >&2; exit 2 ;;
+esac
+
 export PROJECT_ROOT="${PROJECT_ROOT:-/opt/huawei/dataset/infra_data/verl_omni_qwen36_gzq_new}"
 _HUANYU_EXAMPLE_DIR="${PROJECT_ROOT}/examples/qwen3_6_huanyu"
 cd "$PROJECT_ROOT"
@@ -25,6 +51,11 @@ declare -A _HUANYU_PATH_CONFIG=(
     [TRAIN_FILE]="${TRAIN_FILE:-/opt/huawei/dataset/infra_data/data/train.parquet}"
     [VAL_FILE]="${VAL_FILE:-/opt/huawei/dataset/infra_data/data/validation.parquet}"
 )
+if (( _PREPARE_ONLY )); then
+    for _key in DEFAULT_LOCAL_DIR TENSORBOARD_DIR GENRM_DUMP_DIR HUANYU_EMBED_CACHE_DIR RAY_ADDRESS; do
+        if [[ -v "$_key" ]]; then _HUANYU_PATH_CONFIG["$_key"]="${!_key}"; fi
+    done
+fi
 for _key in "${!_HUANYU_PATH_CONFIG[@]}"; do
     export "$_key=${_HUANYU_PATH_CONFIG[$_key]}"
 done
@@ -61,6 +92,7 @@ _ACTOR_PER_NODE=${_HUANYU_POOL_CONFIG[NUM_NPUS]}
 _ACTOR_NODES=${_HUANYU_POOL_CONFIG[NNODES]}
 _RM_PER_NODE=${_HUANYU_POOL_CONFIG[RM_N_GPUS_PER_NODE]}
 _RM_NODES=${_HUANYU_POOL_CONFIG[RM_NNODES]}
+if (( ! _PREPARE_ONLY )); then
 if (( _ACTOR_PER_NODE > 16 || _RM_PER_NODE > 16 || _ACTOR_NODES > 2 || _RM_NODES > 2 ||
       _ACTOR_PER_NODE * _ACTOR_NODES + _RM_PER_NODE * _RM_NODES != 32 ||
       _ACTOR_PER_NODE % ${_HUANYU_POOL_CONFIG[ROLLOUT_TP]} != 0 ||
@@ -93,6 +125,7 @@ if [[ "$_JOB_MODE" == aqa_16k_sync_each ]] &&
     echo 'FATAL: run_huanyu_aqa_16k_sync_each_job.sh now requires actor16x1 + RM16x1 with TP4' >&2
     exit 2
 fi
+fi  # Pool packing is checked when launching the job, not during standalone setup.
 case "$_JOB_MODE" in
     frozen_cache) _TRAIN_ENTRY=run_huanyu.sh ;;
     aqa_unfreeze) _TRAIN_ENTRY=run_huanyu_aqa_audio_train.sh ;;
@@ -113,18 +146,20 @@ declare -A _HUANYU_AUDIO_CONFIG=()
 for _key in HUANYU_FREEZE_AUDIO HUANYU_TRAIN_AUDIO_ENCODER HUANYU_TRAIN_AUDIO_PROJECTOR MINICPMO_TUNE_AUDIO; do
     _HUANYU_AUDIO_CONFIG["$_key"]="${!_key}"
 done
-[[ -f "$PROJECT_ROOT/examples/qwen3_6_huanyu/$_TRAIN_ENTRY" ]] || {
+[[ "$_PREPARE_ONLY" == 1 || -f "$PROJECT_ROOT/examples/qwen3_6_huanyu/$_TRAIN_ENTRY" ]] || {
     echo "FATAL: missing training entry $PROJECT_ROOT/examples/qwen3_6_huanyu/$_TRAIN_ENTRY" >&2
     exit 1
 }
-for _command in "$_PYTHON" ray git pgrep flock timeout; do
+_REQUIRED_COMMANDS=("$_PYTHON" git pgrep flock)
+if (( ! _PREPARE_ONLY )); then _REQUIRED_COMMANDS+=(ray timeout); fi
+for _command in "${_REQUIRED_COMMANDS[@]}"; do
     command -v "$_command" >/dev/null || { echo "FATAL: missing command $_command" >&2; exit 1; }
 done
-if [[ "$_RANK" != 0 && "$_RANK" != 1 ]]; then
+if (( ! _PREPARE_ONLY )) && [[ "$_RANK" != 0 && "$_RANK" != 1 ]]; then
     echo 'FATAL: set VC_TASK_INDEX=0 on head and VC_TASK_INDEX=1 on worker; no implicit rank 0' >&2
     exit 2
 fi
-if [[ -n "${VC_WORKER_NUM:-}" && "$VC_WORKER_NUM" != 2 ]]; then
+if (( ! _PREPARE_ONLY )) && [[ -n "${VC_WORKER_NUM:-}" && "$VC_WORKER_NUM" != 2 ]]; then
     echo 'FATAL: this launcher expects two nodes, each with 16 NPUs' >&2
     exit 2
 fi
@@ -188,10 +223,12 @@ huanyu_preload_allocator
     echo "FATAL: missing Huanyu package, env file or precision_mode.sh" >&2; exit 1;
 }
 echo "[huanyu-job] allocator before Python/env setup: LD_PRELOAD=$LD_PRELOAD"
-_IPS="$("$_PYTHON" -B "$_HELPER" resolve "${VC_WORKER_HOSTS:-}")"
-IFS=, read -r -a _NODE_IPS <<< "$_IPS"
-_MASTER_IP="${_NODE_IPS[0]}"
-_NODE_IP="${_NODE_IPS[$_RANK]}"
+if (( ! _PREPARE_ONLY )); then
+    _IPS="$("$_PYTHON" -B "$_HELPER" resolve "${VC_WORKER_HOSTS:-}")"
+    IFS=, read -r -a _NODE_IPS <<< "$_IPS"
+    _MASTER_IP="${_NODE_IPS[0]}"
+    _NODE_IP="${_NODE_IPS[$_RANK]}"
+fi
 
 # Filter only scheduler --NAME=value metadata; preserve Hydra argv boundaries.
 _TRAIN_ARGS=()
@@ -236,14 +273,23 @@ for _key in "${HUANYU_PRECISION_KEYS[@]}"; do
     _HUANYU_PRECISION_CONFIG["$_key"]="${!_key}"
 done
 
-export EXPERIMENT_NAME="${EXPERIMENT_NAME:-huanyu_sampleall_cache_32card}"
-_LOG_DIR="${HUANYU_JOB_LOG_DIR:-$PROJECT_ROOT/runs/$EXPERIMENT_NAME/cluster}"
-mkdir -p "$_LOG_DIR"
-exec > >(tee -a "$_LOG_DIR/rank_$_RANK.log") 2>&1
+if (( _PREPARE_ONLY )); then
+    # The outer environment entry captures early errors as well as these steps.
+    _LOG_DIR="$HUANYU_PREPARE_LOG_DIR"
+else
+    export EXPERIMENT_NAME="${EXPERIMENT_NAME:-huanyu_sampleall_cache_32card}"
+    _LOG_DIR="${HUANYU_JOB_LOG_DIR:-$PROJECT_ROOT/runs/$EXPERIMENT_NAME/cluster}"
+    mkdir -p "$_LOG_DIR"
+    exec > >(tee -a "$_LOG_DIR/rank_$_RANK.log") 2>&1
+fi
 # Local lock stays held by this launcher, never inherited by a detached raylet.
 exec 9>"${TMPDIR:-/tmp}/huanyu-32card-${UID}.lock"
 flock -n 9 || { echo 'FATAL: another Huanyu job launcher is already running on this node' >&2; exit 1; }
-echo "[huanyu-job] rank=$_RANK node=$_NODE_IP head=$_MASTER_IP:$_PORT log=$_LOG_DIR/rank_$_RANK.log"
+if (( _PREPARE_ONLY )); then
+    echo "[huanyu-env] setup only mode=$_JOB_MODE log=$_LOG_DIR/prepare.log"
+else
+    echo "[huanyu-job] rank=$_RANK node=$_NODE_IP head=$_MASTER_IP:$_PORT log=$_LOG_DIR/rank_$_RANK.log"
+fi
 
 _LIVE_RAY=0
 if pgrep -x raylet >/dev/null; then _LIVE_RAY=1; fi
@@ -285,7 +331,7 @@ cd "$PROJECT_ROOT"
 huanyu_preload_allocator
 echo "[huanyu-job] allocator for native check/Ray: LD_PRELOAD=$LD_PRELOAD"
 export RAY_PORT="$_PORT" RAY_DASHBOARD_PORT="$_DASHBOARD_PORT"
-export RAY_ADDRESS="$_MASTER_IP:$_PORT"
+if (( ! _PREPARE_ONLY )); then export RAY_ADDRESS="$_MASTER_IP:$_PORT"; fi
 export HUANYU_JOB_MODE="$_JOB_MODE"
 export RAY_USAGE_STATS_ENABLED=0 PYTHONUNBUFFERED=1 HYDRA_FULL_ERROR=1
 export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
@@ -337,6 +383,18 @@ echo "[huanyu-job] physical=16x2 actor=${NUM_NPUS}x${NNODES} rollout_TP=$ROLLOUT
     --check --expected-root "$_VLLM_TARGET"
 echo '[huanyu-job] native import check exited successfully'
 "$_PYTHON" -B "$_HELPER" check-devices
+
+if (( _PREPARE_ONLY )); then
+    if (( _LIVE_RAY )); then
+        echo '[huanyu-env] existing Ray was left running; activation does not update its inherited environment'
+    fi
+    export HUANYU_SKIP_EDITABLE_INSTALL=1
+    "$_PYTHON" -S "${_HUANYU_EXAMPLE_DIR}/prepared_env.py" write \
+        --snapshot "$HUANYU_PREPARE_SNAPSHOT" --output "$HUANYU_PREPARED_ENV_FILE" \
+        --stack-limit "$(ulimit -S -s)"
+    echo "[huanyu-env] READY activation=$HUANYU_PREPARED_ENV_FILE"
+    exit 0
+fi
 
 wait_for_cluster() {
     local status=0

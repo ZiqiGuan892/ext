@@ -10,6 +10,7 @@
 
 | 场景 | 最外层脚本 | 运行位置 | 主要默认配置 |
 |---|---|---|---|
+| 仅准备环境，之后手动启动Ray与训练 | `source prepare_huanyu_env.sh` | 每个节点 | 复用一键准备流程；默认frozen_cache，不连接/启动Ray，不提交训练 |
 | 冻结 Huanyu、OmniMix/通用多模态数据、缓存训练 | `run_huanyu_32card_job.sh` | 两节点各执行一次 | `frozen_cache`，encoder/projector 都冻结，Actor16 + RM16，prompt3072 + response2048 |
 | 冻结缓存训练，16K | `run_huanyu_32card_16k_job.sh` | 两节点 | prompt14336 + response2048，SDPA，默认16+16 |
 | 冻结缓存训练，对照 Whisper 启动参数 | `run_huanyu_32card_whisper_aligned_job.sh` | 两节点 | 保留 Huanyu 接口；Actor BF16、rollout TP2、RM TP4，5K |
@@ -130,6 +131,47 @@ run_huanyu_aqa_audio_train_16card.sh
 
 ## 4. 启动命令
 
+### 只准备环境，手动启动 Ray 和训练
+
+在每个节点的 Bash 终端执行一次；不要求先设置 `VC_WORKER_HOSTS` 或 `VC_TASK_INDEX`。默认准备冻结缓存训练：
+
+```bash
+export PROJECT_ROOT=/opt/huawei/dataset/infra_data/verl_omni_qwen36_gzq_new
+export HUANYU_JOB_MODE=frozen_cache
+export HUANYU_VLLM_SOURCE=/opt/huawei/dataset/infra_data/code/vllm-omni-xy-qwen-vit
+export HUANYU_EMBED_CACHE_DIR=/opt/huawei/dataset/ccb_data/data/omni/embed_cache_huanyu_sampleall_q128
+source "$PROJECT_ROOT/examples/qwen3_6_huanyu/prepare_huanyu_env.sh"
+```
+
+它会设置jemalloc，按摘要比较并同步vLLM-Omni到 `/vllm-workspace/vllm-omni`（保留旧目录备份），安装当前项目插件，加载 `env_export_huanyu.sh`，恢复路径/音频/精度配置，检查原生导入和至少16张可见NPU。env文件还包含mathruler/zarr安装、CANN/ATB环境加载、日志目录与诊断文件准备。源目录已匹配时跳过复制。调用链为：
+
+```text
+source prepare_huanyu_env.sh
+  → 独立bash运行 run_huanyu_32card_job.sh（HUANYU_PREPARE_ONLY=1）
+  → job_bootstrap.py sync → editable安装 → source环境文件
+  → 音频/精度配置 → 原生导入检查 → check-devices
+  → prepared_env.py生成activate.sh → 结束准备子进程
+  → 在当前终端source activate.sh，保留环境变量和工作目录
+```
+
+准备过程不执行Ray启动/停止、集群等待、训练入口或worker保活。完成后再分别手动启动Ray，仅在主节点执行普通训练脚本，例如冻结用 `run_huanyu.sh`。准备成功会设 `HUANYU_SKIP_EDITABLE_INSTALL=1`，普通入口可复用已安装插件。
+
+AQA在线训练将上面模式与组件配置改为下例；准备完成后使用对应普通训练入口：
+
+```bash
+export HUANYU_JOB_MODE=aqa_unfreeze
+export HUANYU_TRAIN_AUDIO_ENCODER=true HUANYU_TRAIN_AUDIO_PROJECTOR=true
+source "$PROJECT_ROOT/examples/qwen3_6_huanyu/prepare_huanyu_env.sh"
+```
+
+支持 `frozen_cache`、`aqa_unfreeze`、`aqa_precision`、`aqa_16k_sync_each`；后两者强制full精度和graph=0。AQA准备关闭embedding cache，默认使用AQA的train/validation路径。模式只选择环境、音频和精度策略；长度、batch与梯度同步仍由后续普通启动脚本配置，选择 `aqa_16k_sync_each` 后应运行 `run_huanyu_aqa_16k_sync_each.sh`。
+
+默认环境文件是本目录的 `env_export_huanyu.sh`。如站点文件叫 `source_env_export.sh`，在准备前 `export HUANYU_ENV_FILE=/绝对路径/source_env_export.sh`。项目/模型/数据路径、显式的输出目录与缓存路径会在source后恢复。不要用一个会主动启动Ray或训练的文件作为环境文件。
+
+`source` 会将成功准备的环境应用到当前终端，保留原有shell选项。若用 `bash prepare_huanyu_env.sh`，准备完成后须执行它打印的 `source .../activate.sh`；子进程不能直接修改父终端环境。准备子进程失败不会生成可用的新激活文件，也不会应用部分环境到父终端；已完成的复制/安装不会因此撤销。激活文件保留受管理的运行配置及其他环境变化，包含unset，并用私有权限保存。
+
+准备日志和激活文件在 `$PROJECT_ROOT/runs/environment/prepare_<时间>_<随机串>/`，可通过 `HUANYU_PREPARE_LOG_ROOT` 改根目录；分别为 `prepare.log`、`activate.sh`。每个节点使用自己刚生成的激活文件。准备时若本地已有Ray，源码不同则拒绝替换；源码一致则跳过复制和项目editable安装，但仍加载环境并检查。新环境不会自动进入已有raylet，应在手动启动Ray之前完成准备。
+
 ### 两节点一键启动
 
 两节点使用相同项目路径和 IP 列表；主节点 `VC_TASK_INDEX=0`，从节点改为1。下例选择冻结缓存训练：
@@ -155,7 +197,7 @@ jemalloc 先查 `HUANYU_JEMALLOC_LIBRARY` / `Q36_JEMALLOC_LIBRARY`，再查 `LD_
 
 ### 已准备环境和 Ray 的普通启动
 
-各节点提前 source `$PROJECT_ROOT/examples/qwen3_6_huanyu/env_export_huanyu.sh`、安装项目插件并准备 Ray。仅在主节点执行：
+各节点先按上一节 `source prepare_huanyu_env.sh`，随后手动准备Ray。仅在主节点执行：
 
 ```bash
 RAY_ADDRESS=auto TOTAL_TRAINING_STEPS=2 \
@@ -274,6 +316,7 @@ bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/run_huanyu_aqa_audio_train.sh" \
 | `run_qwen36_huanyu_gspo_npu_omni_mix_genrm.sh` | 配置多模态、GenRM和奖励池，强制RM_ENABLE=1 |
 | `run_qwen36_huanyu_gspo_npu.sh` | 最终检查和训练命令拼装 |
 | `env_export_huanyu.sh` | 在Ray启动前source；设置路径/Ascend/通信，切换工作目录、创建日志，并包含mathruler/zarr安装操作；不启停Ray |
+| `prepared_env.py` | 仅用标准库保存环境摘要，在准备检查全部通过后生成可source的运行配置及环境差异；处理export/unset，不连接Ray |
 | `audio_train_mode.sh` | 解析encoder/projector开关，兼容旧冻结开关 |
 | `precision_mode.sh` | 精度开关、实际TP、Huanyu worker extension和Ray环境参数 |
 | `graph_mode.sh` | 统一Actor/RM推理graph/eager，校验与full的互斥 |
@@ -300,6 +343,7 @@ python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/migrate_aqa_audio.py" \
 
 ## 7. 日志与生效确认
 
+- 独立环境准备：`$PROJECT_ROOT/runs/environment/prepare_<时间>_<随机串>/prepare.log`，可用 `HUANYU_PREPARE_LOG_ROOT` 覆盖根目录；`[huanyu-env] READY` 表示检查通过。
 - 一键节点日志：`$PROJECT_ROOT/runs/$EXPERIMENT_NAME/cluster/rank_0.log` / `rank_1.log`，可用 `HUANYU_JOB_LOG_DIR` 覆盖。
 - 训练控制台：`[huanyu-output] console=...` 指出的 `$PROJECT_ROOT/runs/huanyu_<时间>_<随机串>/console.log`；GenRM dump在同一目录。
 - checkpoint/TensorBoard由 `DEFAULT_LOCAL_DIR` / `TENSORBOARD_DIR` 或最终trainer配置决定。env文件会设为项目固定目录；AQA precision和sync_each普通入口默认改为独立运行目录。自定义路径需注意source顺序，不要假定所有入口保存位置一致。
