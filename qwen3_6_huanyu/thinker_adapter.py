@@ -105,6 +105,7 @@ class Qwen36HuanyuThinkerAdapter(OmniModelBase):
         )
         from .entropy import install_huanyu_entropy_chunking
         from .forward import install_huanyu_forward
+        from .fsdp_offload import install_huanyu_fsdp_offload
         from .precision import install_huanyu_actor_precision
         from .precision_policy import report_policy, install_fsdp_pin_audit
 
@@ -130,6 +131,9 @@ class Qwen36HuanyuThinkerAdapter(OmniModelBase):
         _flatten_text_config(module.config)
         token_ids = _audio_token_ids(_value(model_config, "tokenizer"), module.config)
         attach_huanyu_audio(module, model_config)
+        # FSDP2 re-pads partial shards on the CPU inside Module.to(). The D2H
+        # transfer must finish before that host copy, including initial load.
+        install_huanyu_fsdp_offload(module)
         if os.environ.get("HUANYU_WEIGHT_SYNC_AUDIT_DIR", "").strip():
             from .weight_sync_audit import start_actor_audit
 

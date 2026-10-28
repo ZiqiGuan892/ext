@@ -61,6 +61,9 @@ class RegistrationTests(unittest.TestCase):
         forward = ModuleType(f"{PACKAGE}.forward")
         self.install_forward = Mock()
         forward.install_huanyu_forward = self.install_forward
+        offload = ModuleType(f"{PACKAGE}.fsdp_offload")
+        self.install_offload = Mock()
+        offload.install_huanyu_fsdp_offload = self.install_offload
         precision = ModuleType(f"{PACKAGE}.precision")
         self.install_precision = Mock()
         precision.install_huanyu_actor_precision = self.install_precision
@@ -78,6 +81,7 @@ class RegistrationTests(unittest.TestCase):
             base.__name__: base,
             audio_runtime.__name__: audio_runtime,
             forward.__name__: forward,
+            offload.__name__: offload,
             precision.__name__: precision,
             entropy.__name__: entropy,
             sync_policy.__name__: sync_policy,
@@ -159,6 +163,7 @@ class RegistrationTests(unittest.TestCase):
         self.assertIs(result, self.model)
         self.base_configure.assert_called_once_with(self.model, self.config)
         self.attach.assert_called_once_with(self.model, self.config)
+        self.install_offload.assert_called_once_with(self.model)
         self.visual_patch.assert_called_once_with(self.model)
         self.install_forward.assert_called_once_with(
             self.model, start_token_id=10, end_token_id=11, placeholder_token_id=12)

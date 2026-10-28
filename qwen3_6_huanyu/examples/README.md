@@ -716,6 +716,8 @@ python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/compare_huanyu_weight_sync.py" \
 
 退出码 `0=PASS`、`1=FAIL`、`2=INCOMPLETE`。报告保留每个已观测进程的结果及具体差异下标；缺少前序阶段时不会猜测最早异常边界。首次同步要求未经过 optimizer 更新；这 8 项 checkpoint 原为 BF16，因此到 FP32 再到 BF16 应能精确往返。若换成 FP32 checkpoint，要另行分析合法舍入，不能沿用此结论。
 
+`actor_loaded` 在 FSDP 初始化前采集，非源 rank 的 meta 参数是正常占位。比较器将形状正确的占位记录标为 `DEFERRED_META`，至少需要一份真实参数与 checkpoint 一致才允许该阶段通过；全部为 meta 或缺少进程记录时仍为 `INCOMPLETE`。其他阶段的 meta 参数仍报错。旧版比较器曾将这些占位误报为 `FAIL`；更新比较脚本后可直接重比已有 JSONL，无需重跑训练。
+
 | 最早不一致的阶段 | 下一步定位范围 |
 | --- | --- |
 | `actor_loaded` | checkpoint 读取、参数绑定或加载时转换 |
@@ -728,3 +730,13 @@ python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/compare_huanyu_weight_sync.py" \
 同时新增正常同步的完整性保护：拒绝未知/重复/形状错误的音频参数；一旦传入任何音频参数，要求 encoder 和 projector 全套完整，缺失时在 finalize 前报错。整套音频均省略的更新仍保留原权重。finalize 后还检查上述 8 个 LayerNorm 是否精确等于接收值转换到目标 dtype 后的结果；不一致时输出参数名和 `bad_indices`，不会继续使用已确认损坏的权重。此保护不从 disk 覆盖 Actor 权重，也不能发现 sender 本身已经输出了错误值。
 
 **验证边界**：CPU 测试覆盖漏参/重复、真实 Torch meta 参数重建、故意破坏长度 40 参数后的报错、各阶段比较和不完整证据处理；尚不能证明 NPU 根因已修复。数值采集及小向量校验需要设备到 CPU 读取，会改变同步时序，尤其是导出前的分片快照；若开启检查后异常消失，应转查异步竞态，不能据此认定原链路正确。该探针只覆盖音频 VGG LayerNorm，不能替代整模型或 LLM 权重一致性验证。
+
+### 8.3 Huanyu FSDP2 尾部分片的 CPU 卸载保护
+
+已观测到的 16 路实验中，四个长度 40 的参数只有 rank 13 持有的索引 39 不一致，长度 20 的对照全部正常；`actor_export`、`receiver_input`、`receiver_owned`、`after_finalize` 哈希一致。最早异常在 Actor 本地分片阶段，后续传输没有新增差异。
+
+PyTorch 2.10 的 `FSDPModule._apply()` 在参数转换后立即执行 `reset_sharded_param()`。非阻塞 D2H 转换尚未完成时，后者可能在 CPU 上复制尾部分片来补齐。40/16 的尾片只有 1 个有效元素、容量为 3，会经过这个分支；20/16 的非空片均为 2，不需要补齐。这个执行顺序提供了与实验相符的竞态机制，实际 NPU 上的因果确认仍需修复前后复测。
+
+Huanyu adapter 现在自动安装 `fsdp_offload.py`：仅对该模型实例在 FSDP2 下的 `.to(cpu, non_blocking=True)` 强制阻塞，确保 CPU 补齐前数据已经就绪。当前默认的非 LoRA 训练中，初始化装载和后续手工卸载都受保护；不会重新从 disk 覆盖权重，解冻后的梯度更新及正常 Actor→rollout 同步保留。代价是 CPU 卸载不再与后续工作异步重叠。额外的 PEFT 外层包装可能绕过该实例的 `.to()`，不能直接套用此覆盖结论。
+
+两节点更新代码、启动新任务后，日志应出现 `[huanyu-fsdp-offload] phase=executed`。用 8.2 的 sync 验证配置写入**新的**审计目录，要求 8 项参数各阶段全部 `PASS`，并与 disk 模式比较同一 WAV 的 embedding 和回答。仅重新比较旧报告不会修复旧进程中的参数。CPU 回归模拟延迟 D2H 与尾片补齐；不等同于 NPU 实测通过。

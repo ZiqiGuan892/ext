@@ -21,29 +21,142 @@ def tensor(values, **kwargs):
                 **kwargs)
 
 
-def fixture(update=1):
+def fixture(update=1, world_size=2):
     result = []
     for name in compare.NAMES:
         size = 20 if ".conv_layers.1." in name else 40
         values = [float(i) for i in range(size)]
         for stage in compare.STAGES:
-            for rank in range(2):
+            for rank in range(world_size):
                 current = values if update == 1 or stage in compare.STAGES[:2] else [v + 1 for v in values]
                 result.append(dict(name=name, stage=stage, tensor=tensor(current),
                                    process=f"{'receiver' if stage in compare.STAGES[3:] else 'actor'}{rank}",
                                    location="fixture", schema_version=1,
                                    round_id=None if stage in compare.STAGES[:2] else update))
-        for rank in range(2):
+        width = (size + world_size - 1) // world_size
+        for rank in range(world_size):
             current = values if update == 1 else [v + 1 for v in values]
-            item = tensor(current[rank * (size // 2):(rank + 1) * (size // 2)],
-                          placements=["S(0)"], mesh_shape=[2], mesh_coordinate=[rank])
+            item = tensor(current[min(rank * width, size):min((rank + 1) * width, size)],
+                          placements=["S(0)"], mesh_shape=[world_size], mesh_coordinate=[rank])
             item["global_shape"] = [size]
             result.append(dict(name=name, stage="actor_local_shard", tensor=item,
                                process=f"actor{rank}", location="fixture", schema_version=1, round_id=update))
     return result
 
 
+def initial_meta_fixture():
+    entries = fixture(world_size=16)
+    for entry in entries:
+        if entry["stage"] == "actor_loaded" and entry["process"] != "actor0":
+            value = entry["tensor"]
+            entry["tensor"] = {key: value[key] for key in ("shape", "global_shape", "dtype")}
+            entry["tensor"]["is_meta"] = True
+    return entries
+
+
 class ComparisonTests(unittest.TestCase):
+    def test_initial_meta_ranks_defer_values_until_fsdp(self):
+        report = compare.compare(initial_meta_fixture())
+        self.assertEqual(report["status"], "PASS")
+        for parameter in report["parameters"].values():
+            stage = parameter["stages"]["actor_loaded"]
+            self.assertEqual(stage["concrete_record_count"], 1)
+            self.assertEqual(stage["deferred_meta_count"], 15)
+            self.assertEqual(len(stage["deferred_meta_processes"]), 15)
+            self.assertFalse(stage["process_divergence"])
+            deferred = [row for row in stage["records"] if row["tensor"].get("is_meta")]
+            self.assertTrue(all(row["status"] == "DEFERRED_META" for row in deferred))
+            self.assertTrue(all(row["comparison"]["match"] is None for row in deferred))
+
+    def test_initial_meta_does_not_hide_bad_shape40_local_shard(self):
+        entries = initial_meta_fixture()
+        for entry in entries:
+            if entry["stage"] == "actor_local_shard" and entry["process"] == "actor13" \
+                    and ".conv_layers.0." in entry["name"]:
+                entry["tensor"].update(values=[999.0], float32_sha256=tensor([999.0])["float32_sha256"])
+        report = compare.compare(entries)
+        for name, parameter in report["parameters"].items():
+            if ".conv_layers.0." in name:
+                self.assertEqual(parameter["earliest_observed_bad_boundary"], "actor_local_shard")
+                self.assertEqual(parameter["status"], "FAIL")
+            else:
+                self.assertEqual(parameter["status"], "PASS")
+
+    def test_rank13_tail_corruption_propagates_without_blame_on_transport(self):
+        entries = initial_meta_fixture()
+        for entry in entries:
+            if ".conv_layers.0." not in entry["name"]:
+                continue
+            if entry["stage"] == "actor_local_shard" and entry["process"] == "actor13":
+                entry["tensor"].update(values=[-0.001], float32_sha256=tensor([-0.001])["float32_sha256"])
+            elif entry["stage"] in compare.STAGES[2:]:
+                values = entry["tensor"]["values"][:]
+                values[39] = -0.001
+                entry["tensor"] = tensor(values)
+        report = compare.compare(entries)
+        self.assertEqual(report["status"], "FAIL")
+        for name, parameter in report["parameters"].items():
+            if ".conv_layers.1." in name:
+                self.assertEqual(parameter["status"], "PASS")
+                continue
+            self.assertEqual(parameter["earliest_observed_bad_boundary"], "actor_local_shard")
+            stages = parameter["stages"]
+            self.assertEqual(stages["actor_loaded"]["status"], "PASS")
+            shards = stages["actor_local_shard"]["records"]
+            self.assertEqual([s["process"] for s in shards if s["status"] == "FAIL"], ["actor13"])
+            self.assertEqual(shards[13]["offset"], 39)
+            self.assertEqual(shards[13]["tensor"]["shape"], [1])
+            hashes = {row["tensor"]["float32_sha256"]
+                      for stage in compare.STAGES[2:] for row in stages[stage]["records"]}
+            self.assertEqual(len(hashes), 1)
+
+    def test_initial_concrete_corruption_still_fails_before_fsdp(self):
+        entries = initial_meta_fixture()
+        bad = next(e for e in entries if e["stage"] == "actor_loaded" and e["process"] == "actor0")
+        bad["tensor"] = tensor([999.0] * len(bad["tensor"]["values"]))
+        item = compare.compare(entries)["parameters"][bad["name"]]
+        self.assertEqual(item["earliest_observed_bad_boundary"], "actor_loaded")
+
+    def test_initial_meta_with_wrong_shape_is_a_real_failure(self):
+        entries = initial_meta_fixture()
+        bad = next(e for e in entries if e["stage"] == "actor_loaded" and e["process"] == "actor1")
+        bad["tensor"]["shape"] = [999]
+        item = compare.compare(entries)["parameters"][bad["name"]]
+        self.assertEqual(item["earliest_observed_bad_boundary"], "actor_loaded")
+        self.assertFalse(item["stages"]["actor_loaded"]["records"][1]["comparison"]["shape_match"])
+
+    def test_all_initial_meta_is_incomplete_without_concrete_source(self):
+        entries = initial_meta_fixture()
+        for entry in entries:
+            if entry["stage"] == "actor_loaded":
+                entry["tensor"] = dict(entry["tensor"], is_meta=True)
+        report = compare.compare(entries)
+        self.assertEqual(report["status"], "INCOMPLETE")
+        self.assertTrue(all(p["stages"]["actor_loaded"]["concrete_record_count"] == 0
+                            and p["earliest_observed_bad_boundary"] is None for p in report["parameters"].values()))
+
+    def test_missing_initial_meta_process_is_not_silently_allowed(self):
+        entries = [e for e in initial_meta_fixture()
+                   if not (e["stage"] == "actor_loaded" and e["process"] == "actor15")]
+        self.assertEqual(compare.compare(entries)["status"], "INCOMPLETE")
+
+    def test_actor_missing_both_initial_snapshots_is_incomplete(self):
+        entries = [e for e in initial_meta_fixture()
+                   if not (e["stage"] in compare.STAGES[:2] and e["process"] == "actor15")]
+        report = compare.compare(entries)
+        self.assertEqual(report["status"], "INCOMPLETE")
+        for parameter in report["parameters"].values():
+            for stage in compare.STAGES[:2]:
+                self.assertEqual(parameter["stages"][stage]["missing_processes"], ["actor15"])
+
+    def test_meta_after_export_is_not_deferred(self):
+        entries = initial_meta_fixture()
+        bad = next(e for e in entries if e["stage"] == "receiver_input")
+        bad["tensor"] = dict(bad["tensor"], is_meta=True)
+        item = compare.compare(entries)["parameters"][bad["name"]]
+        self.assertEqual(item["earliest_observed_bad_boundary"], "receiver_input")
+        self.assertEqual(item["stages"]["receiver_input"]["deferred_meta_count"], 0)
+
     def test_equal_values_ignore_storage_dtype_and_pass_all_eight(self):
         entries = fixture()
         entries[2]["tensor"]["dtype"] = "torch.float32"

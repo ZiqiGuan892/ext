@@ -59,24 +59,48 @@ def load_entries(directory, update):
     return entries
 
 
-def stage_report(entries, expected_processes, baseline):
+def stage_report(entries, expected_processes, baseline, *, allow_initial_meta=False):
     present = {e["process"] for e in entries}
     missing = sorted(expected_processes - present)
     fingerprints = defaultdict(list)
-    records = []
+    records, concrete, deferred = [], [], []
+    bad = False
     for e in entries:
         tensor = e["tensor"]
-        key = fingerprint(tensor)
-        fingerprints[str(key)].append(e["process"])
         row = {"process": e["process"], "location": e["location"], "tensor": tensor,
                "extra": e.get("extra", {}), "versions": e.get("versions", {}),
-               "comparison": difference(baseline, tensor) if baseline else None}
+               "comparison": None}
+        if allow_initial_meta and tensor.get("is_meta"):
+            # Non-source ranks deliberately remain meta inside init_empty_weights.
+            # FSDP's later state-dict broadcast, not this snapshot, supplies values.
+            # Check their structure here and require concrete source-rank evidence.
+            deferred.append(e["process"])
+            shape_matches = baseline is not None and tensor.get("shape") == baseline.get("shape")
+            if baseline is not None and "global_shape" in tensor:
+                shape_matches = shape_matches and tensor["global_shape"] == baseline.get("shape")
+            row["status"] = "DEFERRED_META" if shape_matches else "INCOMPLETE" if baseline is None else "FAIL"
+            row["comparison"] = {
+                "match": None, "deferred": True, "shape_match": shape_matches if baseline else None,
+                "expected_shape": baseline.get("shape") if baseline else None,
+                "actual_shape": tensor.get("shape"),
+                "reason": "Initial meta rank has no values until FSDP initialization/broadcast",
+            }
+            bad = bad or row["status"] == "FAIL"
+        else:
+            concrete.append(e)
+            key = fingerprint(tensor)
+            fingerprints[str(key)].append(e["process"])
+            row["comparison"] = difference(baseline, tensor) if baseline else None
+            bad = bad or key is None or (baseline is not None and not row["comparison"]["match"])
+            row["status"] = ("FAIL" if key is None or (baseline is not None and not row["comparison"]["match"])
+                             else "PASS" if baseline is not None else "INCOMPLETE")
         records.append(row)
-    bad = any(fingerprint(e["tensor"]) is None for e in entries) or len(fingerprints) > 1
-    bad = bad or (baseline is not None and any(not r["comparison"]["match"] for r in records))
-    status = "FAIL" if bad else "PASS" if entries and not missing and baseline is not None else "INCOMPLETE"
+    bad = bad or len(fingerprints) > 1
+    status = "FAIL" if bad else "PASS" if concrete and not missing and baseline is not None else "INCOMPLETE"
     return {"status": status, "missing_processes": missing, "fingerprints": dict(fingerprints),
-            "process_divergence": len(fingerprints) > 1, "records": records}
+            "process_divergence": len(fingerprints) > 1, "records": records,
+            "concrete_record_count": len(concrete), "deferred_meta_count": len(deferred),
+            "deferred_meta_processes": sorted(set(deferred))}
 
 
 def shard_report(entries, expected_processes, baseline):
@@ -124,7 +148,9 @@ def compare(entries, update=1):
         processes[e["stage"]].add(e["process"])
     actors = processes["actor_export"] | processes["actor_local_shard"]
     receivers = set().union(*(processes[s] for s in (*STAGES[3:], "before_reload", "after_initialize")))
-    initial = processes["checkpoint"] | processes["actor_loaded"]
+    # An actor observed at export must also have initial audit evidence. Do not
+    # silently accept a missing checkpoint/load pair just because both are absent.
+    initial = processes["checkpoint"] | processes["actor_loaded"] | actors
     report = {"update": update, "scope": "eight Huanyu LayerNorm parameters; observed processes only",
               "baseline_note": "First-update exact equality assumes these eight checkpoint tensors are BF16; "
                                "an FP32 checkpoint rounded by actor loading needs separate dtype analysis.",
@@ -137,7 +163,8 @@ def compare(entries, update=1):
         for stage in STAGES:
             expected = initial if stage in STAGES[:2] else actors if stage == "actor_export" else receivers
             baseline = checkpoint if update == 1 or stage in STAGES[:2] else exported
-            stages[stage] = stage_report(groups[(name, stage)], expected, baseline)
+            stages[stage] = stage_report(groups[(name, stage)], expected, baseline,
+                                         allow_initial_meta=stage == "actor_loaded")
         shards = shard_report(groups[(name, "actor_local_shard")], actors,
                               checkpoint if update == 1 else exported)
         stages["actor_local_shard"] = shards
