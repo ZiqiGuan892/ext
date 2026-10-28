@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Send exported AQA prompts + WAVs to an existing vLLM Chat Completions server.
+"""Send exported AQA WAVs to vLLM for text replies (audio-only input by default).
 
-Standard library only (Python 3.8+). Results are siblings of samples/row_XXXXXX/.
+Standard library only (Python 3.8+). Results are saved inside samples/row_XXXXXX/.
 This uses HTTP question answering, not the realtime duplex voice protocol.
 """
 
@@ -87,8 +87,31 @@ def load_inputs(root, row):
     return prompt, truth, paths, payloads
 
 
-def build_request(prompt, payloads, model, max_tokens, temperature):
+def build_request(prompt, payloads, model, max_tokens, temperature, audio_input_format="audio_url",
+                  include_prompt=False):
     # Standalone client: do not import the Parquet exporter and its dependencies.
+    if audio_input_format not in ("audio_url", "input_audio"):
+        raise ValueError("unsupported audio input format: {}".format(audio_input_format))
+    if not payloads:
+        raise ValueError("at least one WAV is required")
+    audio_parts = []
+    for payload in payloads:
+        encoded = base64.b64encode(payload).decode("ascii")
+        if audio_input_format == "audio_url":
+            audio_parts.append({"type": "audio_url", "audio_url": {
+                "url": "data:audio/wav;base64," + encoded,
+            }})
+        else:
+            audio_parts.append({"type": "input_audio", "input_audio": {
+                "data": encoded, "format": "wav",
+            }})
+    body = {"model": model, "max_tokens": max_tokens, "temperature": temperature,
+            "stream": False, "n": 1, "modalities": ["text"]}
+    if not include_prompt:
+        # Do not copy any source message, role, text part or metadata. The WAV
+        # order comes from the manifest; prompt.json is local reference only.
+        body["messages"] = [{"role": "user", "content": audio_parts}]
+        return body
     if not isinstance(prompt, list) or not prompt:
         raise ValueError("prompt.json must contain a non-empty message list")
     for message in prompt:
@@ -111,14 +134,12 @@ def build_request(prompt, payloads, model, max_tokens, temperature):
                 if text:
                     parts.append({"type": "text", "text": text})
                 if index < len(pieces) - 1:
-                    parts.append({"type": "input_audio", "input_audio": {
-                        "data": base64.b64encode(payloads[audio_index]).decode("ascii"), "format": "wav",
-                    }})
+                    parts.append(audio_parts[audio_index])
                     audio_index += 1
             result["content"] = parts
         messages.append(result)
-    return {"model": model, "messages": messages, "max_tokens": max_tokens,
-            "temperature": temperature, "stream": False, "n": 1}
+    body["messages"] = messages
+    return body
 
 
 class ServerError(RuntimeError):
@@ -126,6 +147,19 @@ class ServerError(RuntimeError):
         super().__init__(message)
         self.status = status
         self.body = body
+
+
+def server_error_hint(exc):
+    if exc.status == 400 and "Unexpected item type in content" in exc.body:
+        return (
+            "The server chat template rejected a content part. For the Huanyu checkpoint with a "
+            "Qwen image/video/text-only template, restart vllm serve with "
+            "--chat-template-content-format string --interleave-mm-strings. "
+            "Changing input_audio to audio_url alone does not fix this template error: "
+            "vLLM can normalize both to an audio part. Keep the WAV attached; do not "
+            "replace it with a text path. See examples/README.md."
+        )
+    return None
 
 
 def post_json(url, payload, timeout_s, api_key):
@@ -186,6 +220,8 @@ def run(args):
         raise ValueError("invalid limit/start-row/max-tokens/timeout-s/temperature")
     if not re.fullmatch(r"[A-Za-z0-9_-]+", args.result_tag):
         raise ValueError("--result-tag may only contain letters, digits, _ and -")
+    if args.result_tag in ("prompt", "ground_truth", "sample", "request"):
+        raise ValueError("--result-tag is reserved for exported input files: {}".format(args.result_tag))
     if args.overwrite and args.skip_existing:
         raise ValueError("--overwrite and --skip-existing cannot be combined")
     root = Path(args.export_dir).expanduser().resolve(strict=True)
@@ -193,32 +229,42 @@ def run(args):
     samples.relative_to(root)
     rows = select_rows(root, args.start_row, args.limit)
     # Check collisions for all selected rows before paying for inference.
+    output_paths = {}
     for row in rows:
-        for suffix in ("txt", "json"):
-            path = samples / "{}.{}.{}".format(row["sample_id"], args.result_tag, suffix)
+        sample_dir = (samples / row["sample_id"]).resolve(strict=True)
+        sample_dir.relative_to(samples)
+        paths = (sample_dir / (args.result_tag + ".json"), sample_dir / (args.result_tag + ".txt"))
+        for path in paths:
+            path.resolve().relative_to(sample_dir)
             if path.exists() and not (args.overwrite or args.skip_existing):
                 raise FileExistsError("{} exists; use --skip-existing, --overwrite or a new --result-tag".format(path))
-    print("[aqa-request] selected={} model={} url={} output={}".format(
-        len(rows), args.model, args.url, samples), flush=True)
+        output_paths[row["sample_id"]] = paths
+    input_mode = "audio_and_prompt" if args.include_prompt else "audio_only"
+    print("[aqa-request] selected={} model={} url={} audio_format={} input_mode={} prompt_sent={} modalities=text output={}".format(
+        len(rows), args.model, args.url, args.audio_input_format, input_mode,
+        str(args.include_prompt).lower(), samples), flush=True)
     completed, failed, skipped = 0, 0, 0
     for row in rows:
         sample_id = row["sample_id"]
-        output_json = samples / "{}.{}.json".format(sample_id, args.result_tag)
-        output_text = samples / "{}.{}.txt".format(sample_id, args.result_tag)
+        output_json, output_text = output_paths[sample_id]
         result = {"sample_id": sample_id, "row_index": row["row_index"], "status": "failed",
                   "model": args.model, "url": args.url, "max_tokens": args.max_tokens,
+                  "audio_input_format": args.audio_input_format, "modalities": ["text"],
+                  "input_mode": input_mode, "prompt_sent": args.include_prompt,
                   "temperature": args.temperature, "created_at": datetime.now(timezone.utc).isoformat()}
         started = time.monotonic()
         try:
             prompt, truth, paths, payloads = load_inputs(root, row)
             result.update(prompt=prompt, ground_truth=truth, wav_paths=paths)
-            body = build_request(prompt, payloads, args.model, args.max_tokens, args.temperature)
+            body = build_request(prompt, payloads, args.model, args.max_tokens, args.temperature,
+                                 args.audio_input_format, args.include_prompt)
             payload = json.dumps(body, ensure_ascii=False, allow_nan=False).encode("utf-8")
             fingerprint = hashlib.sha256(args.url.encode("utf-8") + b"\n" + payload).hexdigest()
             result["request_sha256"] = fingerprint
             if args.skip_existing and (output_json.exists() or output_text.exists()):
                 previous = read_json(output_json)
                 if (previous.get("status") != "complete" or previous.get("request_sha256") != fingerprint
+                        or previous.get("input_mode") != input_mode or previous.get("prompt") != prompt
                         or previous.get("ground_truth") != truth
                         or output_text.read_text(encoding="utf-8") != previous.get("reply")):
                     raise FileExistsError("existing result is incomplete or inputs changed; use a new --result-tag or --overwrite")
@@ -245,6 +291,10 @@ def run(args):
             result["error"] = {"type": type(exc).__name__, "message": str(exc)}
             if isinstance(exc, ServerError):
                 result["error"].update(http_status=exc.status, response_body=exc.body)
+                hint = server_error_hint(exc)
+                if hint:
+                    result["error"]["hint"] = hint
+                    print("[aqa-request] HINT: " + hint, file=sys.stderr, flush=True)
             # If --overwrite failed, an old successful answer must not survive.
             if args.overwrite and output_text.exists():
                 output_text.unlink()
@@ -265,12 +315,16 @@ def main(argv=None):
     parser.add_argument("--export-dir", required=True, help="Export root containing manifest.jsonl and samples/")
     parser.add_argument("--url", default=DEFAULT_URL, help="Full HTTP Chat Completions endpoint (default: %(default)s)")
     parser.add_argument("--model", default=DEFAULT_MODEL, help="Served model name, same as --served-model-name (default: %(default)s)")
+    parser.add_argument("--audio-input-format", choices=("audio_url", "input_audio"), default="audio_url",
+                        help="WAV transport format (default: %(default)s with a base64 data URL); does not override the server chat template")
+    parser.add_argument("--include-prompt", action="store_true",
+                        help="Also send original prompt messages/text (default: only WAVs, no system or text messages)")
     parser.add_argument("--max-tokens", type=int, default=2048)
     parser.add_argument("--temperature", type=float, default=0)
     parser.add_argument("--timeout-s", type=float, default=300, help="HTTP socket timeout in seconds")
     parser.add_argument("--start-row", type=int, default=0, help="First original Parquet row index, inclusive")
     parser.add_argument("--limit", type=int, default=50, help="Selected row count (default: %(default)s); 0 requests all remaining exported rows")
-    parser.add_argument("--result-tag", default="response", help="Result name: row_XXXXXX.<tag>.txt/json")
+    parser.add_argument("--result-tag", default="response", help="Result name: samples/row_XXXXXX/<tag>.txt/json")
     parser.add_argument("--skip-existing", action="store_true", help="Skip only matching, complete results")
     parser.add_argument("--overwrite", action="store_true", help="Replace results for the selected rows/tag")
     parser.add_argument("--continue-on-error", action="store_true", help="Record errors and continue; exit status stays nonzero")

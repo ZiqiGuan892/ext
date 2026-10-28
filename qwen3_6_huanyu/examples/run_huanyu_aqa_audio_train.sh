@@ -267,6 +267,7 @@ if [[ "${RM_ENABLE}" == 0 ]]; then
 fi
 echo "[huanyu-aqa] train_batch=${TRAIN_BATCH_SIZE} ppo_mini_batch=${PPO_MINI_BATCH_SIZE} rollout_n=${ROLLOUT_N} static_microbatch=1"
 echo "[huanyu-aqa] prompt=${MAX_PROMPT_LENGTH} response=${MAX_RESPONSE_LENGTH} steps=${_huanyu_steps}"
+echo "[huanyu-aqa] dump defaults: rollout=${ROLLOUT_DATA_DIR:-$HUANYU_RUN_DIR/rollout_dump} validation=${VALIDATION_DATA_DIR:-$HUANYU_RUN_DIR/validation_dump} genrm=${GENRM_DUMP_DIR} (trailing trainer overrides take precedence)"
 echo "[huanyu-aqa] forward_prefetch=off Q36_BACKWARD_PREFETCH=${Q36_BACKWARD_PREFETCH}; HCCL timeout is unchanged"
 
 # Required settings follow user arguments so the checked datasets and execution

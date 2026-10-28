@@ -343,7 +343,7 @@ bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/run_huanyu_stem.sh"
 | `migrate_aqa_audio.py` | 复制音频归档并改写parquet，支持预检查、批量读取和进度日志，不执行训练 |
 | `external_audio.py` | 按需读取外部音频文件、TAR成员或Zarr ZIP数组，返回音频字节并可回填样本的audio_buffer；作为Python模块调用 |
 | `export_aqa_validation_wav.py` | 将AQA Parquet按行导出prompt、参考答案、对应WAV及索引；可生成vLLM Chat Completions请求JSON |
-| `request_aqa_validation_wav.py` | 读取已导出的prompt和WAV，逐条调用HTTP Chat Completions，将回复TXT与完整结果JSON保存在row目录同级 |
+| `request_aqa_validation_wav.py` | 默认只发送导出的WAV并请求文字回复，逐条调用HTTP Chat Completions，将回复TXT与完整结果JSON保存在对应row目录内 |
 | `prepare_stem_jsonl_to_parquet.py` | STEM JSONL转Parquet，默认train.jsonl/val.jsonl；Optional类型注解兼容Python 3.8/3.9 |
 
 AQA检查会读取train和validation全部行，即使关闭训练前验证也要提供AQA音频验证集。它要求 `raw_source=aqa_real`、非空prompt/ground_truth/audio且无image/video。归档引用使用 `archive.zarr.zip::member_id`。
@@ -441,25 +441,56 @@ python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/request_aqa_validation_wav.py" \
   --limit 50
 ```
 
-默认地址为 `http://localhost:28889/v1/chat/completions`，模型名为 `qwen3.8`，测试前50条，对应服务启动参数 `--port 28889 --served-model-name qwen3.8`；这三项可省略。请求脚本与服务不在同一机器时，使用 `--url` 将localhost替换为服务机器IP。客户端模型名使用服务别名，不填服务端实际权重目录 `/opt/huawei/dataset/model_gy/downloaded_models/2748`。这里选择HTTP问答接口，将原始prompt中的问题与WAV一起发送；与 `realtime_duplex_demo.py` 的WebSocket双工协议不同，不需要设置回复音色的 `--ref-audio`，服务端必须支持音频Chat Completions。
+默认地址为 `http://localhost:28889/v1/chat/completions`，模型名为 `qwen3.8`，测试前50条，对应服务启动参数 `--port 28889 --served-model-name qwen3.8`；这三项可省略。请求脚本与服务不在同一机器时，使用 `--url` 将localhost替换为服务机器IP。客户端模型名使用服务别名，不填服务端实际权重目录 `/opt/huawei/dataset/model_gy/downloaded_models/2748`。这里使用HTTP音频问答接口，**默认仅发送WAV，适用于问题描述已包含在音频中的数据**，不发送问题文字、system消息或历史assistant消息；不需要设置回复音色的 `--ref-audio`。服务端必须支持音频Chat Completions。
 
-脚本从 `manifest.jsonl` 取行号与有序WAV路径，从每个row目录读取 `prompt.json` 和 `ground_truth.txt`，将 `<audio>` 按顺序替换为base64 WAV。无需已有 `request.json`，本次命令的模型名和生成参数直接生效。保留音频采样率和声道，发送完整文件；**ground_truth仅保存到本地结果，不发送给模型**。
+脚本从 `manifest.jsonl` 取行号与有序WAV路径，仅构造一条user消息，其content中全部为音频项；保留采样率和声道，发送完整文件。`prompt.json` 和 `ground_truth.txt` 仍读取并保存到本地结果，方便对照，**默认均不发送给模型**。无需已有 `request.json`，客户端也不使用导出器生成的旧请求JSON。纯音频模式不依赖prompt中的 `<audio>` 占位符。
+
+只有音频不含问题、确实需要同时发送文字时，才显式添加 `--include-prompt`；此时恢复原始prompt消息，并按 `<audio>` 顺序注入WAV，仍不发送ground_truth。脚本不会自动判断音频是否包含问题。默认控制台打印 `input_mode=audio_only prompt_sent=false modalities=text`，结果JSON同步记录这三项；其中保存的 `prompt` 字段是本地参考，不代表已经发给模型。服务器聊天模板仍会添加角色标记和音频占位符。
+
+客户端默认发送 `audio_url`（`data:audio/wav;base64,...`），并设置 `modalities=["text"]` 请求文字回复。可用 `--audio-input-format input_audio` 切回原传输格式；两种格式都附带真实WAV内容。该参数不控制服务器的聊天模板。
+
+**2748模型的模板兼容配置**：如果 `chat_template.jinja` 只处理image/video/text，音频请求会在模板中触发 `Unexpected item type in content.`。仅改成 `audio_url` 不足以修复，因为vLLM可能将两种音频输入都转换为模板中的audio项。对这套Huanyu thinker-only服务，在原启动命令中增加以下两个参数：
+
+```bash
+vllm serve /opt/huawei/dataset/model_gy/downloaded_models/2748 \
+  --omni --port 28889 --log-stats --trust-remote-code \
+  --stage-init-timeout 600 --served-model-name qwen3.8 \
+  --deploy-config /vllm-workspace/vllm-omni/vllm_omni/deploy/minicpmo_5_0_huanyu_thinker_only.yaml \
+  --chat-template-content-format string \
+  --interleave-mm-strings \
+  2>&1 | tee minicpm.log
+```
+
+`string` 使模板接收包含模型音频占位符的字符串，真实音频仍通过多模态输入传递；`--interleave-mm-strings` 保留音频与文本片段的交错顺序。参考[vLLM服务参数](https://docs.vllm.ai/en/latest/cli/serve/#--chat-template-content-format)。这是服务端参数，不能放到本请求脚本中，也无需直接改权重目录中的模板文件。服务器定制分支的实际音频处理仍需通过单条请求验证。
+
+停止原服务、用上述配置重启后，先重试一条；新结果标签保留此前失败日志：
+
+```bash
+python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/request_aqa_validation_wav.py" \
+  --export-dir /opt/huawei/dataset/infra_data/data/validation_vllm \
+  --limit 1 --result-tag template_string
+```
+
+成功后使用 `--limit 50 --result-tag template_string --skip-existing` 测试前50条；若该标签已有失败结果，用 `--limit 1 --result-tag template_string --overwrite` 重试。不要将音频请求替换为只包含WAV路径的文本，否则模型不会收到音频。旧客户端也可以配合上述服务端参数测试；更新后的客户端会在对应400错误中打印并保存修复提示。
 
 ```text
 validation_vllm/samples/
-  row_000000/                 # 原导出的prompt、ground_truth、WAV
-  row_000000.response.txt      # 模型回复正文
-  row_000000.response.json     # 行号、prompt、参考答案、WAV路径、模型回复、完整响应
+  row_000000/
+    prompt.json               # 原始问题
+    ground_truth.txt          # 参考答案
+    audio_00.wav              # 输入音频
+    response.txt              # 模型回复正文
+    response.json             # 行号、prompt、参考答案、WAV路径、模型回复、完整响应
   row_000001/
-  row_000001.response.txt
-  row_000001.response.json
+    response.txt
+    response.json
 ```
 
-结果与 `row_XXXXXX/` **同级**，不写入row目录。JSON中另存 `reasoning_content`、`usage`、`finish_reason` 和耗时；`finish_reason=length` 时标记 `truncated=true`，表示服务返回的回复被长度限制截断。正文为空（例如只返回推理内容）记为失败，原始响应仍保留在JSON中。
+结果保存在对应的 `row_XXXXXX/` **目录内**，与该条数据的prompt、参考答案和WAV放在一起。JSON中另存 `reasoning_content`、`usage`、`finish_reason` 和耗时；`finish_reason=length` 时标记 `truncated=true`，表示服务返回的回复被长度限制截断。正文为空（例如只返回推理内容）记为失败，原始响应仍保留在JSON中。旧版保存在samples下的 `row_XXXXXX.<tag>.txt/json` 不会自动迁移，续跑检查使用新的目录内路径。
 
 - `--limit` 默认50：测试前50条，不足50条则测试全部已有行；`--limit 5` 可先测5条，`--limit 0` 才表示测试全部已导出的行。`--start-row 100` 从原Parquet零基行号100开始。
-- `--skip-existing`：续跑时只跳过请求地址、模型、参数、prompt、WAV字节与参考答案都匹配的成功结果；失败、损坏或输入变化的结果会报错，避免混用。
-- `--result-tag after_rl`：另存 `row_000000.after_rl.txt/json`，适合比较不同模型。`--overwrite` 则明确替换选中行的旧结果；不能与 `--skip-existing` 同用。
+- `--skip-existing`：续跑时只跳过输入模式、请求地址、模型、参数、原始prompt、WAV字节与参考答案都匹配的成功结果；失败、损坏或输入变化的结果会报错，避免混用。此前带文字的结果不能直接复用于纯音频测试，建议加 `--result-tag audio_only` 另存。
+- `--result-tag after_rl`：另存 `row_000000/after_rl.txt/json`，适合比较不同模型；`--result-tag template_string` 对应 `row_000000/template_string.txt/json`。`--overwrite` 则明确替换选中行的旧结果；不能与 `--skip-existing` 同用。标签不能使用 `prompt`、`ground_truth`、`sample`、`request`，以免覆盖导出数据。
 - 默认逐条请求、遇错停止，不自动重试；`--continue-on-error` 可记录失败后继续，其最终退出码仍非零。HTTP错误、超时等写入对应结果JSON，不伪造回复。
 - 若服务要求API Key，运行前 `export VLLM_API_KEY=...`。该值仅放入请求头，不保存到结果。
 
@@ -469,7 +500,7 @@ validation_vllm/samples/
 
 - 独立环境准备：`$PROJECT_ROOT/runs/environment/prepare_<时间>_<随机串>/prepare.log`，可用 `HUANYU_PREPARE_LOG_ROOT` 覆盖根目录；`[huanyu-env] READY` 表示检查通过。
 - 一键节点日志：`$PROJECT_ROOT/runs/$EXPERIMENT_NAME/cluster/rank_0.log` / `rank_1.log`，可用 `HUANYU_JOB_LOG_DIR` 覆盖。
-- 训练控制台：`[huanyu-output] console=...` 指出的 `$PROJECT_ROOT/runs/huanyu_<时间>_<随机串>/console.log`；GenRM dump在同一目录。
+- 训练控制台：`[huanyu-output] console=...` 指出的 `$PROJECT_ROOT/runs/huanyu_<时间>_<随机串>/console.log`。AQA普通入口及一键入口默认将 `genrm_dump/`、`rollout_dump/`、`validation_dump/` 放在该运行目录下，三个目录同级；`[huanyu-aqa] dump defaults:` 打印目录默认值。旧运行的 `samples_*` 文件不会自动迁移。
 - checkpoint/TensorBoard由 `DEFAULT_LOCAL_DIR` / `TENSORBOARD_DIR` 或最终trainer配置决定。共用AQA入口会将共享环境中的固定默认目录改为独立运行目录，并默认保存rollout_dump和validation_dump。显式环境目录与trainer参数优先；验证数据只在实际运行验证时产生。
 
 ```bash
