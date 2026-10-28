@@ -140,6 +140,17 @@ class WeightReloadTests(unittest.TestCase):
         self.addCleanup(self.env.stop)
         reload._REPORTED_FALLBACKS.clear()
 
+    def test_disk_validation_rejects_ipc_even_if_layerwise_reload_disabled(self):
+        extension = extension_class()
+        reload.bind_huanyu_weight_reload(extension)
+        worker = extension()
+        with patch.dict("os.environ", {"HUANYU_CHECKPOINT_VALIDATION_MODE": "disk", reload._ENV_FLAG: "0"}):
+            with self.assertRaisesRegex(RuntimeError, "disk checkpoint validation forbids"):
+                worker.update_weights_from_ipc()
+            self.assertEqual(worker.delegated, [])
+            other = extension(model_config=config("other_audio"))
+            self.assertEqual(other.update_weights_from_ipc(), "original")
+
     def test_deferred_loaders_keep_owned_tensor_after_ipc_buffer_reuse(self):
         model = Model()
         shared = Tensor(10)

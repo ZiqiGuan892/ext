@@ -628,3 +628,48 @@ python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/compare_huanyu_audio_probe.py" \
 | 最终 audio embeddings 相同 | prompt/template、音频 span 与位置、LLM 权重、GDN/cache/TP |
 
 比较器输出逐元素最大/平均误差、RMSE、相对 L2、cosine 和误差最大的 token 行；不把单一相关系数接近 1 当作正确。字节哈希不同但 FP32 值哈希相同，可能仅是 dtype 不同。CPU 测试验证采集/配对/同步时序，真实 NPU 数值差异必须由上述运行证据确认。
+
+### 8.1 跳过首次 Actor 权重同步，只做验证
+
+`HUANYU_CHECKPOINT_VALIDATION_MODE=disk` 在 Huanyu TaskRunner 中跳过 `on_init_end()` 的 Actor 权重同步，保留 rollout 通过 `safetensors` 从 `MODEL_PATH` 加载的原始权重；`sync` 对照组正常执行一次首次同步。两组都设置 rollout 的 step 元数据为 0，随后只执行 `val_before_train` 并退出，不更新梯度。默认不设置该变量，正常训练行为不变。
+
+不能只把同步函数改为空函数：初始化阶段还有 `sleep_replicas()`。本实验两组都要求 `free_cache_engine=false`，让原始权重和 KV cache 保持驻留，避免依赖同步过程唤醒。必须同时设置 `val_only=true`、`val_before_train=true`、`resume_mode=disable`，使用独立奖励池、非 LoRA 的 Huanyu `omni_sync` 训练入口及音频探针。诊断模式会拒绝不满足这些条件的配置，并禁止后续权重更新或进入训练循环。
+
+在环境和 Ray 已准备好的主节点上运行；两个节点均需更新 Huanyu 包，并能访问同一模型、导出 WAV 和输出目录。下面顺序执行两组，复用 WAV100 的相同抽样种子、冻结 encoder/projector、Actor16+RM16、TP4 和贪心采样配置：
+
+```bash
+export PROJECT_ROOT=/opt/huawei/dataset/infra_data/code/verl_omni_qwen36_gzq_new
+export MODEL_PATH=/opt/huawei/dataset/model_gy/downloaded_models/2748
+export RM_MODEL_PATH=/opt/huawei/dataset/model_gy/downloaded_models/Qwen3.5-35B-A3B
+export AQA_WAV_SAMPLE_SEED=42
+export AB_ROOT="/opt/huawei/dataset/infra_data/data/huanyu_sync_ab_$(date +%Y%m%d_%H%M%S)"
+
+for MODE in disk sync; do
+  mkdir -p "$AB_ROOT/$MODE"
+  HUANYU_CHECKPOINT_VALIDATION_MODE="$MODE" \
+  EXPERIMENT_NAME="huanyu_sync_ab_$MODE" \
+  bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/run_huanyu_aqa_wav100.sh" \
+    trainer.val_only=true trainer.val_before_train=true trainer.resume_mode=disable \
+    actor_rollout_ref.rollout.load_format=safetensors \
+    actor_rollout_ref.rollout.free_cache_engine=false \
+    "trainer.validation_data_dir=$AB_ROOT/$MODE/validation_dump" \
+    "++ray_kwargs.ray_init.runtime_env.env_vars.HUANYU_CHECKPOINT_VALIDATION_MODE=\"$MODE\"" \
+    "++ray_kwargs.ray_init.runtime_env.env_vars.HUANYU_AUDIO_PROBE_DIR=\"$AB_ROOT/$MODE/probe\"" \
+    '++ray_kwargs.ray_init.runtime_env.env_vars.HUANYU_AUDIO_PROBE_MAX_CALLS="8"' \
+    '++ray_kwargs.ray_init.runtime_env.env_vars.HUANYU_AUDIO_PROBE_ARM_FILE=""' \
+    '++ray_kwargs.ray_init.runtime_env.env_vars.HUANYU_AUDIO_PROBE_FEATURE_ID=""' \
+    || break
+done
+```
+
+核对日志：`[huanyu-checkpoint-validation] mode=disk initial_actor_sync=skipped` 或 `mode=sync initial_actor_sync=completed`。`Initial validation metrics` 后应退出，没有 Actor optimizer step。控制台仍写入启动时打印的 `HUANYU_RUN_DIR/console.log`；完整验证回答在 `$AB_ROOT/{disk,sync}/validation_dump/`，探针在对应的 `probe/`。
+
+选取真实验证样本的 `forward_*.json` 检查 `weight_reload_count`：disk 应为 0，sync 应为 1。disk 没有 `before_first_reload.json` / `after_first_reload.json` 是预期行为；用 forward 文件中的权重哈希对照 checkpoint，尤其是此前发生变化的四个 `conv_layers.0.layers.{1,4}.{weight,bias}`。探针可能先捕获 warmup，必须按有效特征 ID 配对，不能直接比较相同文件序号。
+
+| 对照结果 | 可以得出的结论 |
+|---|---|
+| disk 正常、sync 再现近音词错误，且权重/embedding 差异同步再现 | 强证据指向 Actor 加载→FSDP 导出→传输→rollout 重载链路；还需边界检查区分具体环节 |
+| 两组都异常 | 首次同步不是唯一原因，继续核对与 serve 的输入模板、精度补丁和 TP 等差异 |
+| 两组都正常 | 本实验未复现；两组关闭了 sleep，不能据此排除原同步/sleep 交互问题 |
+
+比较同一 WAV 的实际回答和 embedding，不能只比较平均 GenRM 分数。该实验跳过的是整模型同步，包含 LLM，因此不能单独证明四个 LayerNorm 参数就是全部根因；还要结合音频权重和 embedding 对照。当前仅通过 CPU 控制流程测试，真实 NPU 结论需以上两组服务器结果。

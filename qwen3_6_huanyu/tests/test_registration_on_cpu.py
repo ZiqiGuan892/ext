@@ -140,6 +140,17 @@ class RegistrationTests(unittest.TestCase):
         rollout.install_huanyu_rollout_inputs.assert_called_once_with()
         aqa.install_huanyu_aqa_position_ids.assert_called_once_with()
 
+    def test_tokenizer_setup_installs_checkpoint_validation_hook_in_task_runner(self):
+        utils = ModuleType("verl.utils")
+        utils.hf_tokenizer = Mock(return_value=Tokenizer())
+        validation = ModuleType(f"{PACKAGE}.checkpoint_validation")
+        validation.install_checkpoint_validation = Mock()
+        with patch.dict(sys.modules, {utils.__name__: utils, validation.__name__: validation}):
+            result = self.adapter.configure_tokenizer("checkpoint", self.config)
+        self.assertIs(result, utils.hf_tokenizer.return_value)
+        utils.hf_tokenizer.assert_called_once_with("checkpoint", trust_remote_code=True)
+        validation.install_checkpoint_validation.assert_called_once_with()
+
     def test_valid_model_uses_huanyu_loader_freezes_audio_and_installs_new_forward(self):
         result = self.adapter.configure_model(self.model, self.config)
         self.install_entropy.assert_called_once_with()

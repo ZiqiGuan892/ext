@@ -203,6 +203,12 @@ def bind_huanyu_weight_reload(extension):
 
     @wraps(original)
     def huanyu_update_weights(worker, *args, **kwargs):
+        # A disk-only validation must never silently receive Actor weights,
+        # including when the regular layerwise reload switch is disabled.
+        if os.environ.get("HUANYU_CHECKPOINT_VALIDATION_MODE", "").strip().lower() == "disk":
+            standard = _standard_model_and_config(worker)
+            if standard is not None and _is_huanyu(*standard):
+                raise RuntimeError("Huanyu disk checkpoint validation forbids Actor-to-rollout IPC updates")
         if not _enabled():
             _report_once(f"delegated to original IPC handler: {_ENV_FLAG}=0", worker)
             return original(worker, *args, **kwargs)

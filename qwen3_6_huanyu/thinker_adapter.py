@@ -73,8 +73,10 @@ class Qwen36HuanyuThinkerAdapter(OmniModelBase):
     @classmethod
     def configure_tokenizer(cls, model_path, model_config):
         from verl.utils import hf_tokenizer
+        from .checkpoint_validation import install_checkpoint_validation
 
         validate_huanyu_config(model_config.hf_config)
+        install_checkpoint_validation()
         return hf_tokenizer(model_path, trust_remote_code=model_config.trust_remote_code)
 
     @classmethod
