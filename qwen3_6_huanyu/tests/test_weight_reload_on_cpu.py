@@ -11,18 +11,24 @@ from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SPEC = importlib.util.spec_from_file_location("huanyu_weight_reload_cpu_tests", ROOT / "weight_reload.py")
+PACKAGE = "huanyu_weight_reload_cpu_tests"
+package = ModuleType(PACKAGE)
+package.__path__ = [str(ROOT)]
+sys.modules[PACKAGE] = package
+SPEC = importlib.util.spec_from_file_location(f"{PACKAGE}.weight_reload", ROOT / "weight_reload.py")
 reload = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = reload
 SPEC.loader.exec_module(reload)
 
 
 class Tensor:
-    def __init__(self, value, *, is_meta=False):
+    def __init__(self, value, *, is_meta=False, shape=(40,)):
         self.value = value
         self.is_meta = is_meta
+        self.shape = shape
 
     def clone(self):
-        return Tensor(self.value, is_meta=self.is_meta)
+        return Tensor(self.value, is_meta=self.is_meta, shape=self.shape)
 
 
 class Layer:
@@ -34,6 +40,10 @@ class Layer:
         if path == "layer":
             return self
         raise ValueError(path)
+
+    def named_parameters(self):
+        yield "weight", self.weight
+        yield "bias", self.bias
 
 
 class Model:
@@ -55,6 +65,12 @@ class Model:
 
 def config(audio_type="huanyu_conformer_0_6b"):
     return SimpleNamespace(hf_config=SimpleNamespace(audio_config={"model_type": audio_type}))
+
+
+def full_audio_weights(value=9):
+    return [(f"{module}.{leaf}", Tensor(value))
+            for module in ("apm", "audio_projection_layer")
+            for leaf in ("weight", "bias")]
 
 
 @contextmanager
@@ -156,9 +172,14 @@ class WeightReloadTests(unittest.TestCase):
         shared = Tensor(10)
 
         def receive(on_bucket_received):
-            on_bucket_received([("model.audio_encoder.layer.weight", shared)], False)
+            on_bucket_received([("model.audio_encoder.weight", shared)], False)
             shared.value = 20
-            on_bucket_received([("model.audio_projection.layer.bias", shared), ("llm.weight", shared)], True)
+            on_bucket_received([
+                ("model.audio_encoder.bias", shared),
+                ("model.audio_projection.weight", shared),
+                ("model.audio_projection.bias", shared),
+                ("llm.weight", shared),
+            ], True)
             shared.value = -999  # receiver releases/reuses memory after callback
 
         with fake_reload_api(model) as (events, pending), redirect_stdout(io.StringIO()) as output:
@@ -169,7 +190,7 @@ class WeightReloadTests(unittest.TestCase):
         self.assertEqual(model.text.value, 20)
         self.assertTrue(all(value is not shared for _, value in pending))
         self.assertEqual([name for name, _ in model.loaded], ["llm.weight"])
-        self.assertIn("buckets=2 audio_tensors=2 meta_parameters=0", output.getvalue())
+        self.assertIn("buckets=2 audio_tensors=4 meta_parameters=0", output.getvalue())
 
     def test_one_argument_callback_and_mapping_supported_frozen_audio_unchanged(self):
         model = Model()
@@ -225,7 +246,7 @@ class WeightReloadTests(unittest.TestCase):
 
     def test_finalize_left_meta_is_rejected_without_success_log(self):
         model = Model()
-        receiver = SimpleNamespace(receive_weights=lambda on_bucket_received: on_bucket_received([("apm.weight", Tensor(9))]))
+        receiver = SimpleNamespace(receive_weights=lambda on_bucket_received: on_bucket_received(full_audio_weights()))
         with fake_reload_api(model, leave_meta=True), redirect_stdout(io.StringIO()) as output:
             with self.assertRaisesRegex(RuntimeError, "left meta parameters.*apm.weight"):
                 reload.receive_layerwise_weights(model, config(), receiver)
@@ -248,7 +269,7 @@ class WeightReloadTests(unittest.TestCase):
         model = Model()
         snapshots = []
         receiver = SimpleNamespace(receive_weights=lambda on_bucket_received:
-                                   on_bucket_received([("apm.weight", Tensor(9))]))
+                                   on_bucket_received(full_audio_weights()))
         with fake_reload_api(model) as (events, _), redirect_stdout(io.StringIO()):
             model._huanyu_audio_probe_snapshot_weights = lambda phase: snapshots.append(
                 (phase, list(events), model.thinker.apm.weight.value,
@@ -271,7 +292,7 @@ class WeightReloadTests(unittest.TestCase):
                 model._huanyu_audio_probe_snapshot_weights = snapshots.append
 
                 def receive(on_bucket_received):
-                    on_bucket_received([("apm.weight", Tensor(9))])
+                    on_bucket_received(full_audio_weights())
                     if failure == "receive":
                         raise RuntimeError("IPC disconnected")
 
@@ -283,6 +304,35 @@ class WeightReloadTests(unittest.TestCase):
                 self.assertEqual(model._huanyu_audio_probe_reload_count, 0)
                 self.assertNotIn("completed", output.getvalue())
                 self.assertEqual(events, ["initialize"] if failure == "receive" else ["initialize", "finalize"])
+
+    def test_missing_audio_bias_does_not_finalize_or_report_success(self):
+        model = Model()
+        snapshots = []
+        model._huanyu_audio_probe_snapshot_weights = snapshots.append
+
+        def receive(on_bucket_received):
+            on_bucket_received(full_audio_weights()[:1], False)
+            on_bucket_received(full_audio_weights()[2:], True)
+
+        with fake_reload_api(model) as (events, _), redirect_stdout(io.StringIO()) as output:
+            with self.assertRaisesRegex(RuntimeError, "Incomplete.*model.audio_encoder.bias"):
+                reload.receive_layerwise_weights(model, config(), SimpleNamespace(receive_weights=receive))
+        self.assertEqual(events, ["initialize"])
+        self.assertEqual(snapshots, ["before_first_reload"])
+        self.assertFalse(hasattr(model, "_huanyu_audio_probe_reload_count"))
+        self.assertNotIn("completed", output.getvalue())
+
+    def test_duplicate_audio_alias_does_not_finalize(self):
+        model = Model()
+
+        def receive(on_bucket_received):
+            on_bucket_received(full_audio_weights(), False)
+            on_bucket_received([("model.audio_encoder.weight", Tensor(99))], True)
+
+        with fake_reload_api(model) as (events, _), redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(ValueError, "Duplicate"):
+                reload.receive_layerwise_weights(model, config(), SimpleNamespace(receive_weights=receive))
+        self.assertEqual(events, ["initialize"])
 
     def test_missing_reload_api_fails_before_receiving(self):
         incomplete = ModuleType(reload._RELOAD_MODULE)

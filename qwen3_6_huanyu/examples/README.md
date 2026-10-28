@@ -673,3 +673,58 @@ done
 | 两组都正常 | 本实验未复现；两组关闭了 sleep，不能据此排除原同步/sleep 交互问题 |
 
 比较同一 WAV 的实际回答和 embedding，不能只比较平均 GenRM 分数。该实验跳过的是整模型同步，包含 LLM，因此不能单独证明四个 LayerNorm 参数就是全部根因；还要结合音频权重和 embedding 对照。当前仅通过 CPU 控制流程测试，真实 NPU 结论需以上两组服务器结果。
+
+### 8.2 定位首次权重同步中最早的数值偏差
+
+在 disk 正常、sync 异常后，启用 `HUANYU_WEIGHT_SYNC_AUDIT_DIR`。探针跟踪 VGG 两个 block 的 `layers.{1,4}.{weight,bias}` 共 8 个 LayerNorm 参数；40 维参数是已发现异常的目标，20 维参数是对照。它记录完整小向量、原 dtype 字节哈希、FP32 数值哈希和源码指纹，避免只因 BF16/FP32 dtype 不同就判为数值变化。
+
+记录链路：`checkpoint → actor_loaded → actor_local_shard → actor_export → receiver_input → receiver_owned → after_finalize`，另记录 `before_reload`、`after_initialize` 和 `after_load_bucket`。`actor_export` 是实际 `OmniFSDPEngine` 原生成器完成 H2D、`full_tensor()` 和 BF16 cast 后的值；当前不能把这三步再拆开。分片检查仅支持一维 `Shard(0)`，其他 mesh 会明确报告证据不足。探针不额外调用 collective，不修改传输值。
+
+两个节点更新代码后，在环境、Ray 已准备好的主节点上运行一次 sync 验证。沿用前面 WAV100 对照的数据和冻结配置：
+
+```bash
+export PROJECT_ROOT=/opt/huawei/dataset/infra_data/code/verl_omni_qwen36_gzq_new
+export MODEL_PATH=/opt/huawei/dataset/model_gy/downloaded_models/2748
+export RM_MODEL_PATH=/opt/huawei/dataset/model_gy/downloaded_models/Qwen3.5-35B-A3B
+export AQA_WAV_SAMPLE_SEED=42
+export AUDIT_ROOT="/opt/huawei/dataset/infra_data/data/huanyu_weight_sync_$(date +%Y%m%d_%H%M%S)"
+mkdir -p "$AUDIT_ROOT"
+
+HUANYU_CHECKPOINT_VALIDATION_MODE=sync \
+EXPERIMENT_NAME=huanyu_weight_sync_audit \
+bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/run_huanyu_aqa_wav100.sh" \
+  trainer.val_only=true trainer.val_before_train=true trainer.resume_mode=disable \
+  actor_rollout_ref.rollout.load_format=safetensors \
+  actor_rollout_ref.rollout.free_cache_engine=false \
+  "trainer.validation_data_dir=$AUDIT_ROOT/validation_dump" \
+  '++ray_kwargs.ray_init.runtime_env.env_vars.HUANYU_CHECKPOINT_VALIDATION_MODE="sync"' \
+  "++ray_kwargs.ray_init.runtime_env.env_vars.HUANYU_AUDIO_PROBE_DIR=\"$AUDIT_ROOT/audio_probe\"" \
+  '++ray_kwargs.ray_init.runtime_env.env_vars.HUANYU_AUDIO_PROBE_MAX_CALLS="8"' \
+  '++ray_kwargs.ray_init.runtime_env.env_vars.HUANYU_AUDIO_PROBE_ARM_FILE=""' \
+  '++ray_kwargs.ray_init.runtime_env.env_vars.HUANYU_AUDIO_PROBE_FEATURE_ID=""' \
+  "++ray_kwargs.ray_init.runtime_env.env_vars.HUANYU_WEIGHT_SYNC_AUDIT_DIR=\"$AUDIT_ROOT/weights\"" \
+  '++ray_kwargs.ray_init.runtime_env.env_vars.HUANYU_WEIGHT_SYNC_AUDIT_MAX_UPDATES="1"'
+```
+
+输出为 `$AUDIT_ROOT/weights/weights-<host>-<pid>-<uuid>.jsonl`。目录不共享时，先收集两个节点的文件到同一目录；不要混入其他实验。同步失败也可比较已落盘的阶段。比较命令：
+
+```bash
+python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/compare_huanyu_weight_sync.py" \
+  --audit-dir "$AUDIT_ROOT/weights" --update 1 \
+  --output "$AUDIT_ROOT/compare_update1.json"
+```
+
+退出码 `0=PASS`、`1=FAIL`、`2=INCOMPLETE`。报告保留每个已观测进程的结果及具体差异下标；缺少前序阶段时不会猜测最早异常边界。首次同步要求未经过 optimizer 更新；这 8 项 checkpoint 原为 BF16，因此到 FP32 再到 BF16 应能精确往返。若换成 FP32 checkpoint，要另行分析合法舍入，不能沿用此结论。
+
+| 最早不一致的阶段 | 下一步定位范围 |
+| --- | --- |
+| `actor_loaded` | checkpoint 读取、参数绑定或加载时转换 |
+| `actor_local_shard` | FSDP 初始化、分片装载及导出前的参数状态 |
+| `actor_export` | H2D、FSDP 聚合、导出 cast；尚不能单靠此阶段区分三者 |
+| `receiver_input` | Actor 导出后到接收 callback 之前的打包/传输 |
+| `receiver_owned` | 接收 buffer 的独立复制 |
+| `after_finalize` | layerwise loader、临时参数 materialize、复制回原始存储 |
+
+同时新增正常同步的完整性保护：拒绝未知/重复/形状错误的音频参数；一旦传入任何音频参数，要求 encoder 和 projector 全套完整，缺失时在 finalize 前报错。整套音频均省略的更新仍保留原权重。finalize 后还检查上述 8 个 LayerNorm 是否精确等于接收值转换到目标 dtype 后的结果；不一致时输出参数名和 `bad_indices`，不会继续使用已确认损坏的权重。此保护不从 disk 覆盖 Actor 权重，也不能发现 sender 本身已经输出了错误值。
+
+**验证边界**：CPU 测试覆盖漏参/重复、真实 Torch meta 参数重建、故意破坏长度 40 参数后的报错、各阶段比较和不完整证据处理；尚不能证明 NPU 根因已修复。数值采集及小向量校验需要设备到 CPU 读取，会改变同步时序，尤其是导出前的分片快照；若开启检查后异常消失，应转查异步竞态，不能据此认定原链路正确。该探针只覆盖音频 VGG LayerNorm，不能替代整模型或 LLM 权重一致性验证。

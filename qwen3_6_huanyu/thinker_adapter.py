@@ -130,6 +130,10 @@ class Qwen36HuanyuThinkerAdapter(OmniModelBase):
         _flatten_text_config(module.config)
         token_ids = _audio_token_ids(_value(model_config, "tokenizer"), module.config)
         attach_huanyu_audio(module, model_config)
+        if os.environ.get("HUANYU_WEIGHT_SYNC_AUDIT_DIR", "").strip():
+            from .weight_sync_audit import start_actor_audit
+
+            start_actor_audit(module, model_config)
 
         visual = getattr(module.model, "visual", None)
         if visual is not None:

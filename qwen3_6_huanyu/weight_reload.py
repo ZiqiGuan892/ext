@@ -108,6 +108,8 @@ def _load_audio_weights(model, weights):
 
 def receive_layerwise_weights(model, model_config, receiver, *, worker=None):
     """Receive one complete update; finalize once after all buckets succeeded."""
+    from .audio_reload_guard import AudioReloadGuard
+
     try:
         reload_api = importlib.import_module(_RELOAD_MODULE)
         initialize = reload_api.initialize_layerwise_reload
@@ -118,6 +120,24 @@ def receive_layerwise_weights(model, model_config, receiver, *, worker=None):
             "finalize_layerwise_reload; check the vLLM version on every rollout node"
         ) from exc
 
+    guard = AudioReloadGuard(model)
+    update_id = getattr(model, "_huanyu_weight_sync_update_id", 0) + 1
+    audit = None
+    audit_extra = {}
+    if os.environ.get("HUANYU_WEIGHT_SYNC_AUDIT_DIR", "").strip():
+        from . import weight_sync_audit
+
+        if weight_sync_audit.enabled(update_id):
+            audit = weight_sync_audit
+            audit_extra = {"initialize": audit.source_info(initialize),
+                           "finalize": audit.source_info(finalize),
+                           "receiver": audit.source_info(receiver.receive_weights)}
+
+    def record_model(stage, **extra):
+        if audit is not None:
+            audit.record(stage, model.named_parameters(), round_id=update_id,
+                         extra={**audit_extra, **extra})
+
     # Optional evidence from the actual live model, before any reload loader
     # replaces its parameters. Constructor-time hashes would hash random/meta
     # tensors instead of the checkpoint. Limit this to the first IPC update.
@@ -125,17 +145,26 @@ def receive_layerwise_weights(model, model_config, receiver, *, worker=None):
     reload_count = getattr(model, "_huanyu_audio_probe_reload_count", 0)
     if callable(snapshot) and reload_count == 0:
         snapshot("before_first_reload")
+    record_model("before_reload")
     initialize(model)
+    record_model("after_initialize")
     audio_count, bucket_count, encoder_count, projector_count = 0, 0, 0, 0
 
     def load_bucket(weights, is_last=None):
         nonlocal audio_count, bucket_count, encoder_count, projector_count
         # Both callback(weights) and callback(weights, is_last) are used by verl
         # versions. Completion is receiver return, never a per-bucket finalize.
-        items = weights.items() if isinstance(weights, Mapping) else weights
+        items = list(weights.items() if isinstance(weights, Mapping) else weights)
+        if audit is not None:
+            audit.record("receiver_input", items, round_id=update_id,
+                         extra={**audit_extra, "bucket": bucket_count + 1})
         # Deferred loaders may retain tensors until a later bucket completes a
         # layer. The IPC buffer is reused immediately after the callback's ACK.
         owned = [(name, value.clone()) for name, value in items]
+        guard.ingest(owned)
+        if audit is not None:
+            audit.record("receiver_owned", owned, round_id=update_id,
+                         extra={**audit_extra, "bucket": bucket_count + 1})
         encoder_count += sum(name.startswith(("model.audio_encoder.", "apm.")) for name, _ in owned)
         projector_count += sum(name.startswith(("model.audio_projection.", "audio_projection_layer.")) for name, _ in owned)
         remaining, count = _load_audio_weights(model, owned)
@@ -143,14 +172,19 @@ def receive_layerwise_weights(model, model_config, receiver, *, worker=None):
         bucket_count += 1
         if remaining:
             model.load_weights(remaining)
+        record_model("after_load_bucket", bucket=bucket_count)
 
     receiver.receive_weights(on_bucket_received=load_bucket)
     # On receive/load failure, propagate it. Finalizing an incomplete update
     # cannot make it usable and must not emit a misleading completion message.
+    guard.check_complete()
     finalize(model, model_config)
+    record_model("after_finalize")
     meta = [name for name, value in model.named_parameters() if value.is_meta]
     if meta:
         raise RuntimeError(f"Huanyu layerwise reload left meta parameters: {meta[:8]}")
+    guard.verify(model)
+    model._huanyu_weight_sync_update_id = update_id
     if callable(snapshot):
         model._huanyu_audio_probe_reload_count = reload_count + 1
         if reload_count == 0:
