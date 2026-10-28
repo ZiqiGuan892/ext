@@ -118,6 +118,13 @@ def receive_layerwise_weights(model, model_config, receiver, *, worker=None):
             "finalize_layerwise_reload; check the vLLM version on every rollout node"
         ) from exc
 
+    # Optional evidence from the actual live model, before any reload loader
+    # replaces its parameters. Constructor-time hashes would hash random/meta
+    # tensors instead of the checkpoint. Limit this to the first IPC update.
+    snapshot = getattr(model, "_huanyu_audio_probe_snapshot_weights", None)
+    reload_count = getattr(model, "_huanyu_audio_probe_reload_count", 0)
+    if callable(snapshot) and reload_count == 0:
+        snapshot("before_first_reload")
     initialize(model)
     audio_count, bucket_count, encoder_count, projector_count = 0, 0, 0, 0
 
@@ -144,6 +151,10 @@ def receive_layerwise_weights(model, model_config, receiver, *, worker=None):
     meta = [name for name, value in model.named_parameters() if value.is_meta]
     if meta:
         raise RuntimeError(f"Huanyu layerwise reload left meta parameters: {meta[:8]}")
+    if callable(snapshot):
+        model._huanyu_audio_probe_reload_count = reload_count + 1
+        if reload_count == 0:
+            snapshot("after_first_reload")
     freeze = os.environ.get("HUANYU_FREEZE_AUDIO", "unspecified").lower()
     audio_mode = "frozen" if freeze in {"1", "true", "yes", "on"} else (
         "trainable" if freeze in {"0", "false", "no", "off"} else "unspecified"

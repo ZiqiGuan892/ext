@@ -162,6 +162,14 @@ def configure_huanyu_rollout(native, vllm_config):
     _shared("linear_precision").install_rollout(native)
     vision = _isolate_vision(native)
     audio = _install_audio(native)
+    # Capture the real rollout audio boundary, after the active isolation
+    # wrapper. The neutral probe also runs in standalone serve without
+    # importing this precision policy. No tensor reads when it is disabled.
+    if os.environ.get("HUANYU_AUDIO_PROBE_DIR"):
+        from .examples.huanyu_audio_probe import attach_audio_probe
+
+        native._huanyu_audio_probe_config = vllm_config
+        attach_audio_probe(native)
     native._huanyu_precision_configured = True
     print(f"[huanyu-precision] rollout installed: gdn_fp32={fp32} isolated_vision={vision} "
           f"isolated_audio={audio}; native Huanyu audio retained", flush=True)

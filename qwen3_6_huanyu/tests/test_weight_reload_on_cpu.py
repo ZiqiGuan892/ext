@@ -233,6 +233,46 @@ class WeightReloadTests(unittest.TestCase):
         self.assertEqual(events, ["initialize"])
         self.assertNotIn("completed", output.getvalue())
 
+    def test_probe_snapshots_bracket_first_successful_reload_only(self):
+        model = Model()
+        snapshots = []
+        receiver = SimpleNamespace(receive_weights=lambda on_bucket_received:
+                                   on_bucket_received([("apm.weight", Tensor(9))]))
+        with fake_reload_api(model) as (events, _), redirect_stdout(io.StringIO()):
+            model._huanyu_audio_probe_snapshot_weights = lambda phase: snapshots.append(
+                (phase, list(events), model.thinker.apm.weight.value,
+                 getattr(model, "_huanyu_audio_probe_reload_count", 0)))
+            reload.receive_layerwise_weights(model, config(), receiver)
+            reload.receive_layerwise_weights(model, config(), receiver)
+        self.assertEqual(snapshots, [
+            ("before_first_reload", [], 1, 0),
+            ("after_first_reload", ["initialize", "finalize"], 9, 1),
+        ])
+        self.assertEqual(model._huanyu_audio_probe_reload_count, 2)
+        self.assertEqual(events, ["initialize", "finalize", "initialize", "finalize"])
+
+    def test_failed_reload_does_not_report_post_sync_evidence_or_increment_count(self):
+        for failure in ("receive", "meta"):
+            with self.subTest(failure=failure):
+                model = Model()
+                snapshots = []
+                model._huanyu_audio_probe_reload_count = 0
+                model._huanyu_audio_probe_snapshot_weights = snapshots.append
+
+                def receive(on_bucket_received):
+                    on_bucket_received([("apm.weight", Tensor(9))])
+                    if failure == "receive":
+                        raise RuntimeError("IPC disconnected")
+
+                receiver = SimpleNamespace(receive_weights=receive)
+                with fake_reload_api(model, leave_meta=failure == "meta") as (events, _):
+                    with redirect_stdout(io.StringIO()) as output, self.assertRaises(RuntimeError):
+                        reload.receive_layerwise_weights(model, config(), receiver)
+                self.assertEqual(snapshots, ["before_first_reload"])
+                self.assertEqual(model._huanyu_audio_probe_reload_count, 0)
+                self.assertNotIn("completed", output.getvalue())
+                self.assertEqual(events, ["initialize"] if failure == "receive" else ["initialize", "finalize"])
+
     def test_missing_reload_api_fails_before_receiving(self):
         incomplete = ModuleType(reload._RELOAD_MODULE)
         receiver = SimpleNamespace(receive_weights=lambda **kw: self.fail("receiver must not run"))

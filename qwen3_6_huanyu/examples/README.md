@@ -18,6 +18,7 @@
 | AQA 一键启动，自定义长度/同步 | `HUANYU_JOB_MODE=aqa_unfreeze bash run_huanyu_32card_job.sh` | 两节点 | 直接转入共用AQA入口，长度、精度和同步由参数配置 |
 | 已准备环境和 Ray，冻结/缓存训练 | `run_huanyu.sh` | 仅主节点 | 需提前配置冻结与缓存环境；复用通用训练链 |
 | 已准备环境和 Ray，AQA 自定义长度/参数 | `run_huanyu_aqa_audio_train.sh` | 仅主节点 | 在线音频，默认4096+2048，16+16，静态 micro=1 |
+| 从 validation 抽100条，用已有WAV诊断训练 | `run_huanyu_aqa_wav100.sh` | 仅主节点 | 环境/Ray已准备；两音频组件冻结，16+16，先验证100条再训练 |
 | 已准备环境和 Ray，STEM 纯文本 | `run_huanyu_stem.sh` | 仅主节点 | 默认5K、16+16、full、冻结音频、micro1、逐micro同步；支持12K及更长 |
 | 单机16卡 AQA，关闭模型奖励 | `run_huanyu_aqa_audio_train_16card.sh` | 仅主节点 | Actor16、RM0，规则奖励；默认4096+2048 |
 
@@ -343,6 +344,7 @@ bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/run_huanyu_stem.sh"
 | `migrate_aqa_audio.py` | 复制音频归档并改写parquet，支持预检查、批量读取和进度日志，不执行训练 |
 | `external_audio.py` | 按需读取外部音频文件、TAR成员或Zarr ZIP数组，返回音频字节并可回填样本的audio_buffer；作为Python模块调用 |
 | `export_aqa_validation_wav.py` | 将AQA Parquet按行导出prompt、参考答案、对应WAV及索引；可生成vLLM Chat Completions请求JSON |
+| `prepare_aqa_wav_parquet.py` | 按导出manifest匹配源Parquet，复用真实WAV路径，支持固定种子随机抽样；不读取ZIP、不覆盖源文件 |
 | `request_aqa_validation_wav.py` | 默认只发送导出的WAV并请求文字回复，逐条调用HTTP Chat Completions，将回复TXT与完整结果JSON保存在对应row目录内 |
 | `prepare_stem_jsonl_to_parquet.py` | STEM JSONL转Parquet，默认train.jsonl/val.jsonl；Optional类型注解兼容Python 3.8/3.9 |
 
@@ -388,6 +390,22 @@ Path("sample.wav").write_bytes(wav_bytes)
 ```
 
 若原始引用是 `archive.zarr.zip::member_id`，需将两部分分别传入 `absolute_path` 和 `archive_key`；该模块不自动拆分 `::`。
+
+### 从validation抽100条，直接使用已导出的WAV训练
+
+先准备好环境和32卡Ray集群，再仅在主节点执行：
+
+```bash
+bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/run_huanyu_aqa_wav100.sh"
+```
+
+默认读取 `/opt/huawei/dataset/infra_data/data/aqa_dataset/validation.parquet`，从全部行中以seed=42不放回随机抽100条，复用 `/opt/huawei/dataset/infra_data/data/validation_vllm/manifest.jsonl` 对应的WAV。可分别用 `AQA_WAV_SOURCE_PARQUET`、`AQA_WAV_EXPORT_DIR`、`AQA_WAV_SAMPLE_SEED` 覆盖。若当前导出目录只有前50条，必须先按下一节导出完整validation到新目录，再用 `AQA_WAV_EXPORT_DIR` 指定，不能把缺失行静默换成其他样本。
+
+调用链：`run_huanyu_aqa_wav100.sh → prepare_aqa_wav_parquet.py → run_huanyu_aqa_audio_train.sh → 原有训练链`。新Parquet位于本次 `HUANYU_RUN_DIR/wav100/train.parquet`，只替换 `audios` 中的路径，保持prompt、答案、其他字段和Arrow schema。旁边的 `train.selection.json` 记录原始行号、WAV路径和文件SHA256。准备脚本严格核对原始音频引用、顺序、prompt/答案和WAV格式，不重新解码ZIP或编码WAV；两个节点都必须能访问输出Parquet及这些绝对WAV路径。
+
+该入口默认使用2748模型、Actor16+GenRM16、TP4、冻结encoder/projector、关闭embedding cache、full精度配置、静态micro-batch=1及逐micro-batch梯度同步。输入上限3072、回复上限2048；采样temperature=0、top_p=1、top_k=-1、repetition_penalty=1，ignore_eos=false。它先对这100条做训练前验证，再以batch=4、每题4个rollout训练一轮（25步）；可用 `TOTAL_TRAINING_STEPS=2` 短跑。训练和验证使用同一100条，是输入链路诊断，不是独立验证集效果评估；贪心的组内回答/奖励可能相同，使GRPO优势为零。
+
+先看未更新权重时的 `validation_dump`，再看 `rollout_dump`。此对照保留原训练prompt，仅改变音频读取入口；不能把它当作与纯音频HTTP请求的所有条件已完全一致。旧导出器使用PCM16编码，复用同一WAV有利于服务/训练对照，但不是对源Zarr浮点数组的无损证明。
 
 ### 导出AQA验证集，逐条对应prompt、答案和WAV
 
@@ -519,3 +537,94 @@ grep -E '\[huanyu-(job|aqa|precision|cache|audio-train|memory|sampling)' "$LOG"
 | EOS/最小生成参数透传 | `[huanyu-sampling] ignore_eos=True min_tokens=...` |
 
 只有 `Engine core initialization failed` 时，向前找 `WorkerProc failed to start` 对应子进程的首个异常；父进程汇总错误和清理时的SIGKILL不能单独确定OOM。本文核对的是脚本配置与调用链，实际NPU结果以本次服务器日志为准。
+
+## 8. serve 与训练 rollout 的音频 embedding 对照
+
+`huanyu_audio_probe.py` 是默认关闭的采集工具，**采集两个真实推理引擎，不是拿 Actor 的 teacher-forcing 前向代替 rollout**。它不改变计算公式或返回值，也不为 serve 安装训练精度补丁。每个进程分别保存 JSON 元数据及 NPZ 张量：
+
+- 原生 `get_audio_hidden_states` 的 fbank 特征、真实帧长及最终有效 audio embeddings；
+- `thinker.apm`（encoder）的输入/输出；`audio_projection_layer` 的输入/输出，包含 fold 后真正送入 projector 的输入；
+- 实际执行时 encoder/projector 的全部参数与 buffers 的 shape、dtype、字节哈希和统一 FP32 值哈希；
+- 第一次 Huanyu IPC 同步前、成功同步后的权重指纹及同步计数。
+
+它尚未抓取音频 embedding 插入语言模型后的完整序列/位置，也不在此处记录原始 WAV。先用 WAV 文件及样本清单确定同一输入，再用有效特征的 `feature_id` 配对；这个 ID 不能当作 WAV 哈希。采集会复制张量到 CPU 并同步设备，适合短诊断运行，不适合测吞吐；同名路径下的源代码也记录 SHA256。
+
+**serve 侧**：将本目录放入 `PYTHONPATH`，在原来成功运行的 deploy YAML 副本中，将 stage 0 的 `engine_extras.worker_extension_cls` 设为 `huanyu_audio_probe.ProbeWorkerExtension`。下列命令生成新副本，保留原始 TP、采样、缓存与图配置，不覆盖已有文件或其他 worker extension：
+
+```bash
+export PROBE_ROOT=/opt/huawei/dataset/infra_data/data/huanyu_audio_probe
+export PYTHONPATH="$PROJECT_ROOT/examples/qwen3_6_huanyu:${PYTHONPATH:-}"
+mkdir -p "$PROBE_ROOT"
+python3 - <<'PY'
+import os
+from pathlib import Path
+import yaml
+src = Path('/vllm-workspace/vllm-omni/vllm_omni/deploy/minicpmo_5_0_huanyu_thinker_only.yaml')
+dst = Path(os.environ['PROBE_ROOT']) / 'serve_probe.yaml'
+cfg = yaml.safe_load(src.read_text())
+extension = 'huanyu_audio_probe.ProbeWorkerExtension'
+patched = 0
+for scope in (cfg, cfg.get('platforms', {}).get('npu', {})):
+    for stage in scope.get('stages', []):
+        if stage.get('stage_id') != 0:
+            continue
+        extras = stage.setdefault('engine_extras', {})
+        if extras.get('worker_extension_cls') not in (None, extension):
+            raise RuntimeError('Existing worker extension must be reviewed before adding the probe')
+        extras['worker_extension_cls'] = extension
+        patched += 1
+if not patched:
+    raise RuntimeError('No stage 0 in this deploy schema')
+with dst.open('x') as f:
+    yaml.safe_dump(cfg, f, sort_keys=False)
+print(dst)
+PY
+```
+
+在**原 serve 命令**前加环境变量，并将 `--deploy-config` 改为新副本；其余配置先保持原状。使用一个尚不存在的 ARM 文件，避免初始化假音频耗尽采集次数：
+
+```bash
+export HUANYU_AUDIO_PROBE_DIR="$PROBE_ROOT/serve"
+export HUANYU_AUDIO_PROBE_MAX_CALLS=2
+export HUANYU_AUDIO_PROBE_ARM_FILE="$PROBE_ROOT/serve_ready_$(date +%s).flag"
+echo "$HUANYU_AUDIO_PROBE_ARM_FILE"
+# 运行原 serve 命令，--deploy-config 改为 "$PROBE_ROOT/serve_probe.yaml"
+# 等服务就绪后，在另一终端 touch 上面打印的 ARM 文件，再发送选定 WAV 请求。
+```
+
+worker 中必须出现 `[huanyu-audio-probe] phase=installed`，真实请求后必须出现 `phase=executed ... file=...`。只有 `model_hook_installed` 不代表采集成功。不要为采集而给 standalone serve 添加训练的 `engine_hooks`，否则会改变待比较的基线。
+
+**训练侧**：更新 Huanyu 包后，沿用当前 WAV 训练命令，追加下面的 Hydra 配置，将变量明确传入 Ray。不需要更换训练的 worker extension；采集安装在现有音频隔离 wrapper 外层。初次检查不要设置 `HUANYU_AUDIO_PROBE_FEATURE_ID`，以免把前端特征发生变化的样本过滤掉。
+
+```bash
+bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/run_huanyu_aqa_audio_train.sh" \
+  '++ray_kwargs.ray_init.runtime_env.env_vars.HUANYU_AUDIO_PROBE_DIR="/opt/huawei/dataset/infra_data/data/huanyu_audio_probe/rollout"' \
+  '++ray_kwargs.ray_init.runtime_env.env_vars.HUANYU_AUDIO_PROBE_MAX_CALLS="4"' \
+  '++ray_kwargs.ray_init.runtime_env.env_vars.HUANYU_AUDIO_PROBE_ARM_FILE=""' \
+  '++ray_kwargs.ray_init.runtime_env.env_vars.HUANYU_AUDIO_PROBE_FEATURE_ID=""'
+```
+
+上面只是追加参数的示例：模型、WAV Parquet、冻结及采样参数继续使用本次对照命令的设置。目录需在两个节点可写；未共享挂载时分别收集文件。每个模型实例最多捕获指定次数，可能包含 warmup；根据元数据的长度、特征、同步计数选择真实样本，不能默认两个 `forward_0001` 是同一 WAV。可设置 ARM 文件在就绪后才采集；已有特征完全相同的证据后，才可使用 `HUANYU_AUDIO_PROBE_FEATURE_ID` 精确筛选。首次 IPC 权重快照不受 ARM/特征筛选影响。
+
+**比较**：从两端日志取得对应 JSON 的完整路径：
+
+```bash
+python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/compare_huanyu_audio_probe.py" \
+  /实际serve采集目录/forward_0001.json \
+  /实际rollout采集目录/forward_0002.json \
+  --out "$PROBE_ROOT/comparison.json"
+```
+
+同一命令也能比较 `before_first_reload.json` 和 `after_first_reload.json`。多音频批次按有效特征 ID 唯一匹配；重复音频或特征本身不一致时，用 `--left-group 0 --right-group 0` 显式选择已知的同一 WAV，报告仍会标明输入特征不一致。`huanyu_probe_alignment.py` 按已核实的原生接口验证每次调用的帧长、batch、下采样和 fold 维度，将批处理与逐 chunk 处理还原为可比较的有效区；未知布局会报告不能对齐，不按下标强行配对。保留原始补齐张量，便于继续分析边界效应。
+
+| 最先出现差异的位置 | 接下来检查 |
+|---|---|
+| 有效 fbank 特征或长度 | 波形解码、重采样、归一化、分块及 frontend 参数 |
+| 首次同步前后权重值哈希 | Actor 加载时 dtype 转换、同步导出、native weight loader |
+| 相同特征下 encoder 输出 | encoder 权重/buffers、eval 状态、精度、补齐和 batch 形状 |
+| encoder 输出相同，projector 输入不同 | 帧折叠、尾帧丢弃、下采样率 |
+| projector 输入相同，输出不同 | projector 权重与运算精度 |
+| projector 输出相同，最终 audio embeddings 不同 | 有效长度裁剪、chunk 拼接顺序 |
+| 最终 audio embeddings 相同 | prompt/template、音频 span 与位置、LLM 权重、GDN/cache/TP |
+
+比较器输出逐元素最大/平均误差、RMSE、相对 L2、cosine 和误差最大的 token 行；不把单一相关系数接近 1 当作正确。字节哈希不同但 FP32 值哈希相同，可能仅是 dtype 不同。CPU 测试验证采集/配对/同步时序，真实 NPU 数值差异必须由上述运行证据确认。
