@@ -10,6 +10,7 @@ import os
 
 
 ENV = "HUANYU_CHECKPOINT_VALIDATION_MODE"
+FULL_AUDIT_ENV = "HUANYU_FULL_WEIGHT_AUDIT_DIR"
 _MARKER = "_huanyu_checkpoint_validation"
 
 
@@ -21,6 +22,8 @@ def mode():
     value = os.environ.get(ENV, "").strip().lower()
     if value not in ("", "disk", "sync"):
         raise ValueError("%s must be disk, sync, or unset" % ENV)
+    if os.environ.get(FULL_AUDIT_ENV, "").strip() and value != "sync":
+        raise ValueError("%s requires %s=sync (audit-only, no generation)" % (FULL_AUDIT_ENV, ENV))
     return value
 
 
@@ -45,7 +48,7 @@ def validate_config(trainer):
         errors.append("LoRA is unsupported in the checkpoint validation experiment")
     if _get(trainer, "global_steps", 0) != 0:
         errors.append("global_steps must be 0")
-    if not os.environ.get("HUANYU_AUDIO_PROBE_DIR"):
+    if not os.environ.get("HUANYU_AUDIO_PROBE_DIR") and not os.environ.get(FULL_AUDIT_ENV, "").strip():
         errors.append("HUANYU_AUDIO_PROBE_DIR is required to verify the actual rollout weights")
     if getattr(trainer.reward_loop_manager, "reward_loop_worker_handles", None) is None:
         errors.append("a separate reward loop is required; colocated reward evaluation may reload policy weights")
@@ -74,6 +77,8 @@ def _bind(trainer_class):
     def on_init_end(trainer):
         selected = mode()
         model = trainer.config.actor_rollout_ref.model
+        if os.environ.get(FULL_AUDIT_ENV, "").strip() and _get(model, "architecture") != "Qwen36HuanyuForTraining":
+            raise ValueError("Full weight audit requires the Huanyu training adapter")
         if not selected or _get(model, "architecture") != "Qwen36HuanyuForTraining":
             return original(trainer)
         validate_config(trainer)
@@ -81,6 +86,17 @@ def _bind(trainer_class):
             result = original(trainer)
         else:
             result = None
+        if os.environ.get(FULL_AUDIT_ENV, "").strip():
+            # Each worker has completed both its first sync and its independent
+            # checkpoint replay. Those replay weights MUST NOT produce a result
+            # labelled as sync validation. Stop here, after all update RPCs.
+            setattr(trainer, _MARKER, "full_weight_audit")
+            raise RuntimeError(
+                "[huanyu-full-weight-audit] AUDIT_ONLY_STOP: first-sync audit RPCs returned; "
+                "aggregate reports to determine PASS/FAIL/INCOMPLETE. Disk reference replay "
+                "replaced rollout weights; validation and training are intentionally forbidden. "
+                "audit_dir=" + os.environ[FULL_AUDIT_ENV]
+            )
         _set_rollout_version(trainer)
         setattr(trainer, _MARKER, selected)
 

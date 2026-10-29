@@ -108,6 +108,75 @@ class TextCaptureTests(unittest.TestCase):
         self.assertEqual((self.root / "case/rollout/row_000123.txt").read_text(encoding="utf-8"), record["reply"])
         self.assertTrue(all(not args[2] for args in loop.tokenizer.calls))
 
+    def test_embedding_request_tag_reaches_real_manager_without_changing_prompt(self):
+        observed = []
+        class Manager:
+            async def generate(self, request_id, prompt_ids, sampling_params):
+                observed.append((request_id, prompt_ids, sampling_params))
+                return "unchanged"
+        async def native_run(loop, sampling_params, **kwargs):
+            answer = await loop.server_manager.generate("random-native-id", [1, 2, 3], sampling_params)
+            self.assertEqual(answer, "unchanged")
+            return loop.result
+        self.Loop.run = native_run
+        loop = self.install()
+        loop.server_manager = Manager()
+        with patch.dict(os.environ, {"HUANYU_EMBEDDING_AB_DIR": str(self.root / "case"),
+                                     "HUANYU_EMBEDDING_AB_SIDE": "rollout"}):
+            result = asyncio.run(loop.run(self.sampling, **self.kwargs))
+        self.assertIs(result, loop.result)
+        self.assertEqual(observed[0][0], "huanyuab.case-test-42.row_000123")
+        self.assertEqual(observed[0][1], [1, 2, 3])
+        self.assertIs(observed[0][2], self.sampling)
+        self.assertEqual(self.read_record()["embedding_request_id"], observed[0][0])
+        self.assertIsNone(capture._EMBEDDING_REQUEST.get())
+        asyncio.run(loop.server_manager.generate("ordinary-id", [9], {}))
+        self.assertEqual(observed[-1][0], "ordinary-id")
+
+    def test_embedding_identity_is_coroutine_local_with_shared_manager(self):
+        observed = []
+        class Manager:
+            async def generate(self, request_id, prompt_ids):
+                await asyncio.sleep(0)
+                observed.append((request_id, prompt_ids))
+        manager = Manager()
+        capture._tag_embedding_requests(manager)
+        async def one(sample):
+            state = {"manager": manager, "calls": [], "request_id": sample}
+            token = capture._EMBEDDING_REQUEST.set(state)
+            try:
+                await manager.generate("random", [sample])
+            finally:
+                capture._EMBEDDING_REQUEST.reset(token)
+            self.assertEqual(state["calls"], ["random"])
+        async def both():
+            await asyncio.gather(one("sample-A"), one("sample-B"))
+        asyncio.run(both())
+        self.assertEqual(sorted(observed), [("sample-A", ["sample-A"]), ("sample-B", ["sample-B"])])
+
+    def test_embedding_request_missing_or_multiple_never_records_success(self):
+        loop = self.install()
+        class Manager:
+            async def generate(self, request_id):
+                return request_id
+        loop.server_manager = Manager()
+        with patch.dict(os.environ, {"HUANYU_EMBEDDING_AB_DIR": str(self.root / "case"),
+                                     "HUANYU_EMBEDDING_AB_SIDE": "rollout"}):
+            with self.assertRaisesRegex(RuntimeError, "exactly one"):
+                asyncio.run(loop.run(self.sampling, **self.kwargs))
+        self.assertEqual(self.read_record()["status"], "failed")
+        self.assertIsNone(capture._EMBEDDING_REQUEST.get())
+        state = {"manager": loop.server_manager, "calls": [], "request_id": "sample"}
+        async def duplicate():
+            token = capture._EMBEDDING_REQUEST.set(state)
+            try:
+                await loop.server_manager.generate("first")
+                await loop.server_manager.generate("second")
+            finally:
+                capture._EMBEDDING_REQUEST.reset(token)
+        with self.assertRaisesRegex(RuntimeError, "exactly one"):
+            asyncio.run(duplicate())
+
     def test_install_disabled_has_no_import_and_repeated_install_is_idempotent(self):
         with patch.dict(os.environ, {"HUANYU_TEXT_AB_DIR": ""}):
             self.assertFalse(capture.install_text_ab_capture())

@@ -7,12 +7,38 @@ run sequentially when they use the same devices. No optimizer steps are taken.
 
 import argparse
 import hashlib
+import importlib
 import json
 import os
 from pathlib import Path
 import shlex
 import subprocess
 import sys
+import uuid
+
+
+def serve_cli(argv):
+    """Register the custom pipeline in the API process before native CLI dispatch.
+
+    Worker external-module hooks may run after StageConfigFactory has already
+    read the deploy file. Registration in a separate Python process would also
+    be lost; invoke the native CLI in this same interpreter instead of exec().
+    """
+    if not argv or argv[0] != "serve":
+        raise ValueError("internal serve entry requires the native serve arguments")
+    registration = importlib.import_module("verl_omni_ext.models.qwen3_6_whisper.vllm_omni")
+    registry = importlib.import_module("vllm_omni.config.pipeline_registry")
+    pipeline = registration.QWEN36_WHISPER_THINKER_ONLY_PIPELINE
+    # Explicit/idempotent even if the registration module was imported earlier.
+    registry.register_pipeline(pipeline)
+    print("[huanyu-text-ab] API pipeline registered: {}".format(pipeline.model_type), flush=True)
+    native_cli = importlib.import_module("vllm.entrypoints.cli.main")
+    previous_argv = sys.argv
+    try:
+        sys.argv = ["vllm", *argv]
+        return native_cli.main()
+    finally:
+        sys.argv = previous_argv
 
 
 def load_case(directory):
@@ -35,9 +61,11 @@ def file_hash(path):
     return digest.hexdigest()
 
 
-def build_launch(root, case, project, mode, port=28889, served_model="qwen3.8"):
+def build_launch(root, case, project, mode, port=28889, served_model="qwen3.8", full_weight_audit_dir=None):
     """Return an argv/environment/deploy plan; never execute or import vLLM here."""
     sampling, engine = case["sampling"], case["engine"]
+    if full_weight_audit_dir is not None and mode != "rollout":
+        raise ValueError("--full-weight-audit-dir is only supported for rollout (audit-only)")
     for key, expected in {"temperature": 0, "top_p": 1, "top_k": -1, "n": 1,
                           "repetition_penalty": 1, "frequency_penalty": 0,
                           "presence_penalty": 0, "min_tokens": 0, "ignore_eos": False}.items():
@@ -67,9 +95,19 @@ def build_launch(root, case, project, mode, port=28889, served_model="qwen3.8"):
     # compares only text and retains the normal initial Actor synchronization.
     disabled = (
         "HUANYU_CHECKPOINT_VALIDATION_MODE", "HUANYU_WEIGHT_SYNC_AUDIT_DIR",
+        "HUANYU_FULL_WEIGHT_AUDIT_DIR", "HUANYU_FULL_WEIGHT_AUDIT_RUN_ID",
         "HUANYU_AUDIO_PROBE_DIR", "HUANYU_AUDIO_PROBE_ARM_FILE", "HUANYU_AUDIO_PROBE_FEATURE_ID",
+        "HUANYU_EMBEDDING_AB_DIR", "HUANYU_EMBEDDING_AB_SIDE",
     )
     env.update({key: "" for key in disabled})
+    embedding_check = case.get("embedding_check", {}).get("enabled", False)
+    if not isinstance(embedding_check, bool):
+        raise ValueError("embedding_check.enabled must be a boolean")
+    embedding_env = {
+        "HUANYU_EMBEDDING_AB_DIR": str(root) if embedding_check and full_weight_audit_dir is None else "",
+        "HUANYU_EMBEDDING_AB_SIDE": mode if embedding_check and full_weight_audit_dir is None else "",
+    }
+    env.update(embedding_env)
     env.update({
         "PROJECT_ROOT": str(project), "MODEL_PATH": checkpoint,
         "HUANYU_PRECISION_PROFILE": "full", "HUANYU_GRAPH_MODE": "0",
@@ -148,7 +186,10 @@ def build_launch(root, case, project, mode, port=28889, served_model="qwen3.8"):
                  'source "$PROJECT_ROOT/examples/qwen3_6_huanyu/precision_mode.sh"\n'
                  'exec > >(tee -a "$HUANYU_TEXT_AB_SERVE_LOG") 2>&1\n'
                  'exec "$@"\n')
-        argv = ["bash", "-c", shell, "huanyu-text-ab-serve", *command]
+        # Re-enter this script only after the shell has installed the native
+        # PYTHONPATH and precision policy. Do not lose registry state to exec.
+        argv = ["bash", "-c", shell, "huanyu-text-ab-serve",
+                sys.executable, str(Path(__file__).resolve()), "_serve_cli", *command[1:]]
     else:
         subset = str(case["subset_parquet"])
         env.update({
@@ -196,18 +237,40 @@ def build_launch(root, case, project, mode, port=28889, served_model="qwen3.8"):
                    "trainer.rollout_data_dir=" + hydra_string(root / "rollout_dump"),
                    "++ray_kwargs.ray_init.runtime_env.env_vars.HUANYU_TEXT_AB_DIR=" + hydra_string(root)]
         command.extend("++ray_kwargs.ray_init.runtime_env.env_vars.{}=\"\"".format(key) for key in disabled)
+        for key, value in embedding_env.items():
+            prefix = "++ray_kwargs.ray_init.runtime_env.env_vars." + key + "="
+            command = [arg for arg in command if not arg.startswith(prefix)]
+            command.append(prefix + hydra_string(value))
+        if full_weight_audit_dir is not None:
+            audit_env = {
+                "HUANYU_CHECKPOINT_VALIDATION_MODE": "sync",
+                "HUANYU_FULL_WEIGHT_AUDIT_DIR": str(Path(full_weight_audit_dir).expanduser().resolve()),
+                "HUANYU_FULL_WEIGHT_AUDIT_RUN_ID": uuid.uuid4().hex,
+                "HUANYU_TEXT_AB_DIR": "",
+            }
+            env.update(audit_env)
+            # Replace prior overrides so Hydra sees one value per key. No text
+            # capture is allowed after the diagnostic reloads disk weights.
+            prefixes = tuple("++ray_kwargs.ray_init.runtime_env.env_vars." + key + "=" for key in audit_env)
+            command = [arg for arg in command if not arg.startswith(prefixes)]
+            command.extend("++ray_kwargs.ray_init.runtime_env.env_vars." + key + "=" + hydra_string(value)
+                           for key, value in audit_env.items())
         argv = command
     return {"mode": mode, "case_id": case["case_id"], "command": command,
             "argv": argv, "env": env, "deploy": deploy}
 
 
 def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "_serve_cli":
+        return serve_cli(argv[1:])
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=("serve", "rollout"))
     parser.add_argument("--case-dir", required=True)
     parser.add_argument("--project-root", default=os.environ.get("PROJECT_ROOT"))
     parser.add_argument("--port", type=int, default=28889)
     parser.add_argument("--served-model", default="qwen3.8")
+    parser.add_argument("--full-weight-audit-dir", help="New directory for audit-only first-sync/disk comparison; stops before validation")
     parser.add_argument("--dry-run", action="store_true", help="Print the requested launch plan without starting processes")
     args = parser.parse_args(argv)
     try:
@@ -215,7 +278,7 @@ def main(argv=None):
             raise ValueError("set PROJECT_ROOT or --project-root")
         root, case = load_case(args.case_dir)
         project = Path(args.project_root).expanduser().resolve(strict=True)
-        plan = build_launch(root, case, project, args.mode, args.port, args.served_model)
+        plan = build_launch(root, case, project, args.mode, args.port, args.served_model, args.full_weight_audit_dir)
         print("[huanyu-text-ab] " + " ".join(shlex.quote(arg) for arg in plan["command"]), flush=True)
         if args.dry_run:
             return 0
@@ -230,6 +293,12 @@ def main(argv=None):
             if (file_hash(path) if path.is_file() else None) != expected:
                 raise ValueError("checkpoint configuration changed: " + name)
         target = root / (args.mode + ".launch.json")
+        if args.full_weight_audit_dir:
+            audit_dir = Path(plan["env"]["HUANYU_FULL_WEIGHT_AUDIT_DIR"])
+            audit_dir.mkdir(parents=True, exist_ok=False)
+            target = audit_dir / "full_weights.launch.json"
+            print("[huanyu-full-weight-audit] audit-only: expected_workers=16 tp_size=4; "
+                  "no validation outputs; reports=" + str(audit_dir), flush=True)
         # Deliberately do not persist the ambient environment (it may contain credentials).
         snapshot = {key: value for key, value in plan.items() if key != "env"}
         snapshot["selected_environment"] = {
@@ -237,6 +306,8 @@ def main(argv=None):
                 "HUANYU_PRECISION_PROFILE", "HUANYU_GRAPH_MODE", "HCCL_OP_EXPANSION_MODE",
                 "VLLM_ASCEND_WEIGHT_NZ_MODE", "USE_OPTIMIZED_MODEL",
                 "HUANYU_TRAIN_AUDIO_ENCODER", "HUANYU_TRAIN_AUDIO_PROJECTOR",
+                "HUANYU_FULL_WEIGHT_AUDIT_DIR", "HUANYU_FULL_WEIGHT_AUDIT_RUN_ID",
+                "HUANYU_EMBEDDING_AB_DIR", "HUANYU_EMBEDDING_AB_SIDE",
             )
         }
         with target.open("x", encoding="utf-8") as stream:

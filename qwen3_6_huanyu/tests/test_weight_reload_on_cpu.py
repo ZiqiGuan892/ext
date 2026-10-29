@@ -151,7 +151,7 @@ def fake_worker_api(extension):
 
 class WeightReloadTests(unittest.TestCase):
     def setUp(self):
-        self.env = patch.dict("os.environ", {reload._ENV_FLAG: "1"})
+        self.env = patch.dict("os.environ", {reload._ENV_FLAG: "1", "HUANYU_FULL_WEIGHT_AUDIT_DIR": ""})
         self.env.start()
         self.addCleanup(self.env.stop)
         reload._REPORTED_FALLBACKS.clear()
@@ -204,6 +204,68 @@ class WeightReloadTests(unittest.TestCase):
         self.assertEqual(pending, [])
         self.assertEqual(model.thinker.apm.weight.value, 1)
         self.assertEqual(model.text.value, 8)
+
+    def test_full_model_audit_runs_at_real_boundaries_and_cannot_run_twice(self):
+        model = Model()
+        module = ModuleType(PACKAGE + ".full_weight_audit")
+        events = []
+
+        def snapshot(current, model_config, worker):
+            events.append(("initial_disk", current.text.value))
+            return {"llm.weight": current.text.value}
+
+        def audit(current, model_config, worker, initialize, finalize, *, initial):
+            events.append(("after_sync", current.text.value, initial))
+            current._huanyu_full_weight_audit_complete = True
+            current.text.value = 3  # diagnostic disk replay; must not masquerade as a normal sync
+
+        module.snapshot_initial_disk = snapshot
+        module.audit_first_sync = audit
+        receiver = SimpleNamespace(receive_weights=lambda on_bucket_received: on_bucket_received([("llm.weight", Tensor(8))]))
+        with patch.dict("sys.modules", {module.__name__: module}), patch.dict("os.environ", {
+            "HUANYU_FULL_WEIGHT_AUDIT_DIR": "/audit", "HUANYU_CHECKPOINT_VALIDATION_MODE": "sync",
+        }), fake_reload_api(model), redirect_stdout(io.StringIO()) as output:
+            reload.receive_layerwise_weights(model, config(), receiver)
+            with self.assertRaisesRegex(RuntimeError, "subsequent"):
+                reload.receive_layerwise_weights(model, config(), receiver)
+        self.assertEqual(events, [("initial_disk", 3), ("after_sync", 8, {"llm.weight": 3})])
+        self.assertNotIn("weight update completed", output.getvalue())
+        with self.assertRaisesRegex(RuntimeError, "generation is forbidden"):
+            model.forward()
+        # Clearing the opt-in flag cannot turn disk reference weights back into
+        # the synchronized policy, including after an audit exception.
+        with self.assertRaisesRegex(RuntimeError, "subsequent"):
+            reload.receive_layerwise_weights(model, config(), receiver)
+
+    def test_full_audit_cannot_delegate_to_disabled_reload(self):
+        extension = extension_class()
+        reload.bind_huanyu_weight_reload(extension)
+        worker = extension()
+        with patch.dict("os.environ", {"HUANYU_FULL_WEIGHT_AUDIT_DIR": "/audit", reload._ENV_FLAG: "0"}):
+            with self.assertRaisesRegex(RuntimeError, "requires Huanyu layerwise"):
+                worker.update_weights_from_ipc()
+        self.assertEqual(worker.delegated, [])
+
+    def test_failed_reference_replay_also_blocks_generation_and_retries(self):
+        model = Model()
+        module = ModuleType(PACKAGE + ".full_weight_audit")
+        module.snapshot_initial_disk = lambda *args: {"baseline": True}
+
+        def fail(*args, **kwargs):
+            raise RuntimeError("reference loader failed")
+
+        module.audit_first_sync = fail
+        receiver = SimpleNamespace(receive_weights=lambda on_bucket_received: on_bucket_received([("llm.weight", Tensor(8))]))
+        with patch.object(package, "full_weight_audit", module, create=True), patch.dict("os.environ", {
+            "HUANYU_FULL_WEIGHT_AUDIT_DIR": "/audit", "HUANYU_CHECKPOINT_VALIDATION_MODE": "sync",
+        }), fake_reload_api(model):
+            with self.assertRaisesRegex(RuntimeError, "reference loader failed"):
+                reload.receive_layerwise_weights(model, config(), receiver)
+        self.assertFalse(getattr(model, "_huanyu_full_weight_audit_complete", False))
+        with self.assertRaisesRegex(RuntimeError, "generation is forbidden"):
+            model.forward()
+        with self.assertRaisesRegex(RuntimeError, "subsequent"):
+            reload.receive_layerwise_weights(model, config(), receiver)
 
     def test_audio_parameters_are_resolved_after_layer_materializes(self):
         model = Model()

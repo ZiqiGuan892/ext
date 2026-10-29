@@ -7,9 +7,11 @@ dumps, not a claim that the serving HTTP response used identical token IDs.
 """
 
 from collections.abc import Mapping
+from contextvars import ContextVar
 from functools import wraps
 import hashlib
 import importlib
+import inspect
 import json
 from numbers import Integral
 import os
@@ -20,6 +22,39 @@ import time
 
 
 _HOOK = "_huanyu_text_ab_capture"
+_EMBEDDING_REQUEST = ContextVar("huanyu_embedding_sample_request", default=None)
+
+
+def _tag_embedding_requests(manager):
+    """Bind sample identity to the real RPC, without changing prompt/sampling.
+
+    The manager is shared by concurrent AgentLoops. A ContextVar, not a mutable
+    manager attribute, keeps asynchronous sample identities isolated.
+    """
+    cls = type(manager)
+    original = cls.generate
+    if getattr(original, "_huanyu_embedding_request_tag", False):
+        return
+    signature = inspect.signature(original)
+    if "request_id" not in signature.parameters or not inspect.iscoroutinefunction(original):
+        raise RuntimeError("Embedding A/B requires an async server manager.generate(request_id=...)")
+
+    @wraps(original)
+    async def generate(self, *args, **kwargs):
+        state = _EMBEDDING_REQUEST.get()
+        if state is None:
+            return await original(self, *args, **kwargs)
+        if self is not state["manager"] or state["calls"]:
+            raise RuntimeError("Embedding A/B requires exactly one engine request per sample")
+        bound = signature.bind(self, *args, **kwargs)
+        if "request_id" not in bound.arguments:
+            raise RuntimeError("Embedding A/B missing engine request ID")
+        state["calls"].append(str(bound.arguments["request_id"]))
+        bound.arguments["request_id"] = state["request_id"]
+        return await original(*bound.args, **bound.kwargs)
+
+    generate._huanyu_embedding_request_tag = True
+    cls.generate = generate
 
 
 def _field(value, key, default=None):
@@ -179,8 +214,26 @@ def install_text_ab_capture():
         with output.open("x", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False, indent=2, allow_nan=False) + "\n")
         started = time.monotonic()
+        embedding_token = None
+        embedding_state = None
         try:
+            embedding_root = os.environ.get("HUANYU_EMBEDDING_AB_DIR", "").strip()
+            if embedding_root:
+                if (Path(embedding_root).expanduser().resolve() != root
+                        or os.environ.get("HUANYU_EMBEDDING_AB_SIDE") != "rollout"
+                        or not re.fullmatch(r"[A-Za-z0-9_-]+", metadata["case_id"])):
+                    raise ValueError("Embedding capture case/side identity does not match text A/B")
+                _tag_embedding_requests(self.server_manager)
+                embedding_state = {
+                    "manager": self.server_manager, "calls": [],
+                    "request_id": "huanyuab.{}.{}".format(metadata["case_id"], metadata["sample_id"]),
+                }
+                embedding_token = _EMBEDDING_REQUEST.set(embedding_state)
             result = await original(self, sampling_params, *args, **kwargs)
+            if embedding_state is not None:
+                if len(embedding_state["calls"]) != 1:
+                    raise RuntimeError("Embedding A/B did not observe exactly one engine request")
+                record["embedding_request_id"] = embedding_state["request_id"]
             prompt_ids, response_ids = _ids(result.prompt_ids), _ids(result.response_ids)
             decode = self.tokenizer.decode
             record.update(
@@ -207,6 +260,9 @@ def install_text_ab_capture():
                           elapsed_seconds=time.monotonic() - started)
             _write_json(output, record)
             raise
+        finally:
+            if embedding_token is not None:
+                _EMBEDDING_REQUEST.reset(embedding_token)
 
     setattr(run, _HOOK, True)
     cls.run = run

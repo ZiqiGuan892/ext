@@ -6,6 +6,7 @@ loaded here. Both engines consume a single immutable case manifest and WAVs.
 """
 
 import argparse
+import base64
 import copy
 import csv
 import hashlib
@@ -111,6 +112,9 @@ def prepare_case(args):
             "wav_paths": [a["wav_path"] for a in selected["audios"]],
             "wav_sha256": [a["sha256"] for a in selected["audios"]],
         }
+        identity["prompt_sha256"] = hashlib.sha256(json.dumps(
+            prompt, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
+        ).encode("utf-8")).hexdigest()
         extra = dict(original.get("extra_info") or {})
         if "huanyu_text_ab" in extra:
             raise ValueError("source already contains reserved huanyu_text_ab metadata")
@@ -153,6 +157,8 @@ def prepare_case(args):
         "sample_size": len(rows), "selection_seed": args.seed, "prompt_mode": args.prompt_mode,
         "manifest_sha256": sha256(manifest), "checkpoint_file_sha256": fingerprints,
         "enable_thinking": args.enable_thinking == "true",
+        "embedding_check": {"enabled": getattr(args, "embedding_check", "false") == "true",
+                            "scope": "llm_inputs_embeds", "strict": True, "expected_tp_size": args.tp},
         "sampling": {"max_tokens": args.max_tokens, "temperature": 0, "top_p": 1, "top_k": -1,
                      "n": 1, "seed": args.seed, "min_tokens": 0, "ignore_eos": False,
                      "repetition_penalty": 1, "frequency_penalty": 0, "presence_penalty": 0},
@@ -201,6 +207,38 @@ def sanitized_request(body):
     return copied
 
 
+def build_case_request(prompt, payloads, model, sampling, enable_thinking):
+    """Encode the frozen case messages, independent of the standalone client's mode.
+
+    prepare already removed user question text in system_audio mode. Preserve
+    those messages here, including system text, and only expand audio markers.
+    Older request_aqa_validation_wav.py versions lack include_prompt and use a
+    different audio format; neither should determine this comparison's inputs.
+    """
+    messages = canonical_prompt(prompt, len(payloads), "original")
+    audio_index = 0
+    for message in messages:
+        pieces = message["content"].split("<audio>")
+        if len(pieces) == 1:
+            continue
+        parts = []
+        for index, text in enumerate(pieces):
+            if text:
+                parts.append({"type": "text", "text": text})
+            if index < len(pieces) - 1:
+                encoded = base64.b64encode(payloads[audio_index]).decode("ascii")
+                parts.append({"type": "audio_url", "audio_url": {
+                    "url": "data:audio/wav;base64," + encoded,
+                }})
+                audio_index += 1
+        message["content"] = parts
+    body = {"model": model, "max_tokens": sampling["max_tokens"], "temperature": sampling["temperature"],
+            "stream": False, "n": 1, "modalities": ["text"], "messages": messages}
+    body.update(sampling)
+    body["chat_template_kwargs"] = {"enable_thinking": enable_thinking}
+    return body
+
+
 def serve_case(args):
     root, case, rows = load_case(args.case_dir)
     parsed = urlsplit(args.url)
@@ -234,11 +272,11 @@ def serve_case(args):
             if (original_prompt != row["original_prompt"] or truth != row["ground_truth"]
                     or paths != row["wav_paths"] or hashes != row["wav_sha256"]):
                 raise ValueError("exported prompt/truth/WAV differs from prepared case")
-            body = client.build_request(row["prompt"], payloads, args.model,
-                                        case["sampling"]["max_tokens"], case["sampling"]["temperature"],
-                                        include_prompt=True)
-            body.update(case["sampling"])
-            body["chat_template_kwargs"] = {"enable_thinking": case["enable_thinking"]}
+            body = build_case_request(row["prompt"], payloads, args.model,
+                                      case["sampling"], case["enable_thinking"])
+            if case.get("embedding_check", {}).get("enabled", False):
+                body["request_id"] = "huanyuab.{}.{}".format(case["case_id"], sample)
+                result["embedding_request_id"] = body["request_id"]
             payload = json.dumps(body, ensure_ascii=False, allow_nan=False).encode("utf-8")
             digest = hashlib.sha256(args.url.encode("utf-8") + b"\n" + payload).hexdigest()
             result.update(request_sha256=digest, request=sanitized_request(body))
@@ -306,8 +344,17 @@ def compare_case(args):
             if path.stem not in expected:
                 raise ValueError("unexpected sample result: {}".format(path))
     outputs = [root / name for name in ("comparison.jsonl", "comparison.csv", "summary.json")]
+    embedding_enabled = case.get("embedding_check", {}).get("enabled", False)
+    embedding_outputs = [root / name for name in ("embedding_comparison.jsonl", "embedding_summary.json")]
+    if embedding_enabled and any(path.exists() for path in embedding_outputs):
+        raise FileExistsError("embedding comparison outputs already exist; preserve previous results")
     if any(path.exists() for path in outputs):
         raise FileExistsError("comparison outputs already exist; preserve them and choose a new case for another run")
+    embedding_report = None
+    embedding_samples = {}
+    if embedding_enabled:
+        embedding_report = sibling("compare_huanyu_prompt_embeddings").compare_case_embeddings(root, case, rows)
+        embedding_samples = {item["sample_id"]: item for item in embedding_report["samples"]}
     comparisons = []
     for row in rows:
         serve, serve_status = _read_result(root, "serve", row)
@@ -327,6 +374,8 @@ def compare_case(args):
             "rollout_token_count": rollout.get("response_token_count") if rollout else None,
             "representation_comparable": comparable,
             "reply_exact_match": (serve["reply"] == rollout["reply"]) if comparable else None,
+            "embedding_status": embedding_samples.get(row["sample_id"], {}).get("status", "NOT_COLLECTED"),
+            "embedding_strict_equal": embedding_samples.get(row["sample_id"], {}).get("strict_equal"),
             "comparison_note": ("HTTP separates reasoning; raw texts retained, no reconstructed equality claim"
                                 if complete and reasoning else "incomplete pair" if not complete
                                 else "exact text equality only; not answer correctness"),
@@ -346,11 +395,19 @@ def compare_case(args):
     summary = {"case_id": case["case_id"], "expected": len(rows), "complete_pairs": completed,
                "incomplete_pairs": len(rows) - completed, "representation_comparable_pairs": comparable_count,
                "identical_text_pairs": identical, "different_text_pairs": comparable_count - identical,
-               "note": "Text equality is not accuracy. No weights/tensors are compared. "
-                       "Same canonical messages do not prove identical server-side tokenization or numerics."}
+               "embedding_check": embedding_report["summary"] if embedding_report else {"status": "NOT_COLLECTED"},
+               "note": "Text equality is not accuracy. Embedding equality is reported separately; "
+                       "same canonical messages alone do not prove identical model inputs or numerics."}
+    if embedding_report is not None:
+        with embedding_outputs[0].open("x", encoding="utf-8") as stream:
+            for item in embedding_report["samples"]:
+                stream.write(json.dumps(item, ensure_ascii=False, allow_nan=False) + "\n")
+        write_json(embedding_outputs[1], embedding_report["summary"])
     write_json(outputs[2], summary)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
-    return 0 if completed == len(rows) else 2
+    if completed != len(rows) or (embedding_report and embedding_report["summary"]["status"] == "INCOMPLETE"):
+        return 2
+    return 1 if embedding_report and embedding_report["summary"]["status"] == "FAIL" else 0
 
 
 def main(argv=None):
@@ -367,6 +424,8 @@ def main(argv=None):
     prepare.add_argument("--enable-thinking", choices=("true", "false"), default="true")
     prepare.add_argument("--tp", type=int, default=4)
     prepare.add_argument("--max-tokens", type=int, default=2048)
+    prepare.add_argument("--embedding-check", choices=("true", "false"), default="true",
+                         help="Collect actual LLM input embeddings on both engines (default: true)")
     prepare.set_defaults(function=prepare_case)
     serve = commands.add_parser("serve", help="Send the shared case to an already-running HTTP service")
     serve.add_argument("--case-dir", required=True)

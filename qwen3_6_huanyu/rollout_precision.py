@@ -170,6 +170,10 @@ def configure_huanyu_rollout(native, vllm_config):
 
         native._huanyu_audio_probe_config = vllm_config
         attach_audio_probe(native)
+    if os.environ.get("HUANYU_EMBEDDING_AB_DIR", "").strip():
+        from .prompt_embedding_probe import attach_model_probe
+
+        attach_model_probe(native, vllm_config)
     native._huanyu_precision_configured = True
     print(f"[huanyu-precision] rollout installed: gdn_fp32={fp32} isolated_vision={vision} "
           f"isolated_audio={audio}; native Huanyu audio retained", flush=True)

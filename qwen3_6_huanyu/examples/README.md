@@ -15,11 +15,12 @@
 | 冻结缓存训练，16K | `run_huanyu_32card_16k_job.sh` | 两节点 | prompt14336 + response2048，SDPA，默认16+16 |
 | 冻结缓存训练，对照 Whisper 启动参数 | `run_huanyu_32card_whisper_aligned_job.sh` | 两节点 | 保留 Huanyu 接口；Actor BF16、rollout TP2、RM TP4，5K |
 | AQA 在线训练，encoder/projector 可分别开关 | `run_huanyu_aqa_unfreeze_32card_job.sh` | 两节点 | 默认二者都训练，关闭缓存，16+16，5K |
+| AQA 默认冻结encoder、训练projector，bs32 | `run_huanyu_aqa_projector_5k_bs32_job.sh` | 两节点 | 音频开关可配置；3072+2048，train/mini batch=32，n=4，Actor16 + RM16，关闭缓存 |
 | AQA 一键启动，自定义长度/同步 | `HUANYU_JOB_MODE=aqa_unfreeze bash run_huanyu_32card_job.sh` | 两节点 | 直接转入共用AQA入口，长度、精度和同步由参数配置 |
 | 已准备环境和 Ray，冻结/缓存训练 | `run_huanyu.sh` | 仅主节点 | 需提前配置冻结与缓存环境；复用通用训练链 |
 | 已准备环境和 Ray，AQA 自定义长度/参数 | `run_huanyu_aqa_audio_train.sh` | 仅主节点 | 在线音频，默认4096+2048，16+16，静态 micro=1 |
 | 从 validation 抽100条，用已有WAV诊断训练 | `run_huanyu_aqa_wav100.sh` | 仅主节点 | 环境/Ray已准备；两音频组件冻结，16+16，先验证100条再训练 |
-| 已准备环境和 Ray，STEM 纯文本 | `run_huanyu_stem.sh` | 仅主节点 | 默认5K、16+16、full、冻结音频、micro1、逐micro同步；支持12K及更长 |
+| 已准备环境和 Ray，STEM 纯文本 | `run_huanyu_stem.sh` | 仅主节点 | 默认5K、16+16、full、冻结音频、dynamic batching、引擎默认梯度同步、跳过训练前验证；支持12K及更长 |
 | 单机16卡 AQA，关闭模型奖励 | `run_huanyu_aqa_audio_train_16card.sh` | 仅主节点 | Actor16、RM0，规则奖励；默认4096+2048 |
 
 当前所有训练链通过 `precision_mode.sh` 默认选择 `full`。名称不带 `precision` 并不表示关闭精度修复。AQA统一用环境变量 `HUANYU_PRECISION_PROFILE=full HUANYU_GRAPH_MODE=0` 明确选择完整修复。
@@ -88,6 +89,10 @@ run_huanyu_aqa_unfreeze_32card_job.sh
   → run_huanyu_32card_job.sh（mode=aqa_unfreeze）
   → run_huanyu_aqa_audio_train.sh
 
+run_huanyu_aqa_projector_5k_bs32_job.sh（默认冻结encoder，训练projector和语言模型；32题×4条回答）
+  → run_huanyu_32card_job.sh（mode=aqa_unfreeze）
+  → run_huanyu_aqa_audio_train.sh
+
 自定义5K/12K/16K、精度和梯度同步参数
   → run_huanyu_32card_job.sh（mode=aqa_unfreeze）
   → run_huanyu_aqa_audio_train.sh
@@ -107,7 +112,9 @@ run_huanyu_aqa_audio_train.sh
        → python3 -m verl_omni.trainer.main_omni
 ```
 
-AQA 入口限定音频数据，在线编码，关闭 embedding cache；两个音频组件都冻结也不会自动切换为缓存读取。它强制静态 batching、micro-batch=1、FSDP2、sequence parallel=1、视觉塔冻结及 Huanyu 适配参数。
+AQA 入口限定音频数据，在线编码，关闭 embedding cache；两个音频组件都冻结也不会自动切换为缓存读取。它默认静态 batching，允许通过命令行开启 Actor、rollout/ref log-prob 的 dynamic batching；静态模式固定 micro-batch=1，并保留 FSDP2、sequence parallel=1、视觉塔冻结及 Huanyu 适配参数。
+
+`run_huanyu_aqa_projector_5k_bs32_job.sh` 从环境读取 `HUANYU_TRAIN_AUDIO_ENCODER` / `HUANYU_TRAIN_AUDIO_PROJECTOR`，未设置时分别默认 `false` / `true`（true为训练，false为冻结），两节点需设置相同值。固定train/mini batch=32、n=4及16+16卡池；默认full精度，prompt3072+response2048，engine预算5248。两节点设置各自 `VC_TASK_INDEX` 和相同 `VC_WORKER_HOSTS` 后执行该脚本。数据可用 `HUANYU_AQA_TRAIN_FILE` / `HUANYU_AQA_VAL_FILE` 覆盖；默认训练前验证，`VAL_BEFORE_TRAIN=false` 可跳过。日志搜索 `[huanyu-aqa-projector-job]` 查看入口配置，搜索 `[huanyu-audio-train]` 查看实际模型的开关，默认 `train_encoder=False train_projector=True`。
 
 ### 3.4 单机16卡规则奖励
 
@@ -269,7 +276,7 @@ bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/run_huanyu_aqa_unfreeze_32card_job.s
 | 冻结16K | 14336 / 2048 | 14368 / 16512 |
 | AQA 16K命令行示例 | 14336 / 2048 | 14336 / 16512 |
 
-AQA共用入口要求 `PPO_MINI_BATCH_SIZE × ROLLOUT_N = Actor总卡数`、`ROLLOUT_N >= 2`、mini-batch能被rollout副本数整除、train batch能被mini-batch整除。16+16默认 `4×4=16`，每个Actor rank每次mini-batch一条序列。冻结通用默认train32/mini32/n4，Whisper对照为32/16/8，不要直接套到AQA。
+AQA共用入口要求 `PPO_MINI_BATCH_SIZE × ROLLOUT_N` 能被Actor总卡数整除、`ROLLOUT_N >= 2`、mini-batch能被rollout副本数整除、train batch能被mini-batch整除。16+16默认 `4×4=16`，每个Actor rank每次mini-batch一条序列。也支持 `TRAIN_BATCH_SIZE=16 PPO_MINI_BATCH_SIZE=16 ROLLOUT_N=4`：每步64条轨迹，每个rank分到4条，实际micro-batch仍由动态token预算或静态micro-batch配置决定；关闭逐micro-batch同步时，梯度累积可能增加峰值显存。冻结通用默认train32/mini32/n4，Whisper对照为32/16/8，仍需分别核对配置。
 
 例如，已准备环境与Ray时，使用 **2K输入 + 10K输出**：
 
@@ -289,7 +296,7 @@ bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/run_huanyu_aqa_audio_train.sh" \
   actor_rollout_ref.rollout.max_num_seqs=32
 ```
 
-共用AQA入口已经关闭Actor、rollout log-prob、ref log-prob的dynamic batching，并固定micro=1。同步开关要求部署模型目录中的 `microbatch_sync.py` 等Python代码；让每次micro-batch反向传播同步梯度，不改变optimizer更新频率。它不保证任意长序列不OOM，也不控制vLLM初始化内存。
+共用AQA入口默认关闭Actor、rollout log-prob、ref log-prob的dynamic batching，静态模式固定micro=1。可通过 `actor_rollout_ref.actor.use_dynamic_bsz=true`、`actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=true`、`actor_rollout_ref.ref.log_prob_use_dynamic_bsz=true` 开启动态分批，此时分批由各自token预算控制。同步开关要求部署模型目录中的 `microbatch_sync.py` 等Python代码；设为 `++actor_rollout_ref.model.override_config.huanyu_sync_each_microbatch=true` 时让每次micro-batch反向传播同步梯度，设为 `false` 时使用引擎默认同步行为，不改变optimizer更新频率。它不保证任意长序列不OOM，也不控制vLLM初始化内存。
 
 替代原16K入口：将上例长度改成 `MAX_PROMPT_LENGTH=14336 MAX_RESPONSE_LENGTH=2048 ROLLOUT_PROMPT_LENGTH=14336 ROLLOUT_MAX_MODEL_LEN=16512 MAX_TOKEN_LEN_PER_GPU=16512 MINICPMO_MM_PROMPT_BUDGET=14336`，response_length参数改为2048，保留SDPA和逐micro同步，并添加 `actor_rollout_ref.actor.fsdp_config.fsdp_size=-1 actor_rollout_ref.ref.fsdp_config.fsdp_size=-1`。需要一键准备和Ray时，在两节点设置同样参数，将执行文件换为 `run_huanyu_32card_job.sh` 并在bash前添加 `HUANYU_JOB_MODE=aqa_unfreeze`。
 
@@ -307,19 +314,21 @@ bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/run_huanyu_aqa_audio_train.sh" \
 
 ### 5.5 STEM纯文本训练
 
-环境和Ray已准备后，仅在主节点执行 `run_huanyu_stem.sh`。默认Actor16 + GenRM16、TP4、full精度、关闭缓存、冻结encoder/projector、micro=1且逐micro同步。数学奖励由GenRM按答案等价性给出二值判断；parquet中的 `style=rule` 不会覆盖这个显式奖励配置。
+环境和Ray已准备后，仅在主节点执行 `run_huanyu_stem.sh`。默认Actor16 + GenRM16、TP4、full精度、关闭缓存、冻结encoder/projector。Actor、rollout log-prob、ref log-prob均开启dynamic batching，按各自token预算分批；`huanyu_sync_each_microbatch=false`，使用引擎默认梯度同步。保留的micro-batch=1仅在关闭dynamic batching后生效。数学奖励由GenRM按答案等价性给出二值判断；parquet中的 `style=rule` 不会覆盖这个显式奖励配置。
+
+STEM入口设置并向Ray传递 `HUANYU_STEM_TEXT_TRAIN=1`，复用 `aqa_position_ids.py` 的等价位置轴传输：TQ中保存一维序列，在模型入口恢复四轴，避免动态分批出现 `split_sizes=[4]`。日志搜索 `[huanyu-stem-positions]` 可确认执行。两节点需同时更新该Python文件和启动脚本；包含图像/视频或有效token的位置轴不一致时会报错，不会丢弃空间位置编码。
 
 ```bash
 # 默认5K：2048输入 + 3072输出；STEM长度变量支持k后缀（1k=1024）。
 bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/run_huanyu_stem.sh"
 # 12K：2048输入 + 10240输出，可设TOTAL_TRAINING_STEPS=3短跑。
-STEM_CONTEXT_LENGTH=12k TOTAL_TRAINING_STEPS=3 VAL_BEFORE_TRAIN=false \
+STEM_CONTEXT_LENGTH=12k TOTAL_TRAINING_STEPS=3 \
 bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/run_huanyu_stem.sh"
 ```
 
 数据目录默认 `/opt/huawei/dataset/infra_data/data/rl_stem_data`，可用 `STEM_DATA_DIR` 改目录，或 `STEM_TRAIN_FILE` / `STEM_VAL_FILE` 改文件。默认读取train.parquet与val.parquet，后者不存在时尝试validation.parquet。启动时为GenRM在本次运行目录写入带 `extra_info.question` 的parquet副本，源数据保持不变；该运行目录必须能被所有节点读取。
 
-更长测试使用 `STEM_CONTEXT_LENGTH=16k STEM_PROMPT_LENGTH=4096` 等组合；默认遇到EOS可以提前结束，`STEM_IGNORE_EOS=true` 可用于长度压力测试。长度不保证显存可容纳，GenRM的 `RM_MAX_MODEL_LEN` 预算独立配置。默认训练前验证、每10步验证，保存rollout和validation dump；可用 `VAL_BEFORE_TRAIN` / `TEST_FREQ` 调整。
+更长测试使用 `STEM_CONTEXT_LENGTH=16k STEM_PROMPT_LENGTH=4096` 等组合；默认遇到EOS可以提前结束，`STEM_IGNORE_EOS=true` 可用于长度压力测试。长度不保证显存可容纳，GenRM的 `RM_MAX_MODEL_LEN` 预算独立配置。默认跳过训练前验证，初始化完成后进入训练；仍每10步验证，保存rollout和validation dump。可用 `VAL_BEFORE_TRAIN` / `TEST_FREQ` 调整，显式设置 `VAL_BEFORE_TRAIN=true` 会恢复初始验证。dynamic batching、逐micro同步和验证配置均可用末尾Hydra参数覆盖。
 
 ## 6. 全部辅助脚本说明
 
@@ -672,7 +681,7 @@ done
 | 两组都异常 | 首次同步不是唯一原因，继续核对与 serve 的输入模板、精度补丁和 TP 等差异 |
 | 两组都正常 | 本实验未复现；两组关闭了 sleep，不能据此排除原同步/sleep 交互问题 |
 
-比较同一 WAV 的实际回答和 embedding，不能只比较平均 GenRM 分数。该实验跳过的是整模型同步，包含 LLM，因此不能单独证明四个 LayerNorm 参数就是全部根因；还要结合音频权重和 embedding 对照。当前仅通过 CPU 控制流程测试，真实 NPU 结论需以上两组服务器结果。
+比较同一 WAV 的实际回答和 embedding，不能只比较平均 GenRM 分数。该实验跳过的是整模型同步，包含 LLM，因此不能单独证明四个 LayerNorm 参数就是全部根因；还要结合音频权重和 embedding 对照。2026-10-28 的服务器对照、边界定位与修复后结果见 8.3。
 
 ### 8.2 定位首次权重同步中最早的数值偏差
 
@@ -729,17 +738,65 @@ python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/compare_huanyu_weight_sync.py" \
 
 同时新增正常同步的完整性保护：拒绝未知/重复/形状错误的音频参数；一旦传入任何音频参数，要求 encoder 和 projector 全套完整，缺失时在 finalize 前报错。整套音频均省略的更新仍保留原权重。finalize 后还检查上述 8 个 LayerNorm 是否精确等于接收值转换到目标 dtype 后的结果；不一致时输出参数名和 `bad_indices`，不会继续使用已确认损坏的权重。此保护不从 disk 覆盖 Actor 权重，也不能发现 sender 本身已经输出了错误值。
 
-**验证边界**：CPU 测试覆盖漏参/重复、真实 Torch meta 参数重建、故意破坏长度 40 参数后的报错、各阶段比较和不完整证据处理；尚不能证明 NPU 根因已修复。数值采集及小向量校验需要设备到 CPU 读取，会改变同步时序，尤其是导出前的分片快照；若开启检查后异常消失，应转查异步竞态，不能据此认定原链路正确。该探针只覆盖音频 VGG LayerNorm，不能替代整模型或 LLM 权重一致性验证。
+**验证边界**：CPU 测试覆盖漏参/重复、真实 Torch meta 参数重建、故意破坏长度 40 参数后的报错、各阶段比较和不完整证据处理；CPU 通过本身不能替代 NPU 复测，后者见 8.3。数值采集及小向量校验需要设备到 CPU 读取，会改变同步时序，尤其是导出前的分片快照；若开启检查后异常消失，应转查异步竞态，不能据此认定原链路正确。该探针只覆盖音频 VGG LayerNorm，不能替代整模型或 LLM 权重一致性验证。
 
-### 8.3 Huanyu FSDP2 尾部分片的 CPU 卸载保护
+### 8.3 近音词问题复盘：FSDP2 异步 CPU 卸载损坏尾部分片
 
-已观测到的 16 路实验中，四个长度 40 的参数只有 rank 13 持有的索引 39 不一致，长度 20 的对照全部正常；`actor_export`、`receiver_input`、`receiver_owned`、`after_finalize` 哈希一致。最早异常在 Actor 本地分片阶段，后续传输没有新增差异。
+**记录日期：2026-10-28。** 同一 checkpoint `2748` 在独立 vLLM serve 中回答基本正常，接入 verl 后第一次 rollout 就出现较多近音词混淆。改用导出的 WAV、调整采样参数后仍能复现；跳过首次 Actor 同步的 `disk` 验证正常，正常同步的 `sync` 验证异常。最终定位到 Actor CPU 卸载时的尾部分片竞态。修复后，服务器首次同步的 8 个被跟踪参数全部 `PASS`，用户确认 sync 模式的近音词错误**明显减少**。
 
-PyTorch 2.10 的 `FSDPModule._apply()` 在参数转换后立即执行 `reset_sharded_param()`。非阻塞 D2H 转换尚未完成时，后者可能在 CPU 上复制尾部分片来补齐。40/16 的尾片只有 1 个有效元素、容量为 3，会经过这个分支；20/16 的非空片均为 2，不需要补齐。这个执行顺序提供了与实验相符的竞态机制，实际 NPU 上的因果确认仍需修复前后复测。
+本次环境为 `torch 2.10.0+cpu`、`torch-npu 2.10.0.post4`、`accelerate 1.15.0`，Actor FSDP 分片数为 16。以下结论来自用户提供的服务器报告、代码检查及 CPU 回归，并非在本地运行了 NPU 训练。
 
-Huanyu adapter 现在自动安装 `fsdp_offload.py`：仅对该模型实例在 FSDP2 下的 `.to(cpu, non_blocking=True)` 强制阻塞，确保 CPU 补齐前数据已经就绪。当前默认的非 LoRA 训练中，初始化装载和后续手工卸载都受保护；不会重新从 disk 覆盖权重，解冻后的梯度更新及正常 Actor→rollout 同步保留。代价是 CPU 卸载不再与后续工作异步重叠。额外的 PEFT 外层包装可能绕过该实例的 `.to()`，不能直接套用此覆盖结论。
+**定位证据**
 
-两节点更新代码、启动新任务后，日志应出现 `[huanyu-fsdp-offload] phase=executed`。用 8.2 的 sync 验证配置写入**新的**审计目录，要求 8 项参数各阶段全部 `PASS`，并与 disk 模式比较同一 WAV 的 embedding 和回答。仅重新比较旧报告不会修复旧进程中的参数。CPU 回归模拟延迟 D2H 与尾片补齐；不等同于 NPU 实测通过。
+| 检查边界 | 修复前的结果 |
+| --- | --- |
+| checkpoint → `actor_loaded` | rank 0 的 8 个真实参数全部一致；其余 15 个 rank 为正常 meta 占位 |
+| `actor_local_shard` | 仅 `model.audio_encoder.conv_layers.0.layers.{1,4}.{weight,bias}` 四个长度 40 参数异常；全部发生在 rank 13、全局索引 39 |
+| 长度 20 的 block 1 对照 | 分片、导出、接收、重载均一致 |
+| `actor_export` → `receiver_input` → `receiver_owned` → `after_finalize` | 各阶段哈希相同，传输和 rollout 重载继续传递了 Actor 已经损坏的值 |
+
+例如 `conv_layers.0.layers.1.bias[39]` 从 checkpoint 的 `1.578125` 变为 `0.00537109375`。这些 checkpoint 参数本来就是 BF16，BF16→FP32→BF16 可以精确往返；这里不是正常舍入误差。早期比较器把初始 meta 占位误判为 `actor_loaded=FAIL`，修正后最早异常边界为 `actor_local_shard`，不能据旧报告认定 checkpoint 加载错误。
+
+**根本原因与首次 rollout 的关系**
+
+本次根因是异步设备到 CPU 搬运（D2H）与 CPU 尾分片补齐之间缺少完成保证。原卸载调用为 `model.to("cpu", non_blocking=True)`，但 PyTorch 的 `FSDPModule._apply()` 会在转换后立即调用 `reset_sharded_param()`。后者遇到不完整分片时，分配补齐后的 CPU 存储并复制旧分片；此时异步 D2H 可能尚未完成，CPU 复制就读到了未就绪的数据。随后即便同步设备，也只能完成原缓冲区的搬运，无法修复已复制到新存储的错误值。
+
+这个机制解释了异常为何集中于一个 rank：长度 40 按 16 路分片，每片容量 `ceil(40/16)=3`，rank 0–12 各有 3 个元素，rank 13 只有最后 1 个元素，rank 14–15 为空。只有 rank 13 有需要补齐的非空尾片。长度 20 的非空分片均为 2 个元素，没有同样的尾片复制。
+
+当前 AQA 脚本默认 `param_offload=true`、`offload_policy=false`。代码链路是：
+
+```text
+Actor 加载 checkpoint → FSDP 分片装载
+→ FSDPEngine.initialize() 中手工卸载到 CPU
+→ 非阻塞 D2H 返回后，FSDP 立即在 CPU 补齐尾片（竞态位置）
+→ on_init_end() 首次 Actor→rollout 权重同步
+→ val_before_train / 第一次 rollout 使用损坏的音频 encoder 权重
+```
+
+因此问题可以在任何 optimizer 更新之前出现。这个默认配置下，应优先定位初始化后的手工卸载；不能只因 `fsdp2_load_full_state_dict()` 也有条件卸载分支，就认定该分支实际执行过。代码、局部损坏模式、CPU 可控复现和修复后的服务器结果共同支持上述根因；本次没有采集 NPU 算子级时序跟踪。
+
+**解决方式**
+
+修复提交：[c96c88a（GitHub check 分支）](https://github.com/ZiqiGuan892/ext/commit/c96c88aea1ab042217da624c09860a70d6496503)。[thinker_adapter.py](../thinker_adapter.py) 在音频模块加载后安装 [fsdp_offload.py](../fsdp_offload.py) 的实例级保护：Huanyu 根模型进入 FSDP2 后，显式 `.to(cpu, non_blocking=True)` 改为阻塞搬运，确保 CPU 补齐前数据就绪。必须在进入原 `.to()` 前选择阻塞方式，在其返回后补 `synchronize()` 已经太晚。
+
+保护覆盖当前非 LoRA 训练中的初始化及后续手工卸载，保留 dtype、参数及 FSDP 状态管理；不修改磁盘 checkpoint，也不在同步时用 disk 权重覆盖 Actor，encoder/projector 解冻后的更新仍正常同步。代价是 CPU 卸载失去异步重叠。若另加 PEFT 外层包装，需要在最终根对象安装保护，不能直接套用当前覆盖结论。同时修正了比较器对初始 meta 占位的处理，详见 8.2。
+
+**复测结果与复现入口**
+
+- CPU：113 项相关测试通过。其中 [test_fsdp_offload_on_cpu.py](../tests/test_fsdp_offload_on_cpu.py) 使用真实 FSDP 补齐代码和模拟延迟搬运，复现 40/16 仅索引 39 损坏、20/16 正常；阻塞搬运后全部元素正确。
+- 服务器：沿用 WAV100、冻结 encoder/projector、Actor16+RM16、TP4、首次 sync 后只验证的配置。`compare_huanyu_weight_sync.py --update 1` 对 8 个目标/对照参数全部输出 `PASS`、`earliest=None`。
+- 实际回答：用户确认 sync 模式近音词错误明显减少；未报告错误率数值，也未确认所有近音词错误均消失。
+
+修复前报告为 `/opt/huawei/dataset/infra_data/data/huanyu_weight_sync_20261028_174554/compare_update1.json`。修复后记录目录：
+
+```text
+/opt/huawei/dataset/infra_data/data/huanyu_sync_fixed_20261028_204316/
+├── compare_update1.json       # 8 项参数全部 PASS
+├── weights/                  # 权重边界审计记录
+└── validation_dump/0.jsonl    # 本次验证回答
+```
+
+再次验证使用 8.2 的 sync 命令，两节点更新代码、启动新进程并使用新的审计目录；检查 `[huanyu-fsdp-offload] phase=executed`、`mode=sync initial_actor_sync=completed`、8 项 `PASS`，再比较同一 WAV 的回答。现有结果验证了这 8 个音频 VGG LayerNorm 的首次同步一致性，尚不代表整模型权重、所有 embedding 或多轮训练都已逐项验证。
 
 ## 9. 抽取相同100条音频，比较 serve 与 verl 的文字回答
 
@@ -786,6 +843,22 @@ python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/launch_huanyu_aqa_text_ab.py" ser
 
 此入口在case下写`serve.deploy.yaml`和`serve.launch.json`，运行与rollout相同的thinker-only pipeline及ext精度hooks；不是直接复用旧服务的TP2/图模式。HTTP通过`--chat-template-content-format string --interleave-mm-strings`处理当前checkpoint不接受audio内容项的模板。服务日志在`$AB_ROOT/serve_console.log`。
 
+启动器先在API进程中注册`qwen3_6_whisper_thinker_only`，再在同一Python进程调用原生vLLM CLI；仅设置worker使用的`VLLM_OMNI_EXTERNAL_MODULES`不能保证读取deploy配置前完成注册。日志应先出现`[huanyu-text-ab] API pipeline registered: qwen3_6_whisper_thinker_only`，之后仍需等待服务实际就绪。旧版入口若报`Pipeline ... is not registered to OMNI_PIPELINES`，表示尚未进入模型加载与音频推理。更新`launch_huanyu_aqa_text_ab.py`后，确认失败进程已退出，保留同一批100条样本，只归档失败启动留下的三个文件再重试：
+
+```bash
+# AB_ROOT继续使用这次失败实验的绝对路径，不重新prepare。
+FAILED_DIR=$(mktemp -d "$AB_ROOT/serve_failed_$(date +%Y%m%d_%H%M%S)_XXXXXX")
+for name in serve.launch.json serve.deploy.yaml serve_console.log; do
+  if [ -f "$AB_ROOT/$name" ]; then
+    mv "$AB_ROOT/$name" "$FAILED_DIR/"
+  fi
+done
+python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/launch_huanyu_aqa_text_ab.py" serve \
+  --case-dir "$AB_ROOT" --port 28889 --served-model qwen3.8
+```
+
+此重试方法只适用于请求尚未开始的启动失败；已有回答的实验按下方结果保留规则处理。API注册修复已通过15项启动器CPU测试，包括同进程注册顺序、原生CLI参数传递和注册失败时停止；仍需服务器NPU复测。
+
 服务就绪后，在另一个终端设置**相同的PROJECT_ROOT和AB_ROOT绝对路径**，发送全部100条：
 
 ```bash
@@ -793,6 +866,20 @@ python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/aqa_text_ab.py" serve \
   --case-dir "$AB_ROOT" --url http://localhost:28889/v1/chat/completions \
   --model qwen3.8
 ```
+
+如果旧版A/B脚本报`build_request() got an unexpected keyword argument 'include_prompt'`，说明同目录的`request_aqa_validation_wav.py`接口与调用方不一致；该行尚未发送HTTP请求。更新后的`aqa_text_ab.py`直接从case中的规范化prompt构造`audio_url`请求，保留system原文及WAV顺序、指定`modalities=["text"]`，不再调用辅助脚本的`build_request`；辅助脚本仍用于读取WAV和收发HTTP。无需重启已就绪的服务，也无需重新抽样。
+
+例如仅`row_000026`发生上述构造错误，更新`aqa_text_ab.py`后先归档它的失败记录，再使用`--skip-existing`重试；之前成功的结果会校验后跳过：
+
+```bash
+FAILED_DIR=$(mktemp -d "$AB_ROOT/request_failed_$(date +%Y%m%d_%H%M%S)_XXXXXX")
+mv "$AB_ROOT/serve/row_000026.json" "$FAILED_DIR/"
+python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/aqa_text_ab.py" serve \
+  --case-dir "$AB_ROOT" --url http://localhost:28889/v1/chat/completions \
+  --model qwen3.8 --skip-existing
+```
+
+请求接口修复通过12项工具CPU测试，覆盖旧辅助函数签名、多音频顺序、system原文与问题文字区分、纯文字输出、以及已有成功记录的请求哈希兼容性。真实回答仍需服务器测试。
 
 **完成请求后停止上述独立serve，释放其卡，再运行verl验证**。此入口不拉起Ray、不安装包、不替换vLLM-Omni：
 
@@ -818,6 +905,107 @@ $AB_ROOT/
 
 比较器按原始样本ID配对，拒绝串实验、错prompt/音频、未知行或重复结果；缺失/失败明确标记。HTTP将思考过程单独放入`reasoning_content`时，两份文字都保留，但不自动拼接猜测“完全相同”。`reply_exact_match`只表示文字一致，不能当作准确率或近音词错误率。`rollout`记录的是AgentLoop合并后的回答，与验证dump采用相同token来源；其请求参数快照也不会冒称引擎最终解析参数。
 
-**验证边界**：规范化messages一致不等于已证明HTTP模板渲染、音频token展开及最终token IDs逐个一致。rollout JSON保留`rendered_prompt_with_special_tokens`供排查；当前无法从HTTP回复获取服务端完整prompt token IDs。批处理、副本分配以及初始Actor同步仍与独立serve不同，这正是后续排查的范围。本工具只比较文字，不额外采集权重或embedding；CPU测试验证数据配对和请求/启动逻辑，真实100条结果需在服务器运行上述流程获得。
+**验证边界**：旧版 case 只比较文字，没有采集 embedding；规范化 messages 一致不能证明实际模型输入一致。新版 prepare 默认开启第 11 节的完整输入 embedding 检查，必须使用对应启动器重新运行两端，不能给旧文字结果补算或推断 embedding。rollout JSON 仍保留 `rendered_prompt_with_special_tokens`。批处理、副本分配、权重和语言模型内部计算需要与输入 embedding 的比较结果分开判断。
 
 本次本地验证：61项相关CPU测试通过，包含真实小型Parquet/WAV、模拟HTTP和实际捕获wrapper串联的配对测试；新增三个工具/模块通过Python 3.8语法检查。未在本地启动NPU或真实模型服务。
+
+## 10. 首次同步后的全模型权重检查
+
+此前 `compare_huanyu_weight_sync.py` 的 PASS **只覆盖 8 个音频 VGG LayerNorm 参数**，不能证明整个推理模型与 checkpoint 一致。新增的 `full_weight_audit.py` 在真实 rollout worker 内枚举全部注册参数（含别名），对每个参数的完整内容计算 SHA256，并分别保存 shape、dtype、numel。注册 buffer 单独列出，不冒充 checkpoint 参数。
+
+检查采用三个阶段：
+
+1. `initial_disk`：首次 Actor 同步之前，原生 safetensors 加载完成后的实际推理参数。
+2. `after_sync`：首次同步及 layerwise finalize 完成后的实际参数。
+3. `disk_replay`：再次读取本地 checkpoint，经过安装版本的 `DefaultModelLoader`、模型 `load_weights` 和 layerwise finalize，得到同一 TP rank 的实际推理参数。TP 切分、QKV 合并、MoE 排列由原生加载器处理，不手写猜测映射。Huanyu 音频参数使用已有桥接调用当前原生参数的 deferred `weight_loader`，避免 `load_state_dict` 对 meta 参数加载无效。
+
+重载参考前会把内存参数填为 NaN，防止漏加载的参数保留 sync 数值而误判通过；不会修改磁盘 checkpoint。`initial_disk` 也必须与 `disk_replay` 一致，否则报告 `reference_reload_changes_disk_baseline`，不能把重载本身的差异当成正常。漏加载、meta、非有限值、缺 worker、缺 TP rank、版本接口不支持均不能汇总为 PASS。量化和 LoRA 不支持本次诊断。
+
+**这是独立的权重诊断运行，完成后必须停止，不进行 validation 文字生成或训练。** 磁盘重载已经替换了内存参数，不能把随后生成的回答标成 sync 结果；driver 会以 `AUDIT_ONLY_STOP` 主动退出，是否通过以汇总报告为准。正常训练及普通文字 A/B 不启用此功能。完整哈希及再次读取模型会显著增加初始化时间和磁盘读取量；哈希按块转 CPU，不额外常驻第二份完整模型。
+
+复用第 9 节已准备好的 `AB_ROOT`（含 `case.json` 等文件），保留相同模型和并行配置。先释放独立 serve 占用的卡，保持原来的 Ray 集群；下面的入口沿用 actor16 + RM16、rollout TP4、冻结 encoder/projector。`AUDIT_ROOT` 必须是尚不存在的新目录，由启动器创建，不覆盖已有文字结果：
+
+```bash
+export PROJECT_ROOT=/opt/huawei/dataset/infra_data/code/verl_omni_qwen36_gzq_new
+# AB_ROOT 保持原来那批 100 条数据的目录。
+export AUDIT_ROOT="$PROJECT_ROOT/runs/huanyu_full_weight_audit_$(date +%Y%m%d_%H%M%S)"
+
+RAY_ADDRESS=auto python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/launch_huanyu_aqa_text_ab.py" rollout \
+  --case-dir "$AB_ROOT" \
+  --full-weight-audit-dir "$AUDIT_ROOT"
+
+# 上一步预期以 AUDIT_ONLY_STOP 非零退出；在终端继续单独执行，不用 && 串联。
+python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/compare_huanyu_full_weights.py" \
+  --audit-dir "$AUDIT_ROOT" --expected-workers 16 --tp-size 4 \
+  --output "$AUDIT_ROOT/summary.json"
+```
+
+每个 worker 写 `full_weights-*.json`，启动配置写 `full_weights.launch.json`。汇总器要求 16 个 worker、4 个完整 TP4 组，以及一致的 checkpoint 内容摘要；不能只查看某一个 rank 的 PASS。返回码 0/1/2 分别表示 PASS/FAIL/INCOMPLETE。参数中的 `sync_differs_from_disk` 定位同步后发生变化，`reference_reload_changes_disk_baseline` 要先检查原生重载与初始加载的差异。缺失证据需先解决，不能降低 expected-workers 来绕过。文件中的 `checkpoint_stream.rounding_tensors` 记录原始浮点权重转 BF16 会发生的舍入；这个统计本身不等于同步错误。
+
+精度口径：Actor 通常保存 FP32 主参数，`OmniFSDPEngine.get_per_tensor_param()` 对 DTensor 执行 `full_tensor().to(torch.bfloat16)`，非 DTensor 原样导出。Huanyu 音频加载还会先将浮点 checkpoint 参数转 BF16，再随 Actor 模型转成 FP32。对于原本为 BF16、尚未优化器更新的有限值，BF16→FP32→BF16 应精确还原；此前 LN 尾元素损坏不是正常舍入。对于真正的 FP32 权重，转 BF16 会舍入，尤其要检查原生推理是否本来保留 FP32。这里保留各阶段实际 dtype，不通过统一强转 BF16 来掩盖差异。FP32 主参数也不代表所有前向计算都是 FP32；混精计算、VGG 内部 FP32 和 GDN FP32 cache 是不同层面的设置。
+
+全量 PASS 只证明这次首同步中全部注册参数与原生 checkpoint 推理表示一致，仍不证明音频特征、prompt token IDs、执行算子或最终生成文字一致；未注册的临时缓存不属于此参数清单。合法的非有限值 buffer（例如 `-inf` 掩码）可按完整字节一致性通过，参数仍严格要求有限值。若 padding 或派生 buffer 导致参考重载与初始加载不一致，也要先检查这项差异，不能直接归因为同步损坏。原生加载器接口参考 [vLLM DefaultModelLoader](https://docs.vllm.ai/en/latest/api/vllm/model_executor/model_loader/default_loader/)；运行时接口不兼容会停止并报告，不退回部分参数检查。
+
+本地验证：95 项相关 CPU 测试通过，其中 16 项使用真实 Torch 2.10 张量验证 TP 融合、参数别名、非 LN 损坏、漏加载、FP32/BF16 舍入、meta deferred loader 和报告汇总联调。真实 Huanyu/NPU 模型尚需在服务器运行此检查。
+
+## 11. 100 条文字 A/B 同时检查完整 prompt embedding
+
+新版 `aqa_text_ab.py prepare` 默认 `--embedding-check true`。两端仍输出文字，同时在真实推理 worker 的 `native.thinker.llm.model.forward` 入口保存**文本与音频合并后的完整 `inputs_embeds`**。服务器 Huanyu thinker 直接调用 `self.llm.model(...)`，因此这里不使用会被绕过的 `self.llm.forward()`，也不重新运行 encoder 构造替代结果。
+
+每条样本使用包含 case ID 与 `row_XXXXXX` 的请求 ID。serve 通过 HTTP `request_id` 发送；rollout 在原本的 AgentLoop→server manager 请求中绑定同一标识，不添加问题文字、不改变采样参数。采集器读取实际 runner 请求的 prompt token IDs、音频占位范围，以及 LLM 调用的 positions。音频 mask 来自 `mm_features.mm_position`（有 `is_embed` 时使用实际 mask），不用 `<unk>` 数量猜测位置。输入已经由 `inputs_embeds` 给出时，外层可能传入未使用的全零 `input_ids`；记录会单独保留该实参，逻辑 token IDs 仍取实际调度请求。
+
+此诊断要求原有 A/B 的 TP4、单请求、eager、关闭 prefix cache 和 chunked prefill。每个 TP rank 都保存完整 prompt，不能只比较 rank0。真实请求未经过采集点、只采到一部分 prompt、缺 rank、重复请求或身份不明都会报错或汇总为 `INCOMPLETE`，不会使用调用先后顺序猜测配对。初始化的无请求 warmup 和非 Huanyu judge 不属于采集范围。**没有“只采前两次”的限制，100 条都必须覆盖。**
+
+旧实验没有完整 embedding，需在新目录重跑两端。源 Parquet、导出 WAV 和 seed 保持与此前实验一致时，仍选中相同的 100 条；保留旧目录用于查看先前回答：
+
+```bash
+export PROJECT_ROOT=/opt/huawei/dataset/infra_data/code/verl_omni_qwen36_gzq_new
+export MODEL_PATH=/opt/huawei/dataset/model_gy/downloaded_models/2748
+export AB_ROOT="$PROJECT_ROOT/runs/aqa_embedding_ab_$(date +%Y%m%d_%H%M%S)"
+
+python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/aqa_text_ab.py" prepare \
+  --parquet /opt/huawei/dataset/infra_data/data/aqa_dataset/validation.parquet \
+  --export-dir /opt/huawei/dataset/infra_data/data/validation_vllm \
+  --output-dir "$AB_ROOT" --model-path "$MODEL_PATH" \
+  --sample-size 100 --seed 42 --prompt-mode system_audio --embedding-check true
+
+# 终端一：启动带采集功能的 serve，保持前台。
+python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/launch_huanyu_aqa_text_ab.py" serve \
+  --case-dir "$AB_ROOT" --port 28889 --served-model qwen3.8
+```
+
+服务就绪后，在另一个终端设置相同的 `PROJECT_ROOT`、`AB_ROOT` 绝对路径，发送请求：
+
+```bash
+python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/aqa_text_ab.py" serve \
+  --case-dir "$AB_ROOT" --url http://localhost:28889/v1/chat/completions --model qwen3.8
+```
+
+请求完成后停止独立 serve，释放卡，保持原来的 Ray 集群，再运行 rollout（actor16 + RM16、冻结 encoder/projector、首次 Actor 同步照常执行）：
+
+```bash
+RAY_ADDRESS=auto python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/launch_huanyu_aqa_text_ab.py" rollout \
+  --case-dir "$AB_ROOT"
+
+python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/aqa_text_ab.py" compare --case-dir "$AB_ROOT"
+```
+
+输出增加以下文件：
+
+| 路径 | 内容 |
+| --- | --- |
+| `embeddings/serve/*.json`、`*.npz` | serve 每样本、每 TP rank 的真实输入及来源 |
+| `embeddings/rollout/*.json`、`*.npz` | rollout 对应输入 |
+| `embedding_comparison.jsonl` | 每条的严格比较结果、各 rank 的首个差异位置和误差 |
+| `embedding_summary.json` | `equal_samples`、`different_samples`、`incomplete_samples`、总体 `status` |
+| `comparison.csv` / `comparison.jsonl` | 原文字结果旁增加 `embedding_status`、`embedding_strict_equal` |
+
+严格相等要求 dtype、shape、完整 embedding 原始字节、逻辑 token IDs、positions、音频 mask 全部一致；不使用 `allclose` 或余弦相似度代替。BF16 按原始字节保存，不先转换 FP32。数值差异另报最大/平均绝对误差、首个差异元素，以及音频区和文本/特殊 token 区的差异数。原始 bytes 和 NPZ 均校验 SHA256，比较器逐样本读取，避免一次加载所有张量。
+
+100 条全部通过、每条两端均有完整 TP4 记录且各 rank 也一致，才汇总 `PASS`。缺失证据为 `INCOMPLETE`；完整证据有差异为 `FAIL`。总 `compare` 返回码：0 为文字配对完整且 embedding 全部通过，1 为 embedding 有差异，2 为文字或 embedding 证据不完整。文字是否完全相同单独统计，不作为 embedding 成败条件。
+
+日志关键词为 `[huanyu-embedding-ab]`；正常每条每个 rank 有 `status=complete scope=llm_inputs_embeds`。完整输入一致只能排除**本次这批样本在此输入边界之前产生输出差异**，不能证明权重、cache、算子和后续生成一定一致。探针会同步复制并写盘，因此此实验不能用于衡量正常吞吐量；普通训练不设置 `HUANYU_EMBEDDING_AB_DIR` 时不会开启。第 10 节全量权重诊断会关闭 embedding 采集，避免将磁盘重载后的结果误标为 sync。
+
+请求 ID 的依据见 [vLLM ChatCompletionRequest](https://docs.vllm.ai/en/v0.28.0/api/vllm/entrypoints/openai/chat_completion/protocol/)；安装版本若改写成无法识别的 ID 或不提供所需运行时元数据，采集器会拒绝继续，而非生成错误配对结果。
+
+本次本地验证：98 项相关 CPU 测试通过，覆盖请求身份传递、启动配置、真实 BF16 张量采集、全部 TP rank 比较，以及采集→NPZ→文字 A/B 汇总的串联测试。改动单个音频 embedding 元素会判为 FAIL；缺少一个 rank 会判为 INCOMPLETE。未运行真实 Huanyu/NPU 模型，100 条是否严格一致仍须以上述服务器运行结果为准。

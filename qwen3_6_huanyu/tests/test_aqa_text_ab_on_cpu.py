@@ -2,6 +2,7 @@
 
 from contextlib import redirect_stderr, redirect_stdout
 import asyncio
+import base64
 import copy
 import importlib.util
 import io
@@ -72,11 +73,11 @@ class TextCaseTests(unittest.TestCase):
             "".join(json.dumps(x, ensure_ascii=False) + "\n" for x in manifest), encoding="utf-8")
         return rows
 
-    def prepare(self, size=3, mode="system_audio", destination=None):
+    def prepare(self, size=3, mode="system_audio", destination=None, embedding=False):
         args = SimpleNamespace(parquet=str(self.source), export_dir=str(self.export),
                                output_dir=str(destination or self.case), sample_size=size, seed=42,
                                prompt_mode=mode, model_path=str(self.model), enable_thinking="true", tp=4,
-                               max_tokens=2048)
+                               max_tokens=2048, embedding_check="true" if embedding else "false")
         with redirect_stdout(io.StringIO()):
             self.assertEqual(ab.prepare_case(args), 0)
         return ab.load_case(destination or self.case)
@@ -110,7 +111,8 @@ class TextCaseTests(unittest.TestCase):
             self.assertEqual(row["prompt"][1], {"role": "user", "content": "<audio><audio>"})
             self.assertEqual(rewritten["prompt"], row["prompt"])
             identity = rewritten["extra_info"].pop("huanyu_text_ab")
-            self.assertEqual(identity, {key: row[key] for key in ab.IDENTITY_KEYS})
+            self.assertEqual(identity, dict({key: row[key] for key in ab.IDENTITY_KEYS},
+                                           prompt_sha256=row["prompt_sha256"]))
             self.assertEqual(rewritten["extra_info"], original["extra_info"])
             self.assertEqual(rewritten["reward_model"], original["reward_model"])
             self.assertEqual(rewritten["audios"], row["wav_paths"])
@@ -171,6 +173,105 @@ class TextCaseTests(unittest.TestCase):
         self.assertTrue(result["truncated"])
         self.assertFalse(result["answer_text_present"])
         self.assertEqual(result["reasoning_content"], "思考到长度上限")
+
+    def test_legacy_client_request_signature_does_not_control_case_messages(self):
+        originals = self.fixtures(count=1, audio_count=2)
+        _, case, rows = self.prepare(size=1)
+        client = ab.sibling("request_aqa_validation_wav")
+        # The old deployed helper had exactly these five arguments. A call with
+        # include_prompt would reproduce the reported TypeError before HTTP.
+        def legacy_build_request(prompt, payloads, model, max_tokens, temperature):
+            raise AssertionError("case construction must not use the standalone helper")
+        client.build_request = legacy_build_request
+        with patch.object(ab, "sibling", return_value=client), patch.object(client, "post_json") as post:
+            post.return_value = self.response()
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(ab.serve_case(self.server()), 0)
+            post.assert_called_once()
+            body = json.loads(post.call_args.args[1])
+        self.assertEqual(body["messages"][0], originals[0]["prompt"][0])
+        self.assertEqual(body["modalities"], ["text"])
+        self.assertEqual({key: body[key] for key in case["sampling"]}, case["sampling"])
+        parts = body["messages"][1]["content"]
+        self.assertEqual([part["type"] for part in parts], ["audio_url", "audio_url"])
+        for part, path in zip(parts, rows[0]["wav_paths"]):
+            data = part["audio_url"]["url"].split(",", 1)[1]
+            self.assertEqual(base64.b64decode(data), Path(path).read_bytes())
+        self.assertNotIn("文字问题不能发送", json.dumps(body, ensure_ascii=False))
+        self.assertNotIn("GROUND_TRUTH", json.dumps(body))
+
+    def test_request_serialization_stays_compatible_with_completed_cases(self):
+        self.fixtures()
+        _, case, _ = self.prepare(size=1)
+        client = ab.sibling("request_aqa_validation_wav")
+        source = [{"role": "system", "content": " 系统原文\n\t"},
+                  {"role": "user", "content": "前<audio>中<audio>后"},
+                  {"role": "user", "content": "另一个<audio>问题"}]
+        payloads = [b"wav1", b"wav2", b"wav3"]
+        for mode in ("system_audio", "original"):
+            for with_system in (True, False):
+                with self.subTest(mode=mode, with_system=with_system):
+                    prompt = ab.canonical_prompt(source if with_system else source[1:], 3, mode)
+                    before = copy.deepcopy(prompt)
+                    expected = client.build_request(prompt, payloads, "qwen3.8", 2048, 0, include_prompt=True)
+                    expected.update(case["sampling"])
+                    expected["chat_template_kwargs"] = {"enable_thinking": True}
+                    actual = ab.build_case_request(prompt, payloads, "qwen3.8", case["sampling"], True)
+                    # Identical serialization retains request_sha256 and permits
+                    # --skip-existing for already completed rows after upgrading.
+                    self.assertEqual(json.dumps(actual, ensure_ascii=False), json.dumps(expected, ensure_ascii=False))
+                    self.assertEqual(prompt, before)
+                    self.assertEqual(payloads, [b"wav1", b"wav2", b"wav3"])
+
+    def test_case_request_rejects_mismatched_audio_before_http(self):
+        self.fixtures()
+        _, case, _ = self.prepare(size=1)
+        with self.assertRaisesRegex(ValueError, "count mismatch"):
+            ab.build_case_request([{"role": "user", "content": "<audio><audio>"}],
+                                  [b"wav"], "qwen3.8", case["sampling"], True)
+
+    def test_embedding_case_tags_http_request_without_adding_prompt_text(self):
+        self.fixtures(count=1)
+        _, case, rows = self.prepare(size=1, embedding=True)
+        client = ab.sibling("request_aqa_validation_wav")
+        with patch.object(ab, "sibling", return_value=client), patch.object(client, "post_json") as post:
+            post.return_value = self.response()
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(ab.serve_case(self.server()), 0)
+        body = json.loads(post.call_args.args[1])
+        tag = "huanyuab.{}.{}".format(case["case_id"], rows[0]["sample_id"])
+        self.assertEqual(body["request_id"], tag)
+        self.assertEqual(body["messages"][0], rows[0]["prompt"][0])
+        self.assertEqual([part["type"] for part in body["messages"][1]["content"]], ["audio_url"])
+        record = ab.read_json(self.case / "serve" / (rows[0]["sample_id"] + ".json"))
+        self.assertEqual(record["embedding_request_id"], tag)
+
+    def test_text_success_cannot_hide_missing_embedding_evidence(self):
+        self.fixtures(count=1)
+        _, _, rows = self.prepare(size=1, embedding=True)
+        for side in ("serve", "rollout"):
+            self.save_result(side, rows[0], "相同回答")
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(ab.compare_case(SimpleNamespace(case_dir=str(self.case))), 2)
+        summary = ab.read_json(self.case / "summary.json")
+        self.assertEqual(summary["identical_text_pairs"], 1)
+        self.assertEqual(summary["embedding_check"]["status"], "INCOMPLETE")
+        self.assertEqual(summary["embedding_check"]["incomplete_samples"], 1)
+        records = [json.loads(line) for line in (self.case / "comparison.jsonl").read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(records[0]["embedding_status"], "INCOMPLETE")
+        self.assertIsNone(records[0]["embedding_strict_equal"])
+        self.assertTrue((self.case / "embedding_summary.json").is_file())
+
+    def test_prepare_cli_enables_strict_embedding_check_by_default(self):
+        self.fixtures(count=1)
+        with redirect_stdout(io.StringIO()):
+            result = ab.main(["prepare", "--parquet", str(self.source), "--export-dir", str(self.export),
+                              "--output-dir", str(self.case), "--model-path", str(self.model),
+                              "--sample-size", "1"])
+        self.assertEqual(result, 0)
+        check = ab.read_json(self.case / "case.json")["embedding_check"]
+        self.assertEqual(check, {"enabled": True, "scope": "llm_inputs_embeds", "strict": True,
+                                "expected_tp_size": 4})
 
     def test_wav_changed_after_prepare_fails_before_request(self):
         self.fixtures()

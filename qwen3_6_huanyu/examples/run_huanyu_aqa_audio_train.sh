@@ -119,8 +119,9 @@ echo "[huanyu-aqa] train=$TRAIN_FILE validation=$VAL_FILE"
 export MODEL_PATH="${MODEL_PATH:-/opt/huawei/dataset/model_gy/downloaded_models/Qwen3.6-35B-A3B-huanyu06b-iter2000-omni4b-hf-huanyu7tokens}"
 export RM_MODEL_PATH="${RM_MODEL_PATH:-/opt/huawei/dataset/model_gy/downloaded_models/Qwen3.5-35B-A3B}"
 
-# One sequence per actor rank avoids retaining full unsharded gradients during
-# FSDP2 no_sync accumulation. More train samples may form multiple mini-batches.
+# Default to one sequence per actor rank. Larger mini-batches are allowed when
+# trajectories divide evenly across ranks; micro-batching then accumulates
+# gradients and can retain unsharded gradients when no_sync is enabled.
 export TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-4}"
 export PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-4}"
 export ROLLOUT_N="${ROLLOUT_N:-4}"
@@ -131,9 +132,10 @@ for _huanyu_integer in "${TRAIN_BATCH_SIZE}" "${PPO_MINI_BATCH_SIZE}" "${ROLLOUT
         exit 2
     fi
 done
-if (( PPO_MINI_BATCH_SIZE * ROLLOUT_N != _huanyu_actor_world || ROLLOUT_N < 2 ||
+_huanyu_mini_sequences=$((PPO_MINI_BATCH_SIZE * ROLLOUT_N))
+if (( _huanyu_mini_sequences % _huanyu_actor_world != 0 || ROLLOUT_N < 2 ||
       PPO_MINI_BATCH_SIZE % _huanyu_rollout_replicas != 0 || TRAIN_BATCH_SIZE % PPO_MINI_BATCH_SIZE != 0 )); then
-    echo "[huanyu-aqa] FATAL: require ppo_mini_batch*rollout.n=${_huanyu_actor_world}, rollout.n>=2, ppo_mini_batch%${_huanyu_rollout_replicas}=0 and train_batch%ppo_mini_batch=0" >&2
+    echo "[huanyu-aqa] FATAL: require (ppo_mini_batch*rollout.n)%${_huanyu_actor_world}=0, rollout.n>=2, ppo_mini_batch%${_huanyu_rollout_replicas}=0 and train_batch%ppo_mini_batch=0" >&2
     exit 2
 fi
 
@@ -265,15 +267,20 @@ echo "[huanyu-aqa] train_audio_encoder=$HUANYU_TRAIN_AUDIO_ENCODER train_audio_p
 if [[ "${RM_ENABLE}" == 0 ]]; then
     echo "[huanyu-aqa] reward=rule_based (character bigram Dice against ground_truth; no model/API)"
 fi
-echo "[huanyu-aqa] train_batch=${TRAIN_BATCH_SIZE} ppo_mini_batch=${PPO_MINI_BATCH_SIZE} rollout_n=${ROLLOUT_N} static_microbatch=1"
+echo "[huanyu-aqa] train_batch=${TRAIN_BATCH_SIZE} ppo_mini_batch=${PPO_MINI_BATCH_SIZE} rollout_n=${ROLLOUT_N} microbatch_size_per_gpu=1 (used when dynamic_bsz=false)"
+echo "[huanyu-aqa] mini_batch_trajectories=${_huanyu_mini_sequences} sequences_per_actor_rank=$((_huanyu_mini_sequences / _huanyu_actor_world))"
 echo "[huanyu-aqa] prompt=${MAX_PROMPT_LENGTH} response=${MAX_RESPONSE_LENGTH} steps=${_huanyu_steps}"
 echo "[huanyu-aqa] dump defaults: rollout=${ROLLOUT_DATA_DIR:-$HUANYU_RUN_DIR/rollout_dump} validation=${VALIDATION_DATA_DIR:-$HUANYU_RUN_DIR/validation_dump} genrm=${GENRM_DUMP_DIR} (trailing trainer overrides take precedence)"
 echo "[huanyu-aqa] forward_prefetch=off Q36_BACKWARD_PREFETCH=${Q36_BACKWARD_PREFETCH}; HCCL timeout is unchanged"
 
+# Dynamic batching defaults precede user arguments so each phase can opt in.
 # Required settings follow user arguments so the checked datasets and execution
 # contract cannot be bypassed by stale command-line options. Model selection is
 # the verl alias; the checkpoint's HF architecture and RM alias remain intact.
 exec bash "${_HUANYU_BACKEND}" "${_huanyu_backend_defaults[@]}" \
+    actor_rollout_ref.actor.use_dynamic_bsz=false \
+    actor_rollout_ref.ref.log_prob_use_dynamic_bsz=false \
+    actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=false \
     "actor_rollout_ref.rollout.response_length=${MAX_RESPONSE_LENGTH}" \
     "++ray_kwargs.ray_init.runtime_env.env_vars.MINICPMO_MM_PROMPT_BUDGET=${_huanyu_budget_json}" \
     'trainer.logger=[console]' \
@@ -302,7 +309,6 @@ exec bash "${_HUANYU_BACKEND}" "${_huanyu_backend_defaults[@]}" \
     actor_rollout_ref.actor.ulysses_sequence_parallel_size=1 \
     actor_rollout_ref.actor.ppo_mini_batch_size="${PPO_MINI_BATCH_SIZE}" \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
-    actor_rollout_ref.actor.use_dynamic_bsz=false \
     actor_rollout_ref.actor.fsdp_config.forward_prefetch=false \
     actor_rollout_ref.actor.fsdp_config.ulysses_sequence_parallel_size=1 \
     actor_rollout_ref.actor.fsdp_config.param_offload=true \
@@ -314,9 +320,7 @@ exec bash "${_HUANYU_BACKEND}" "${_huanyu_backend_defaults[@]}" \
     actor_rollout_ref.ref.fsdp_config.forward_prefetch=false \
     actor_rollout_ref.ref.fsdp_config.ulysses_sequence_parallel_size=1 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
-    actor_rollout_ref.ref.log_prob_use_dynamic_bsz=false \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
-    actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=false \
     actor_rollout_ref.rollout.n="${ROLLOUT_N}" \
     "actor_rollout_ref.rollout.tensor_model_parallel_size=${ROLLOUT_TP}" \
     "actor_rollout_ref.rollout.agent.num_workers=${_huanyu_rollout_replicas}" \

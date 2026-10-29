@@ -237,7 +237,7 @@ class AudioTrainingLauncherTests(unittest.TestCase):
         capture = json.loads(self.capture.read_text())
         actual = dict(item.lstrip("+").split("=", 1) for item in capture["argv"])
         self.assertEqual(actual["actor_rollout_ref.model.override_config.huanyu_freeze_audio"], "false")
-        self.assertEqual(actual["actor_rollout_ref.actor.use_dynamic_bsz"], "false")
+        self.assertEqual(actual["actor_rollout_ref.actor.use_dynamic_bsz"], "true")
         self.assertEqual(actual["actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu"], "1")
         self.assertEqual(actual["actor_rollout_ref.actor.fsdp_config.forward_prefetch"], "false")
         self.assertEqual(actual["actor_rollout_ref.model.lora_rank"], "0")
@@ -513,9 +513,40 @@ class AudioTrainingLauncherTests(unittest.TestCase):
         ):
             self.assertEqual(actual["env"].get(key), reference["env"][key], key)
 
+    def test_large_mini_batch_preserves_dynamic_batching_and_sync_override(self):
+        pq.write_table(pa.Table.from_pylist([aqa_row(self.audio)] * 16), self.train)
+        result = self.run_script(
+            {"TRAIN_BATCH_SIZE": "16", "PPO_MINI_BATCH_SIZE": "16", "ROLLOUT_N": "4"},
+            arguments=(
+                "actor_rollout_ref.actor.use_dynamic_bsz=true",
+                "actor_rollout_ref.actor.ppo_max_token_len_per_gpu=12288",
+                "actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=true",
+                "actor_rollout_ref.ref.log_prob_use_dynamic_bsz=true",
+                "++actor_rollout_ref.model.override_config.huanyu_sync_each_microbatch=false",
+            ),
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        capture = json.loads(self.capture.read_text())
+        actual = dict(item.lstrip("+").split("=", 1) for item in capture["argv"])
+        for key, value in (
+            ("data.train_batch_size", "16"),
+            ("actor_rollout_ref.actor.ppo_mini_batch_size", "16"),
+            ("actor_rollout_ref.rollout.n", "4"),
+            ("actor_rollout_ref.actor.use_dynamic_bsz", "true"),
+            ("actor_rollout_ref.actor.ppo_max_token_len_per_gpu", "12288"),
+            ("actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu", "1"),
+            ("actor_rollout_ref.rollout.log_prob_use_dynamic_bsz", "true"),
+            ("actor_rollout_ref.ref.log_prob_use_dynamic_bsz", "true"),
+            ("actor_rollout_ref.model.override_config.huanyu_sync_each_microbatch", "false"),
+        ):
+            self.assertEqual(actual[key], value, key)
+        self.assertIn("mini_batch_trajectories=64 sequences_per_actor_rank=4", result.stdout)
+
     def test_rejects_unequal_rank_batching_debug_mode_and_bad_hyperparameter(self):
         for updates, error in (
             ({"PPO_MINI_BATCH_SIZE": "8"}, "ppo_mini_batch"),
+            ({"ROLLOUT_N": "6"}, "ppo_mini_batch*rollout.n"),
+            ({"ROLLOUT_N": "1"}, "rollout.n>=2"),
             ({"TRAIN_BATCH_SIZE": "6"}, "train_batch"),
             ({"DEBUG_MODE": "1"}, "TOTAL_TRAINING_STEPS=2"),
             ({"HUANYU_FREEZE_AUDIO": "maybe"}, "must be true or false"),

@@ -49,7 +49,8 @@ def make_trainer():
 
 class CheckpointValidationTests(unittest.TestCase):
     def setUp(self):
-        self.env = patch.dict(os.environ, {validation.ENV: "disk", "HUANYU_AUDIO_PROBE_DIR": "/probe"})
+        self.env = patch.dict(os.environ, {validation.ENV: "disk", "HUANYU_AUDIO_PROBE_DIR": "/probe",
+                                          validation.FULL_AUDIT_ENV: ""})
         self.env.start()
         self.addCleanup(self.env.stop)
         versions = patch.object(validation, "_set_rollout_version", side_effect=lambda t: t.events.append("version=0"))
@@ -78,6 +79,29 @@ class CheckpointValidationTests(unittest.TestCase):
         self.assertEqual(trainer.disk_weights, [4, 5, 6])
         with self.assertRaises(RuntimeError):
             trainer.checkpoint_manager.update_weights(1)
+
+    def test_full_audit_stops_after_sync_rpcs_before_any_validation_or_training(self):
+        trainer = make_trainer()
+        with patch.dict(os.environ, {validation.ENV: "sync", validation.FULL_AUDIT_ENV: "/full-audit",
+                                     "HUANYU_AUDIO_PROBE_DIR": ""}):
+            with self.assertRaisesRegex(RuntimeError, "AUDIT_ONLY_STOP"):
+                trainer.on_init_end()
+            self.assertEqual(trainer.events, [("sync", 0)])
+            with self.assertRaisesRegex(RuntimeError, "training is forbidden"):
+                trainer.on_train_begin()
+        self.versions.assert_not_called()
+
+    def test_full_audit_requires_guarded_sync_even_when_mode_unset(self):
+        for mode in ("", "disk"):
+            with patch.dict(os.environ, {validation.ENV: mode, validation.FULL_AUDIT_ENV: "/audit"}):
+                with self.assertRaisesRegex(ValueError, "requires"):
+                    validation.install_checkpoint_validation()
+        trainer = make_trainer()
+        trainer.config.actor_rollout_ref.model.architecture = "OtherModel"
+        with patch.dict(os.environ, {validation.ENV: "sync", validation.FULL_AUDIT_ENV: "/audit"}):
+            with self.assertRaisesRegex(ValueError, "Huanyu training adapter"):
+                trainer.on_init_end()
+        self.assertEqual(trainer.events, [])
 
     def test_disabled_and_other_architecture_preserve_regular_training(self):
         for disabled in (True, False):

@@ -110,6 +110,8 @@ def receive_layerwise_weights(model, model_config, receiver, *, worker=None):
     """Receive one complete update; finalize once after all buckets succeeded."""
     from .audio_reload_guard import AudioReloadGuard
 
+    if getattr(model, "_huanyu_full_weight_audit_started", False):
+        raise RuntimeError("Full weight audit forbids subsequent weight updates; restart the engine")
     try:
         reload_api = importlib.import_module(_RELOAD_MODULE)
         initialize = reload_api.initialize_layerwise_reload
@@ -122,6 +124,18 @@ def receive_layerwise_weights(model, model_config, receiver, *, worker=None):
 
     guard = AudioReloadGuard(model)
     update_id = getattr(model, "_huanyu_weight_sync_update_id", 0) + 1
+    full_audit = None
+    initial_disk = None
+    if os.environ.get("HUANYU_FULL_WEIGHT_AUDIT_DIR", "").strip():
+        if os.environ.get("HUANYU_CHECKPOINT_VALIDATION_MODE", "").strip() != "sync":
+            raise RuntimeError("Full weight audit requires guarded sync validation mode")
+        if (update_id != 1 or getattr(model, "_huanyu_full_weight_audit_complete", False)
+                or getattr(model, "_huanyu_full_weight_audit_started", False)):
+            raise RuntimeError("Full weight audit forbids subsequent weight updates")
+        from . import full_weight_audit
+
+        full_audit = full_weight_audit
+        initial_disk = full_audit.snapshot_initial_disk(model, model_config, worker)
     audit = None
     audit_extra = {}
     if os.environ.get("HUANYU_WEIGHT_SYNC_AUDIT_DIR", "").strip():
@@ -183,6 +197,24 @@ def receive_layerwise_weights(model, model_config, receiver, *, worker=None):
     meta = [name for name, value in model.named_parameters() if value.is_meta]
     if meta:
         raise RuntimeError(f"Huanyu layerwise reload left meta parameters: {meta[:8]}")
+    if full_audit is not None:
+        # Reference replay changes the live model even if it fails partway.
+        # Keep the engine unusable if a caller catches the diagnostic exception.
+        model._huanyu_full_weight_audit_started = True
+        if worker is not None:
+            worker._huanyu_full_weight_audit_started = True
+
+        def reject_forward(*args, **kwargs):
+            raise RuntimeError("Full weight audit replaced rollout weights; generation is forbidden")
+
+        model.forward = reject_forward
+        full_audit.audit_first_sync(
+            model, model_config, worker, initialize, finalize, initial=initial_disk,
+        )
+        # The driver stops after every worker returns. Do not record a normal
+        # sync completion or an audio-probe snapshot of disk-replayed weights.
+        model._huanyu_weight_sync_update_id = update_id
+        return
     guard.verify(model)
     model._huanyu_weight_sync_update_id = update_id
     if callable(snapshot):
@@ -237,6 +269,8 @@ def bind_huanyu_weight_reload(extension):
 
     @wraps(original)
     def huanyu_update_weights(worker, *args, **kwargs):
+        if getattr(worker, "_huanyu_full_weight_audit_started", False):
+            raise RuntimeError("Full weight audit engine cannot be reused; restart before sync or generation")
         # A disk-only validation must never silently receive Actor weights,
         # including when the regular layerwise reload switch is disabled.
         if os.environ.get("HUANYU_CHECKPOINT_VALIDATION_MODE", "").strip().lower() == "disk":
@@ -244,6 +278,8 @@ def bind_huanyu_weight_reload(extension):
             if standard is not None and _is_huanyu(*standard):
                 raise RuntimeError("Huanyu disk checkpoint validation forbids Actor-to-rollout IPC updates")
         if not _enabled():
+            if os.environ.get("HUANYU_FULL_WEIGHT_AUDIT_DIR", "").strip():
+                raise RuntimeError("Full weight audit requires Huanyu layerwise reload enabled")
             _report_once(f"delegated to original IPC handler: {_ENV_FLAG}=0", worker)
             return original(worker, *args, **kwargs)
         standard = _standard_model_and_config(worker)
@@ -258,6 +294,8 @@ def bind_huanyu_weight_reload(extension):
             return original(worker, *args, **kwargs)
         values, unknown = _arguments(signature, worker, args, kwargs)
         if values.get("peft_config") is not None or getattr(worker, "_pending_lora_peft_config", None) is not None:
+            if os.environ.get("HUANYU_FULL_WEIGHT_AUDIT_DIR", "").strip():
+                raise RuntimeError("Full weight audit does not support LoRA updates")
             # Original code owns pending-LoRA consumption/base_sync_done and
             # adapter IDs. Do not clear the stash or receive any buckets here.
             _report_once("delegated to original IPC handler: LoRA update", worker)

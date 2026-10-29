@@ -28,6 +28,9 @@ bind_huanyu_weight_reload(HuanyuColocateWorkerExtension)
 # before it constructs the model. Installation errors propagate to startup.
 install_huanyu_rollout_precision()
 install_huanyu_cache_precision()
+if os.environ.get("HUANYU_EMBEDDING_AB_DIR", "").strip():
+    from .prompt_embedding_probe import install_runtime_probe
+    install_runtime_probe()
 print(
     f"[huanyu-worker] explicit precision extension selected; host={socket.gethostname()} "
     f"pid={os.getpid()} source={__file__} "

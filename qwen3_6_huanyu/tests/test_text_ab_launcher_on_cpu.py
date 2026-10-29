@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest.mock import patch
@@ -163,6 +164,27 @@ class TextABLauncherTests(unittest.TestCase):
         self.assertEqual(Path(plan["command"][1]),
                          self.project / "examples/qwen3_6_huanyu/run_huanyu_aqa_audio_train.sh")
 
+    def test_full_audit_propagates_to_ray_and_never_overwrites_text_run(self):
+        audit = self.temp / "new audit"
+        plan = self.plan("rollout", full_weight_audit_dir=audit)
+        options = hydra_options(plan)
+        for key in ("HUANYU_CHECKPOINT_VALIDATION_MODE", "HUANYU_FULL_WEIGHT_AUDIT_DIR",
+                    "HUANYU_FULL_WEIGHT_AUDIT_RUN_ID", "HUANYU_TEXT_AB_DIR"):
+            self.assertEqual(json.loads(options["ray_kwargs.ray_init.runtime_env.env_vars." + key]), plan["env"][key])
+            self.assertEqual(sum(arg.startswith("++ray_kwargs.ray_init.runtime_env.env_vars." + key + "=")
+                                 for arg in plan["command"]), 1)
+        self.assertEqual(plan["env"]["HUANYU_TEXT_AB_DIR"], "")
+        self.assertEqual(plan["env"]["HUANYU_CHECKPOINT_VALIDATION_MODE"], "sync")
+        self.assertEqual(len(plan["env"]["HUANYU_FULL_WEIGHT_AUDIT_RUN_ID"]), 32)
+        (self.root / "rollout.launch.json").write_text("keep text run", encoding="utf-8")
+        with patch.object(LAUNCHER.subprocess, "call", return_value=1):
+            status, out, err = self.invoke("rollout", "--full-weight-audit-dir", str(audit))
+        self.assertEqual(status, 1)  # intentional stopping status is preserved
+        self.assertTrue((audit / "full_weights.launch.json").is_file())
+        self.assertEqual((self.root / "rollout.launch.json").read_text(), "keep text run")
+        with self.assertRaisesRegex(ValueError, "only supported for rollout"):
+            self.plan("serve", full_weight_audit_dir=audit)
+
     def test_stale_audio_training_and_disk_probe_environment_is_overridden(self):
         stale = {
             "MODEL_PATH": "/wrong/model", "TRAIN_FILE": "/wrong/train", "VAL_FILE": "/wrong/val",
@@ -170,13 +192,15 @@ class TextABLauncherTests(unittest.TestCase):
             "HUANYU_FREEZE_AUDIO": "false", "HUANYU_USE_PRECOMPUTE": "1",
             "MINICPMO_USE_PRECOMPUTE": "1", "HUANYU_PRECISION_PROFILE": "off",
             "HUANYU_CHECKPOINT_VALIDATION_MODE": "disk", "HUANYU_WEIGHT_SYNC_AUDIT_DIR": "/old/weights",
+            "HUANYU_FULL_WEIGHT_AUDIT_DIR": "/old/full", "HUANYU_FULL_WEIGHT_AUDIT_RUN_ID": "old-run",
             "HUANYU_AUDIO_PROBE_DIR": "/old/probe", "HUANYU_AUDIO_PROBE_ARM_FILE": "/old/arm",
             "HUANYU_AUDIO_PROBE_FEATURE_ID": "old-feature", "HUANYU_GRAPH_MODE": "1",
             "RAY_ADDRESS": "ray-head:6379", "DEBUG_MODE": "1", "DEBUG_SAMPLES": "10",
             "VLLM_ASCEND_ENABLE_NZ": "1", "USE_OPTIMIZED_MODEL": "1",
         }
         cleared = [key for key in stale if "PROBE" in key or key in (
-            "HUANYU_CHECKPOINT_VALIDATION_MODE", "HUANYU_WEIGHT_SYNC_AUDIT_DIR")]
+            "HUANYU_CHECKPOINT_VALIDATION_MODE", "HUANYU_WEIGHT_SYNC_AUDIT_DIR",
+            "HUANYU_FULL_WEIGHT_AUDIT_DIR", "HUANYU_FULL_WEIGHT_AUDIT_RUN_ID")]
         with patch.dict(os.environ, stale):
             for mode in ("serve", "rollout"):
                 plan = self.plan(mode)
@@ -204,7 +228,10 @@ class TextABLauncherTests(unittest.TestCase):
 
     def test_paths_remain_literal_arguments_and_hydra_quoted_strings(self):
         serve, rollout = self.plan("serve"), self.plan("rollout")
-        self.assertEqual(serve["argv"][4:], serve["command"])
+        self.assertEqual(serve["argv"][4], LAUNCHER.sys.executable)
+        self.assertEqual(Path(serve["argv"][5]), Path(LAUNCHER.__file__).resolve())
+        self.assertEqual(serve["argv"][6], "_serve_cli")
+        self.assertEqual(serve["argv"][7:], serve["command"][1:])
         shell = serve["argv"][2]
         self.assertIn('exec "$@"', shell)
         self.assertNotIn(str(self.model), shell)
@@ -213,6 +240,30 @@ class TextABLauncherTests(unittest.TestCase):
         options = hydra_options(rollout)
         self.assertEqual(json.loads(options["trainer.validation_data_dir"]), str(self.root / "validation_dump"))
         self.assertEqual(json.loads(options["ray_kwargs.ray_init.runtime_env.env_vars.HUANYU_TEXT_AB_DIR"]), str(self.root))
+
+    def test_embedding_capture_is_enabled_on_both_real_engines_and_disabled_for_weight_audit(self):
+        self.case["embedding_check"] = {"enabled": True, "scope": "llm_inputs_embeds", "strict": True,
+                                       "expected_tp_size": 4}
+        for side in ("serve", "rollout"):
+            plan = self.plan(side)
+            self.assertEqual(plan["env"]["HUANYU_EMBEDDING_AB_DIR"], str(self.root))
+            self.assertEqual(plan["env"]["HUANYU_EMBEDDING_AB_SIDE"], side)
+            if side == "rollout":
+                options = hydra_options(plan)
+                for key in ("HUANYU_EMBEDDING_AB_DIR", "HUANYU_EMBEDDING_AB_SIDE"):
+                    self.assertEqual(json.loads(options["ray_kwargs.ray_init.runtime_env.env_vars." + key]),
+                                     plan["env"][key])
+        audit = self.plan("rollout", full_weight_audit_dir=self.temp / "audit")
+        for key in ("HUANYU_EMBEDDING_AB_DIR", "HUANYU_EMBEDDING_AB_SIDE"):
+            self.assertEqual(audit["env"][key], "")
+            self.assertEqual(json.loads(hydra_options(audit)["ray_kwargs.ray_init.runtime_env.env_vars." + key]), "")
+
+    def test_legacy_text_case_clears_stale_embedding_environment(self):
+        with patch.dict(os.environ, {"HUANYU_EMBEDDING_AB_DIR": "/other-case", "HUANYU_EMBEDDING_AB_SIDE": "serve"}):
+            for side in ("serve", "rollout"):
+                plan = self.plan(side)
+                self.assertEqual(plan["env"]["HUANYU_EMBEDDING_AB_DIR"], "")
+                self.assertEqual(plan["env"]["HUANYU_EMBEDDING_AB_SIDE"], "")
 
     def test_serve_pythonpath_prefers_native_and_retains_unrelated_entries(self):
         native = "/vllm-workspace/vllm-omni"
@@ -308,6 +359,50 @@ class TextABLauncherTests(unittest.TestCase):
                     self.assertFalse((self.root / "rollout.launch.json").exists())
                 finally:
                     path.write_bytes(original)
+
+    def test_api_pipeline_registration_precedes_native_cli_resolution_in_same_process(self):
+        pipelines, events = {}, []
+        pipeline = SimpleNamespace(model_type="qwen3_6_whisper_thinker_only")
+        # A cached registration module need not run its import side effect again.
+        registration = SimpleNamespace(QWEN36_WHISPER_THINKER_ONLY_PIPELINE=pipeline)
+        def register(value):
+            events.append("register")
+            pipelines[value.model_type] = value
+        native_arguments = self.plan("serve")["command"][1:]
+        original_argv = LAUNCHER.sys.argv
+        def cli_main():
+            events.append("native_cli")
+            # Reproduce StageConfigFactory's lookup before worker hook imports.
+            self.assertIs(pipelines["qwen3_6_whisper_thinker_only"], pipeline)
+            self.assertEqual(LAUNCHER.sys.argv, ["vllm", *native_arguments])
+            return 17
+        modules = {
+            "verl_omni_ext.models.qwen3_6_whisper.vllm_omni": registration,
+            "vllm_omni.config.pipeline_registry": SimpleNamespace(register_pipeline=register),
+            "vllm.entrypoints.cli.main": SimpleNamespace(main=cli_main),
+        }
+        def load(name):
+            if name == "vllm.entrypoints.cli.main":
+                self.assertIn("qwen3_6_whisper_thinker_only", pipelines)
+            return modules[name]
+        with patch.object(LAUNCHER.importlib, "import_module", side_effect=load), redirect_stdout(io.StringIO()):
+            self.assertEqual(LAUNCHER.main(["_serve_cli", *native_arguments]), 17)
+        self.assertEqual(events, ["register", "native_cli"])
+        self.assertIs(LAUNCHER.sys.argv, original_argv)
+
+    def test_api_registration_failure_never_falls_back_to_unregistered_native_cli(self):
+        original_argv = LAUNCHER.sys.argv
+        with patch.object(LAUNCHER.importlib, "import_module", side_effect=ImportError("missing extension")) as load:
+            with self.assertRaisesRegex(ImportError, "missing extension"):
+                LAUNCHER.main(["_serve_cli", "serve", str(self.model), "--omni"])
+        self.assertEqual(load.call_count, 1)
+        self.assertIs(LAUNCHER.sys.argv, original_argv)
+
+    def test_internal_entry_rejects_non_serve_commands_without_imports(self):
+        with patch.object(LAUNCHER.importlib, "import_module") as load:
+            with self.assertRaises(ValueError):
+                LAUNCHER.main(["_serve_cli", "collect-env"])
+        load.assert_not_called()
 
 
 if __name__ == "__main__":
