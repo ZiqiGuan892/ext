@@ -740,3 +740,84 @@ PyTorch 2.10 的 `FSDPModule._apply()` 在参数转换后立即执行 `reset_sha
 Huanyu adapter 现在自动安装 `fsdp_offload.py`：仅对该模型实例在 FSDP2 下的 `.to(cpu, non_blocking=True)` 强制阻塞，确保 CPU 补齐前数据已经就绪。当前默认的非 LoRA 训练中，初始化装载和后续手工卸载都受保护；不会重新从 disk 覆盖权重，解冻后的梯度更新及正常 Actor→rollout 同步保留。代价是 CPU 卸载不再与后续工作异步重叠。额外的 PEFT 外层包装可能绕过该实例的 `.to()`，不能直接套用此覆盖结论。
 
 两节点更新代码、启动新任务后，日志应出现 `[huanyu-fsdp-offload] phase=executed`。用 8.2 的 sync 验证配置写入**新的**审计目录，要求 8 项参数各阶段全部 `PASS`，并与 disk 模式比较同一 WAV 的 embedding 和回答。仅重新比较旧报告不会修复旧进程中的参数。CPU 回归模拟延迟 D2H 与尾片补齐；不等同于 NPU 实测通过。
+
+## 9. 抽取相同100条音频，比较 serve 与 verl 的文字回答
+
+使用 [aqa_text_ab.py](aqa_text_ab.py) 准备一次样本集、发送 HTTP 请求并配对文字；[launch_huanyu_aqa_text_ab.py](launch_huanyu_aqa_text_ab.py) 从同一份 `case.json` 启动两端。默认 `system_audio` 模式：**保留数据中原有的 system prompt，删除 user 消息中的问题描述，只保留音频及其顺序**。例如保留“你是一个多模态助手”，不再附加音频中已经说过的问题。原始数据没有 system prompt 时，不自动补写。`ground_truth` 只用于结果参照，不发送给模型。
+
+两端使用同一 checkpoint、同一组 WAV、同一份规范化 messages。默认对齐如下：
+
+| 项目 | 两端设置 |
+| --- | --- |
+| 样本 | 从 validation 随机抽100条，seed=42，原始 `row_XXXXXX` 配对 |
+| 生成 | temperature=0、top_p=1、top_k=-1、每条1个回答、请求 seed=42 |
+| 惩罚与停止 | repetition_penalty=1、frequency/presence_penalty=0、min_tokens=0、ignore_eos=false |
+| 长度 | prompt预算3072、回答最多2048、引擎上下文5248（含128余量），允许正常EOS结束 |
+| 推理 | TP4、BF16、eager、显存比例0.5、max_num_seqs=1；关闭prefix/chunked-prefill/MM缓存 |
+| 精度与模板 | 两端均加载ext的full精度策略及Huanyu hooks，显式enable_thinking=true；关闭checkpoint默认采样覆盖 |
+| verl运行 | Actor16+RM16、冻结encoder/projector、正常首次权重同步、仅val_before_train，无optimizer更新 |
+
+verl保持4个AgentLoop worker和4个TP4推理副本；`val_batch_size=1`逐条验证，每条只生成1个回答。训练配置中的`rollout.n=4`用于满足原入口的批量检查，验证实际使用`val_kwargs.n=1`。新增的`q36_sampling.seed`在请求进入引擎前显式指定seed，避免不同副本的默认seed偏移。普通启动不设置该项时行为不变。
+
+**准备**：两节点部署相同版本的ext与examples；环境及Ray按现有流程准备。WAV导出目录须包含所抽样本，不能只导出前50条。若未完整导出，先用`export_aqa_validation_wav.py --parquet ... --output-dir <新目录> --limit 0`导出全部验证集。下面复用已有完整导出目录，case目录由prepare创建，勿提前`mkdir`该目录。
+
+```bash
+export PROJECT_ROOT=/opt/huawei/dataset/infra_data/code/verl_omni_qwen36_gzq_new
+export MODEL_PATH=/opt/huawei/dataset/model_gy/downloaded_models/2748
+export RM_MODEL_PATH=/opt/huawei/dataset/model_gy/downloaded_models/Qwen3.5-35B-A3B
+export AB_ROOT="$PROJECT_ROOT/runs/aqa_text_ab_$(date +%Y%m%d_%H%M%S)"
+echo "$AB_ROOT"
+
+python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/aqa_text_ab.py" prepare \
+  --parquet /opt/huawei/dataset/infra_data/data/aqa_dataset/validation.parquet \
+  --export-dir /opt/huawei/dataset/infra_data/data/validation_vllm \
+  --output-dir "$AB_ROOT" --model-path "$MODEL_PATH" \
+  --sample-size 100 --seed 42 --prompt-mode system_audio
+```
+
+prepare检查原Parquet与WAV导出的来源、prompt、答案、音频顺序；保存WAV哈希与规范化prompt，写入新的`validation.parquet`，不修改源数据。改变回答上限用prepare的`--max-tokens 4096`；关闭思考用`--enable-thinking false`，两端同时读取。要比较包含问题文字的原始prompt，另建case并设`--prompt-mode original`。
+
+**先运行独立serve**（占用4卡，保持前台；同卡不要同时启动verl）：
+
+```bash
+python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/launch_huanyu_aqa_text_ab.py" serve \
+  --case-dir "$AB_ROOT" --port 28889 --served-model qwen3.8
+```
+
+此入口在case下写`serve.deploy.yaml`和`serve.launch.json`，运行与rollout相同的thinker-only pipeline及ext精度hooks；不是直接复用旧服务的TP2/图模式。HTTP通过`--chat-template-content-format string --interleave-mm-strings`处理当前checkpoint不接受audio内容项的模板。服务日志在`$AB_ROOT/serve_console.log`。
+
+服务就绪后，在另一个终端设置**相同的PROJECT_ROOT和AB_ROOT绝对路径**，发送全部100条：
+
+```bash
+python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/aqa_text_ab.py" serve \
+  --case-dir "$AB_ROOT" --url http://localhost:28889/v1/chat/completions \
+  --model qwen3.8
+```
+
+**完成请求后停止上述独立serve，释放其卡，再运行verl验证**。此入口不拉起Ray、不安装包、不替换vLLM-Omni：
+
+```bash
+RAY_ADDRESS=auto python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/launch_huanyu_aqa_text_ab.py" rollout \
+  --case-dir "$AB_ROOT"
+
+python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/aqa_text_ab.py" compare \
+  --case-dir "$AB_ROOT"
+```
+
+可给启动命令加`--dry-run`仅查看参数。两端启动前检查新Parquet、manifest和checkpoint配置文件哈希；修改后应另建case。已有结果不会被静默覆盖。HTTP中断且已有记录均成功时可加`--skip-existing`继续；失败记录或重新跑完整实验使用新case。收到错误时先看对应行JSON中的`error`。
+
+```text
+$AB_ROOT/
+├── case.json、manifest.jsonl、validation.parquet
+├── serve/row_XXXXXX.txt、row_XXXXXX.json       # HTTP文字、请求参数、原始响应
+├── rollout/row_XXXXXX.txt、row_XXXXXX.json     # verl文字、实际解码prompt、样本标识
+├── validation_dump/0.jsonl                  # 原有验证dump及奖励
+├── comparison.csv、comparison.jsonl         # 同一行的prompt/WAV/答案/两端回复
+└── summary.json                            # 完整配对数及文字相同/不同数量
+```
+
+比较器按原始样本ID配对，拒绝串实验、错prompt/音频、未知行或重复结果；缺失/失败明确标记。HTTP将思考过程单独放入`reasoning_content`时，两份文字都保留，但不自动拼接猜测“完全相同”。`reply_exact_match`只表示文字一致，不能当作准确率或近音词错误率。`rollout`记录的是AgentLoop合并后的回答，与验证dump采用相同token来源；其请求参数快照也不会冒称引擎最终解析参数。
+
+**验证边界**：规范化messages一致不等于已证明HTTP模板渲染、音频token展开及最终token IDs逐个一致。rollout JSON保留`rendered_prompt_with_special_tokens`供排查；当前无法从HTTP回复获取服务端完整prompt token IDs。批处理、副本分配以及初始Actor同步仍与独立serve不同，这正是后续排查的范围。本工具只比较文字，不额外采集权重或embedding；CPU测试验证数据配对和请求/启动逻辑，真实100条结果需在服务器运行上述流程获得。
+
+本次本地验证：61项相关CPU测试通过，包含真实小型Parquet/WAV、模拟HTTP和实际捕获wrapper串联的配对测试；新增三个工具/模块通过Python 3.8语法检查。未在本地启动NPU或真实模型服务。

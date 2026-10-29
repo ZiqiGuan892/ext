@@ -520,6 +520,17 @@ class SamplingControlsTest(unittest.TestCase):
         self.assertEqual(actual, {"max_tokens": 17, "min_tokens": 0})
         self.assertNotIn("ignore_eos", actual)
 
+    def test_explicit_seed_reaches_both_apis_and_preserves_request_override(self):
+        for asynchronous in (False, True):
+            server = self.server({"engine_kwargs": {"q36_sampling": {"seed": 42}}},
+                                 asynchronous=asynchronous)
+            for params, expected in (({"temperature": 0}, 42), ({"seed": 7}, 7)):
+                before = dict(params)
+                with redirect_stdout(StringIO()):
+                    _, actual = self.invoke(server, params, asynchronous=asynchronous)
+                self.assertEqual(actual["seed"], expected)
+                self.assertEqual(params, before)
+
     def test_other_model_servers_ignore_even_invalid_huanyu_controls(self):
         for asynchronous in (False, True):
             with self.subTest(asynchronous=asynchronous):
@@ -538,6 +549,8 @@ class SamplingControlsTest(unittest.TestCase):
         configs = [{"ignore_eos": value} for value in ("true", 1, None)]
         configs += [{"engine_kwargs": {"q36_sampling": {"min_tokens": value}}}
                     for value in (-1, 1.5, "10240", True, None)]
+        configs += [{"engine_kwargs": {"q36_sampling": {"seed": value}}}
+                    for value in (-1, 2**63, 1.5, "42", True, None)]
         for config in configs:
             for asynchronous in (False, True):
                 with self.subTest(config=config, asynchronous=asynchronous):

@@ -47,6 +47,11 @@ def _sampling_overrides(server):
         if isinstance(min_tokens, bool) or not isinstance(min_tokens, Integral) or min_tokens < 0:
             raise ValueError("Huanyu engine_kwargs.q36_sampling.min_tokens must be a nonnegative integer")
         overrides["min_tokens"] = int(min_tokens)
+    seed = _field(side, "seed")
+    if seed is not _MISSING:
+        if isinstance(seed, bool) or not isinstance(seed, Integral) or not 0 <= seed < 2**63:
+            raise ValueError("Huanyu engine_kwargs.q36_sampling.seed must be an integer in [0, 2**63)")
+        overrides["seed"] = int(seed)
     return overrides
 
 
@@ -261,6 +266,7 @@ def _install_on_server_class(server_class):
                 print(f"[huanyu-sampling] ignore_eos={params.get('ignore_eos', False)} "
                       f"min_tokens={params.get('min_tokens', 0)} "
                       f"response_length={_field(_field(self, 'config'), 'response_length')} "
+                      f"seed={params.get('seed', 'engine_default')} "
                       "source=rollout_config/q36_sampling scope=huanyu", flush=True)
                 self._huanyu_sampling_reported = True
         if method_name == "_preprocess_input":
