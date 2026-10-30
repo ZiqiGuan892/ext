@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 PACKAGE = "verl_omni_ext.models.qwen3_6_huanyu"
 ENTRY = PACKAGE + ".engine_hooks"
 INSTALLERS = (
+    ("processor_compat", "install_huanyu_processor_compat"),
     ("rollout_precision", "install_huanyu_rollout_precision"),
     ("cache_precision", "install_huanyu_cache_precision"),
     ("weight_reload", "install_huanyu_weight_reload"),
@@ -82,12 +83,13 @@ def fake_registrations(fail_at=None):
 
 
 class PrecisionEntrypointTests(unittest.TestCase):
-    def test_real_entry_registers_whisper_pipeline_before_all_three_hooks(self):
+    def test_real_entry_registers_whisper_pipeline_before_all_hooks(self):
         with fake_registrations() as (events, installed):
             entry = importlib.import_module(ENTRY)
             self.assertEqual(Path(entry.__file__).resolve(), ROOT / "engine_hooks.py")
             self.assertEqual(events, [
-                "whisper-registration", "rollout_precision", "installed:rollout_precision",
+                "whisper-registration", "processor_compat", "installed:processor_compat",
+                "rollout_precision", "installed:rollout_precision",
                 "cache_precision", "installed:cache_precision", "weight_reload", "installed:weight_reload",
             ])
             self.assertEqual(installed, {"whisper-registration", *(name for name, _ in INSTALLERS)})
@@ -100,7 +102,7 @@ class PrecisionEntrypointTests(unittest.TestCase):
             for name, _ in INSTALLERS:
                 self.assertEqual(events.count(name), 2)
                 self.assertEqual(events.count("installed:" + name), 1)
-            self.assertEqual(events[-3:], [name for name, _ in INSTALLERS])
+            self.assertEqual(events[-len(INSTALLERS):], [name for name, _ in INSTALLERS])
 
     def test_installation_failures_propagate_and_do_not_run_later_hooks(self):
         names = [name for name, _ in INSTALLERS]

@@ -46,6 +46,7 @@ def worker_modules(*, fail=None):
     reload = load_file(PACKAGE + ".weight_reload", ROOT / "weight_reload.py")
     modules = {BASE_MODULE: base, PACKAGE: package, reload.__name__: reload}
     for module_name, installer in (
+        ("processor_compat", "install_huanyu_processor_compat"),
         ("rollout_precision", "install_huanyu_rollout_precision"),
         ("cache_precision", "install_huanyu_cache_precision"),
     ):
@@ -72,7 +73,7 @@ class WorkerExtensionTests(unittest.TestCase):
             self.assertTrue(getattr(cls.update_weights_from_ipc, reload._PATCH_MARKER))
             self.assertIs(cls.__new__, base.__new__)
             cls()
-        self.assertEqual(events, ["rollout_precision", "cache_precision", "base-new"])
+        self.assertEqual(events, ["processor_compat", "rollout_precision", "cache_precision", "base-new"])
         self.assertIn("[huanyu-worker] explicit precision extension selected", output.getvalue())
         self.assertIn("ipc_signature=", output.getvalue())
 
@@ -82,12 +83,12 @@ class WorkerExtensionTests(unittest.TestCase):
                 module = load_file(PACKAGE + ".worker_extension", ROOT / "worker_extension.py")
                 worker = module.HuanyuColocateWorkerExtension()
                 self.assertEqual(worker.update_weights_from_ipc(), "original")
-        self.assertEqual(events, ["rollout_precision", "cache_precision", "base-new", "original-update"])
+        self.assertEqual(events, ["processor_compat", "rollout_precision", "cache_precision", "base-new", "original-update"])
         self.assertIn("enabled=0", output.getvalue())
         self.assertIn("delegated to original IPC handler", output.getvalue())
 
     def test_factory_import_propagates_installer_failure(self):
-        for failed in ("rollout_precision", "cache_precision"):
+        for failed in ("processor_compat", "rollout_precision", "cache_precision"):
             with self.subTest(failed=failed), worker_modules(fail=failed), redirect_stdout(io.StringIO()) as output:
                 with self.assertRaisesRegex(RuntimeError, failed + " unavailable"):
                     load_file(PACKAGE + ".worker_extension", ROOT / "worker_extension.py")

@@ -12,6 +12,7 @@ import socket
 from verl_omni.workers.rollout.vllm_rollout.utils import vLLMOmniColocateWorkerExtension
 
 from .cache_precision import install_huanyu_cache_precision
+from .processor_compat import install_huanyu_processor_compat
 from .rollout_precision import install_huanyu_rollout_precision
 from .weight_reload import bind_huanyu_weight_reload
 from .precision_policy import report_policy
@@ -26,6 +27,7 @@ bind_huanyu_weight_reload(HuanyuColocateWorkerExtension)
 # Some native checkouts do not execute the external-module registry gate in
 # the spawned worker. The explicit worker factory must install these too,
 # before it constructs the model. Installation errors propagate to startup.
+install_huanyu_processor_compat()
 install_huanyu_rollout_precision()
 install_huanyu_cache_precision()
 if os.environ.get("HUANYU_EMBEDDING_AB_DIR", "").strip():
