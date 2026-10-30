@@ -277,16 +277,24 @@ def serve_case(args):
                       sampling=case["sampling"], enable_thinking=case["enable_thinking"])
         started = time.monotonic()
         try:
-            original_prompt, truth, paths, payloads = client.load_inputs(Path(case["export_dir"]), row)
+            export_row = row
+            if case.get("serve_repeat"):
+                # Unique probe IDs identify repetitions; WAVs remain in the
+                # original exported row directory and are never re-encoded.
+                export_row = dict(row, sample_id=row["source_sample_id"])
+                result.update(source_sample_id=row["source_sample_id"], repetition=row["repetition"])
+            original_prompt, truth, paths, payloads = client.load_inputs(Path(case["export_dir"]), export_row)
             hashes = [hashlib.sha256(payload).hexdigest() for payload in payloads]
             if (original_prompt != row["original_prompt"] or truth != row["ground_truth"]
                     or paths != row["wav_paths"] or hashes != row["wav_sha256"]):
                 raise ValueError("exported prompt/truth/WAV differs from prepared case")
             body = build_case_request(row["prompt"], payloads, args.model,
                                       case["sampling"], case["enable_thinking"])
-            if case.get("embedding_check", {}).get("enabled", False):
+            if case.get("embedding_check", {}).get("enabled", False) or case.get("serve_repeat"):
                 body["request_id"] = "huanyuab.{}.{}".format(case["case_id"], sample)
-                result["embedding_request_id"] = body["request_id"]
+                result["request_id"] = body["request_id"]
+                if case.get("embedding_check", {}).get("enabled", False):
+                    result["embedding_request_id"] = body["request_id"]
             payload = json.dumps(body, ensure_ascii=False, allow_nan=False).encode("utf-8")
             digest = hashlib.sha256(args.url.encode("utf-8") + b"\n" + payload).hexdigest()
             result.update(request_sha256=digest, request=sanitized_request(body))

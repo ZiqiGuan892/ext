@@ -1136,3 +1136,45 @@ grep -E 'huanyu-determinism|Enabling batch-invariant|skipping batch-invariant' \
 `VLLM_BATCH_INVARIANT`在共享Ray环境先清为0，随后由Actor引擎的RL配置在创建worker前启用；避免把GenRM也切到需要不同cache配置的模式。已启动推理worker的`[huanyu-determinism] actual`与`logits/*/runtime-*.json`才是最终证据：VLLM_BATCH_INVARIANT=1、HCCL_DETERMINISTIC=strict（原生初始化从true升级）、其余三项=1、batch_invariant_registered=true、torch_deterministic_algorithms=true。仅requested日志或launch.json不够。未知版本无法确认注册则INCOMPLETE；两端同时未启用也不能PASS。注册成功并不证明每个自定义算子都满足不变性，最终仍比较prefill和所有decode的实际logits/选词。
 
 135项CPU回归通过，包括最终环境观测、两侧均未生效的反例、Ray传递和生成deploy中的参数保留；尚未在NPU验证。此前HTTP500 `Stage-0 has no live replica`需另查原始worker异常，开启这些参数本身不能证明该故障已修复。
+
+### 13.2 同一个 serve 中，两条音频各重复20次
+
+`repeat_huanyu_serve.py` 固定复用已有case的 `row_000899`、`row_000418`，各20次、共40次。默认仅记录并比较文字，不采集logits或embedding，也不生成张量NPZ。保留原system、音频、thinking、采样设置；不把ground_truth或问题描述加回请求。顺序为899→418→899→418，客户端逐条等待完整响应，服务端max_num_seqs=1。仅请求ID不同；`manifest.jsonl` 的 `source_sample_id/repetition` 保存对应关系。准备时不重新随机抽样，不重新解码/编码WAV。
+
+这次测试的是同一serve内部的文本可重复性，不启动verl训练。环境准备沿用已有环境，需停止占用同一卡/端口的旧服务，再用启动器加载新case。测试期间不要向该服务发送其他请求，不要中途重启。默认模式不观测worker身份、最终采样元数据或数值运算；报告会将这些明确标为NOT_OBSERVED/NOT_COLLECTED，不能由文本PASS推断数值精度相同。
+
+```bash
+export PROJECT_ROOT=/opt/huawei/dataset/infra_data/code/verl_omni_qwen36_gzq_new
+# AB_ROOT必须是包含上述两条样本的原case目录，其case_id为00c6bf857f4a4b67a1043d719ef6a97f。
+: "${AB_ROOT:?请设置原A/B case目录}"
+export REPEAT_ROOT="$PROJECT_ROOT/runs/huanyu_serve_repeat_$(date +%Y%m%d_%H%M%S)"
+
+python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/repeat_huanyu_serve.py" prepare \
+  --source-case "$AB_ROOT" --output-dir "$REPEAT_ROOT" \
+  --samples row_000899 row_000418 --repeats 20 --batch-invariant false --logits-check false
+echo "$REPEAT_ROOT"
+
+# 终端A：启动服务，等待就绪。使用case中的checkpoint，TP=4、eager、BS=1。
+python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/launch_huanyu_aqa_text_ab.py" serve \
+  --case-dir "$REPEAT_ROOT" --port 28889 --served-model qwen3.8
+
+# 终端B：PROJECT_ROOT和REPEAT_ROOT设置为终端A的相同值。
+python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/repeat_huanyu_serve.py" request \
+  --case-dir "$REPEAT_ROOT" --url http://localhost:28889/v1/chat/completions \
+  --model qwen3.8 --timeout-s 3600
+
+# 等40次请求结束后比较；缺失请求或请求内容变化不能PASS。
+python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/repeat_huanyu_serve.py" compare \
+  --case-dir "$REPEAT_ROOT"
+```
+
+默认关闭此前不兼容的VLLM_BATCH_INVARIANT，启动器仍强制HCCL_DETERMINISTIC=true、ASCEND_LAUNCH_BLOCKING=1、NCCL_DETERMINISTIC=1、LCCL_DETERMINISTIC=1，保持eager、单请求、关闭prefix cache、chunked prefill和async scheduling。它们不保证所有算子逐bit确定。若已修复原生batch-invariant算子兼容性，可在准备新case时改成 `--batch-invariant true`。纯文本模式只保留请求配置和启动日志，不宣称验证了worker最终生效设置。
+
+输出均在REPEAT_ROOT：
+
+- `serve/row_XXXXXX.json/.txt`：40次独立响应；此处row编号是请求序号，原数据行号和第几次重复见manifest以及JSON中的 `source_sample_id/repetition`。
+- `repeat_summary.json`：`scope=text_only`，两条音频各自的 `distinct_text_variants`（文字变体数）、相对第1次一致的请求数、每次状态；第1次自身也计入20次。`logits_status/embeddings_status=NOT_COLLECTED`。
+
+默认模式的 `PASS` 要求40次HTTP响应完整、请求内容符合冻结的case，且各音频的回复文字和单独reasoning字段完全相同、终止状态一致。`DIFFERENT`为输出或终止状态不同；`INCOMPLETE`为缺记录、失败请求、内容被修改等，不能得出一致结论。文本相同不等于回答正确，也不证明logits相同。纯文本比较使用标准库，不读取旧logits/embedding产物；请创建新REPEAT_ROOT，不要直接复用之前启用张量采集的case。
+
+以后需要数值排查时，可在准备新case时显式使用 `--logits-check true`，才会启用原有完整logits与embedding探针，并生成 `logits/serve/`、`embeddings/serve/`、`repeat_comparisons/`。该模式还检查每个TP rank、完整prefill/decode、实际采样设置和worker身份，报告首个分歧位置。全词表logits落盘可能占用数十至数百GiB；默认纯文本模式没有这项开销。本地CPU测试覆盖40次串行请求及两种比较模式；实际NPU结果需运行后读取报告。

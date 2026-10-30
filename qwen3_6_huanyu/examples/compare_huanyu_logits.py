@@ -108,11 +108,11 @@ def vector_difference(left, right, a=None, b=None):
     return result
 
 
-def _load_records(root, case, rows):
+def _load_records(root, case, rows, sides=("serve", "rollout")):
     expected = {r["sample_id"] for r in rows}
     tp = case["engine"]["tensor_parallel_size"]
     records, runtimes, errors = defaultdict(dict), {}, []
-    for side in ("serve", "rollout"):
+    for side in sides:
         for path in sorted((root / "logits" / side).glob("*.json")):
             try:
                 r = read(path)
@@ -149,11 +149,13 @@ def _load_records(root, case, rows):
     return records, runtimes, errors
 
 
-def compare_case(root, case, rows):
+def compare_case(root, case, rows, *, loaded=None):
     root = Path(root)
     if not case.get("logits_check", {}).get("enabled"):
         raise ValueError("case was not prepared with --logits-check true")
-    records, runtimes, errors = _load_records(root, case, rows)
+    # Repeatability tests reuse this validation on two requests from one serve
+    # process. Paths still refer to the original, unmodified capture files.
+    records, runtimes, errors = _load_records(root, case, rows) if loaded is None else loaded
     tp = case["engine"]["tensor_parallel_size"]
     samples = []
     for row in rows:

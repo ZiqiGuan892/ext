@@ -64,6 +64,9 @@ def file_hash(path):
 def build_launch(root, case, project, mode, port=28889, served_model="qwen3.8", full_weight_audit_dir=None):
     """Return an argv/environment/deploy plan; never execute or import vLLM here."""
     sampling, engine = case["sampling"], case["engine"]
+    repeat = bool(case.get("serve_repeat"))
+    if repeat and mode != "serve":
+        raise ValueError("serve-repeat cases test one serving engine; rollout launch is not supported")
     batch_invariant = engine.get("batch_invariant", False)
     if not isinstance(batch_invariant, bool):
         raise ValueError("engine.batch_invariant must be a boolean")
@@ -114,7 +117,7 @@ def build_launch(root, case, project, mode, port=28889, served_model="qwen3.8", 
         "HUANYU_EMBEDDING_AB_SIDE": mode if embedding_check and full_weight_audit_dir is None else "",
     }
     env.update(embedding_env)
-    blocking = "1" if batch_invariant else env.get("ASCEND_LAUNCH_BLOCKING", "0")
+    blocking = "1" if batch_invariant or repeat else env.get("ASCEND_LAUNCH_BLOCKING", "0")
     if blocking not in ("0", "1"):
         raise ValueError("ASCEND_LAUNCH_BLOCKING must be 0 or 1")
     env.update({
@@ -133,7 +136,7 @@ def build_launch(root, case, project, mode, port=28889, served_model="qwen3.8", 
         "HCCL_OP_EXPANSION_MODE": env.get("HCCL_OP_EXPANSION_MODE") or "AIV",
     })
     deterministic_env = {}
-    if batch_invariant:
+    if batch_invariant or repeat:
         deterministic_env = {
             "HCCL_DETERMINISTIC": "true", "ASCEND_LAUNCH_BLOCKING": "1",
             "NCCL_DETERMINISTIC": "1", "LCCL_DETERMINISTIC": "1",
@@ -185,7 +188,7 @@ def build_launch(root, case, project, mode, port=28889, served_model="qwen3.8", 
             "enable_prefix_caching": False, "enable_chunked_prefill": False,
             "mm_processor_cache_gb": 0, "seed": seed, "generation_config": "vllm",
         }
-        if logits_check:
+        if logits_check or repeat:
             engine_values["async_scheduling"] = False
         if batch_invariant:
             engine_values["block_size"] = 128
@@ -208,7 +211,7 @@ def build_launch(root, case, project, mode, port=28889, served_model="qwen3.8", 
             "--additional-config", json.dumps(extras["additional_config"], separators=(",", ":")),
             "--interleave-mm-strings", "--log-stats",
         ]
-        if logits_check:
+        if logits_check or repeat:
             command.append("--no-async-scheduling")
         if batch_invariant:
             command.extend(["--block-size", "128"])
@@ -332,6 +335,10 @@ def main(argv=None):
                   "HCCL_DETERMINISTIC=true (native worker upgrades to strict) "
                   "ASCEND_LAUNCH_BLOCKING=1 NCCL_DETERMINISTIC=1 LCCL_DETERMINISTIC=1 "
                   "block_size=128 graph=eager", flush=True)
+        elif case.get("serve_repeat"):
+            print("[huanyu-determinism] repeat test: HCCL_DETERMINISTIC=true "
+                  "ASCEND_LAUNCH_BLOCKING=1 NCCL_DETERMINISTIC=1 LCCL_DETERMINISTIC=1 "
+                  "VLLM_BATCH_INVARIANT=0 BS=1 graph=eager; these are requested settings", flush=True)
         if args.dry_run:
             return 0
         if not Path(case["model_path"]).is_dir() or not Path(case["subset_parquet"]).is_file():
