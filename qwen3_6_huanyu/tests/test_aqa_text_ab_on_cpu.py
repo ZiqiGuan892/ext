@@ -73,14 +73,28 @@ class TextCaseTests(unittest.TestCase):
             "".join(json.dumps(x, ensure_ascii=False) + "\n" for x in manifest), encoding="utf-8")
         return rows
 
-    def prepare(self, size=3, mode="system_audio", destination=None, embedding=False):
+    def prepare(self, size=3, mode="system_audio", destination=None, embedding=False, logits=False, max_steps=0):
         args = SimpleNamespace(parquet=str(self.source), export_dir=str(self.export),
                                output_dir=str(destination or self.case), sample_size=size, seed=42,
                                prompt_mode=mode, model_path=str(self.model), enable_thinking="true", tp=4,
-                               max_tokens=2048, embedding_check="true" if embedding else "false")
+                               max_tokens=2048, embedding_check="true" if embedding else "false",
+                               logits_check="true" if logits else "false", logits_max_steps=max_steps)
         with redirect_stdout(io.StringIO()):
             self.assertEqual(ab.prepare_case(args), 0)
         return ab.load_case(destination or self.case)
+
+    def test_logits_case_covers_full_generation_by_default_and_can_limit_window(self):
+        self.fixtures(count=3)
+        _, case, _ = self.prepare(embedding=True, logits=True)
+        self.assertEqual(case["logits_check"]["max_steps"], case["sampling"]["max_tokens"])
+        _, limited, _ = self.prepare(embedding=True, logits=True, max_steps=128, destination=self.root / "limited")
+        self.assertEqual(limited["logits_check"]["max_steps"], 128)
+
+    def test_logits_without_embedding_identity_rejected_before_case_creation(self):
+        self.fixtures(count=3)
+        with self.assertRaisesRegex(ValueError, "embedding-check"):
+            self.prepare(logits=True)
+        self.assertFalse(self.case.exists())
 
     def server(self, root=None, **kwargs):
         args = SimpleNamespace(case_dir=str(root or self.case), url="http://localhost:28889/v1/chat/completions",

@@ -88,6 +88,13 @@ def prepare_case(args):
 
     if args.sample_size < 1 or args.max_tokens < 1 or args.tp != 4 or not 0 <= args.seed < 2**63:
         raise ValueError("positive sample size/max tokens, nonnegative seed and TP=4 required")
+    logits_check = getattr(args, "logits_check", "false") == "true"
+    logits_max_steps = getattr(args, "logits_max_steps", 0)
+    if logits_max_steps < 0:
+        raise ValueError("logits-max-steps must be nonnegative")
+    logits_max_steps = logits_max_steps or args.max_tokens
+    if logits_check and getattr(args, "embedding_check", "false") != "true":
+        raise ValueError("logits-check requires embedding-check=true for request/input identity")
     source = Path(args.parquet).expanduser().resolve(strict=True)
     export = Path(args.export_dir).expanduser().resolve(strict=True)
     model = Path(args.model_path).expanduser().resolve(strict=True)
@@ -159,6 +166,8 @@ def prepare_case(args):
         "enable_thinking": args.enable_thinking == "true",
         "embedding_check": {"enabled": getattr(args, "embedding_check", "false") == "true",
                             "scope": "llm_inputs_embeds", "strict": True, "expected_tp_size": args.tp},
+        "logits_check": {"enabled": logits_check, "max_steps": logits_max_steps,
+                         "scope": "model_logits_sampler_input_greedy_input", "strict": True},
         "sampling": {"max_tokens": args.max_tokens, "temperature": 0, "top_p": 1, "top_k": -1,
                      "n": 1, "seed": args.seed, "min_tokens": 0, "ignore_eos": False,
                      "repetition_penalty": 1, "frequency_penalty": 0, "presence_penalty": 0},
@@ -426,6 +435,10 @@ def main(argv=None):
     prepare.add_argument("--max-tokens", type=int, default=2048)
     prepare.add_argument("--embedding-check", choices=("true", "false"), default="true",
                          help="Collect actual LLM input embeddings on both engines (default: true)")
+    prepare.add_argument("--logits-check", choices=("true", "false"), default="false",
+                         help="Capture final worker sampling controls and actual logits/greedy decisions")
+    prepare.add_argument("--logits-max-steps", type=int, default=0,
+                         help="0 captures through max-tokens/EOS; positive values limit capture. Start with sample-size 2")
     prepare.set_defaults(function=prepare_case)
     serve = commands.add_parser("serve", help="Send the shared case to an already-running HTTP service")
     serve.add_argument("--case-dir", required=True)

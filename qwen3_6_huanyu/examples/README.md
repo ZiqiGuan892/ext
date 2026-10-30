@@ -1009,3 +1009,68 @@ python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/aqa_text_ab.py" compare --case-di
 请求 ID 的依据见 [vLLM ChatCompletionRequest](https://docs.vllm.ai/en/v0.28.0/api/vllm/entrypoints/openai/chat_completion/protocol/)；安装版本若改写成无法识别的 ID 或不提供所需运行时元数据，采集器会拒绝继续，而非生成错误配对结果。
 
 本次本地验证：98 项相关 CPU 测试通过，覆盖请求身份传递、启动配置、真实 BF16 张量采集、全部 TP rank 比较，以及采集→NPZ→文字 A/B 汇总的串联测试。改动单个音频 embedding 元素会判为 FAIL；缺少一个 rank 会判为 INCOMPLETE。未运行真实 Huanyu/NPU 模型，100 条是否严格一致仍须以上述服务器运行结果为准。
+
+## 13. serve / rollout 的 prefill、decode logits 和最终采样参数检查
+
+在 embedding 和首次同步权重检查通过后，用 `--logits-check true` 新建一次 A/B 实验。两端仍使用同一 WAV、原始 system 信息和纯音频 user 输入，不额外提供问题文字。该实验只做正常首次权重同步后的验证，不做 optimizer 更新。
+
+探针读取实际 worker 的 `CachedRequestState.sampling_params`，以及采样器收到的 `sampling_metadata`，不是 AgentLoop 的入参或启动命令。每个生成步骤记录三个边界：
+
+| 字段 | 实际观察位置 |
+| --- | --- |
+| `model_logits` | 原生模型 `compute_logits` 返回后，完整复制当前词表输出 |
+| `sampler_input` | 实际 `Sampler.forward` 执行前，可发现模型输出与采样器之间的修改 |
+| `greedy_input` | 实际 `greedy_sample` 调用前，即应用 penalty / token mask 等处理后的分数 |
+| `sampled_token_ids` | 实际 `SamplerOutput` 返回的 token；同时保存 `greedy_sample` 返回值 |
+
+`step=0, phase=prefill` 是完整 prompt 的最后位置，用于生成第一个 token；`step>=1, phase=decode` 是后续逐 token 解码。**两个阶段均采集**，默认一直到 EOS 或 `max_tokens` 上限。引擎通常只对用于选词的位置计算全词表 logits；这里不会额外重跑 prompt 所有位置或使用另一种 forward 替代实际计算。
+
+每个步骤还保存最终 temperature/top_p/top_k/seed/penalties/stop/EOS/min_tokens/max_tokens 等参数、`all_greedy/all_random`、实际采样元数据、当前生成前缀和词表布局。runtime 记录实际引擎配置、精度开关、执行函数及包装函数的源码指纹。参数既做两端互比，也与 `case.json` 的预期值比较：两端同时被覆盖成相同错误值也不能通过。logprobs 等输出诊断选项单列，避免将“是否返回分数”误认为采样温度差异。
+
+服务器提供的 Ascend 实现存在 `enable_reduce_sample` 分支。探针读取实际开关：开启时保存每个 TP rank 的词表分片并检查全局 argmax；关闭时各 rank 记录完整词表 SHA256，TP0 保存完整向量。两端分片布局不同会明确报告，不能将本地分片直接当作完整词表比较。探针不自动切换此开关，以免掩盖实际差异。
+
+先用2条数据，保留本次2048输出上限（允许EOS）。新目录不能与旧实验混用；需两节点代码一致，Ray 按已有32卡验证环境启动。两端顺序运行，避免与已有服务争用同一组NPU。
+
+```bash
+export PROJECT_ROOT=/opt/huawei/dataset/infra_data/code/verl_omni_qwen36_gzq_new
+export MODEL_PATH=/opt/huawei/dataset/model_gy/downloaded_models/2748
+export AB_ROOT="$PROJECT_ROOT/runs/huanyu_logits_ab_$(date +%Y%m%d_%H%M%S)"
+
+python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/aqa_text_ab.py" prepare \
+  --parquet /opt/huawei/dataset/infra_data/data/aqa_dataset/validation.parquet \
+  --export-dir /opt/huawei/dataset/infra_data/data/validation_vllm \
+  --model-path "$MODEL_PATH" --output-dir "$AB_ROOT" \
+  --sample-size 2 --seed 42 --prompt-mode system_audio \
+  --max-tokens 2048 --embedding-check true --logits-check true
+
+# 终端A：启动带相同精度策略和真实探针的serve，等待服务就绪。
+python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/launch_huanyu_aqa_text_ab.py" serve \
+  --case-dir "$AB_ROOT" --port 28889 --served-model qwen3.8
+
+# 终端B：设置成终端A打印的同一个AB_ROOT绝对路径，再发送请求。
+python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/aqa_text_ab.py" serve \
+  --case-dir "$AB_ROOT" --url http://localhost:28889/v1/chat/completions --model qwen3.8
+
+# serve请求全部完成后，在终端A用Ctrl-C退出本次服务、释放其NPU，再运行rollout。
+RAY_ADDRESS=auto python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/launch_huanyu_aqa_text_ab.py" rollout \
+  --case-dir "$AB_ROOT"
+
+python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/compare_huanyu_prompt_embeddings.py" --case-dir "$AB_ROOT"
+python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/compare_huanyu_logits.py" --case-dir "$AB_ROOT"
+```
+
+`--logits-max-steps 0`（默认）取本次 `max_tokens`，包含全部实际生成步骤。可以显式设为128做短窗口诊断；它只限制采集，不改变引擎生成长度。以约248K词表、FP32为例，一个边界每步约0.95MiB；2条、两端、每条2048步约7.6GiB，多个边界数值不同时还会增加。相同向量在同一步文件内去重，其他TP rank在非分片模式下只存摘要。先不要直接对100条做全程向量导出。设备到CPU复制是阻塞的，会减慢推理；不能用本次耗时衡量正常吞吐。
+
+产物位于 `$AB_ROOT/logits/serve/`、`$AB_ROOT/logits/rollout/`（JSON元数据+无pickle的NPZ向量）；总报告是 `$AB_ROOT/logits_comparison.json`。日志关键词为 `[huanyu-logits-ab]`。读报告时关注：
+
+- `sampling_parameter_differences`：两端最终参数/采样元数据不一致、与case预期不符，或实际贪心选择不成立。
+- `runtime_differences`：引擎配置、reduce-sample、精度环境、源码/包装链差异。差异是线索，本身不是根因证明。
+- `prefill` / `decode`：相同前缀下，各TP rank的三个边界逐字节SHA256比较；有向量的rank还计算数值误差、mask差异和top10。
+- `first_different_logits`：最早发生分歧的步骤和边界；`model_logits` 指向模型前向，`sampler_input` 指向中间处理，`greedy_input` 指向采样前处理。
+- `first_different_token`：首次实际选词分歧；`decode_different_prefix` 保留此后的分数摘要比较，但**不能**把不同前缀造成的差异认定为forward错误。若需继续定位，应另做固定同一前缀的实验。
+
+状态 `PASS` 表示全部实际生成（有EOS或max_tokens终止证据）在本次检查范围内一致；`MATCH_CAPTURED_PREFIX` 只表示已采集窗口一致，退出码3；`DIFFERENT` 表示存在数值、选词或设置差异，退出码1；`INCOMPLETE` 表示缺rank/步骤、重复运行混入、缺实际hook、文件损坏或无法完整记录参数，退出码2。缺少decode时不会假装完成整段解码比较，除非首token确实结束了请求。若只有runtime差异而logits/token完全相同，不应据此认定数值错误。
+
+该模式要求单请求、eager、无prefix cache、无chunked prefill、无投机解码，并显式关闭async scheduling，以核对实际CPU前缀与调度步骤。不会修改采样参数来“修正”被覆盖的值，也不会手动调用第二次forward或sampler。本地CPU验证不等同于NPU验证；不支持的服务器接口会报告不完整或停止，而不会产出假PASS。
+
+本次106项CPU回归通过，覆盖探针、比较器、A/B启动器、数据准备及原embedding链路；包含原地修改logits、独立execute/sample生命周期、prefill/decode首次分歧、实际参数被覆盖、TP分片全局argmax、缺步骤/缺rank/损坏文件、提前中断与显式采集窗口的区分。服务器NPU执行尚待验证。

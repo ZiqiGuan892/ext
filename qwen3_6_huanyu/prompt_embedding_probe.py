@@ -417,6 +417,10 @@ def attach_model_probe(native, vllm_config):
     setattr(native, _MARKER, True)
     if not install_runtime_probe():
         raise RuntimeError("embedding A/B could not install a supported native model-runner hook")
+    if case.get("logits_check", {}).get("enabled", False):
+        from .logits_probe import attach_model_probe as attach_logits_probe
+
+        attach_logits_probe(native, vllm_config, state)
     print("[huanyu-embedding-ab] attached side=%s tp=%d/%d source=%s signature=%s "
           "scope=llm_inputs_embeds full_prefill_only=True" %
           (side, rank, size, _source(llm), signature), flush=True)

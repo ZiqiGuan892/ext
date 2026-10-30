@@ -103,6 +103,9 @@ def build_launch(root, case, project, mode, port=28889, served_model="qwen3.8", 
     embedding_check = case.get("embedding_check", {}).get("enabled", False)
     if not isinstance(embedding_check, bool):
         raise ValueError("embedding_check.enabled must be a boolean")
+    logits_check = case.get("logits_check", {}).get("enabled", False)
+    if not isinstance(logits_check, bool) or (logits_check and not embedding_check):
+        raise ValueError("logits_check requires embedding_check.enabled=true")
     embedding_env = {
         "HUANYU_EMBEDDING_AB_DIR": str(root) if embedding_check and full_weight_audit_dir is None else "",
         "HUANYU_EMBEDDING_AB_SIDE": mode if embedding_check and full_weight_audit_dir is None else "",
@@ -161,6 +164,8 @@ def build_launch(root, case, project, mode, port=28889, served_model="qwen3.8", 
             "enable_prefix_caching": False, "enable_chunked_prefill": False,
             "mm_processor_cache_gb": 0, "seed": seed, "generation_config": "vllm",
         }
+        if logits_check:
+            engine_values["async_scheduling"] = False
         # This is the same registered pipeline/stage/extras used by the Huanyu
         # rollout adapter. JSON is valid YAML and needs no YAML dependency.
         deploy = {"pipeline": "qwen3_6_whisper_thinker_only", "stages": [{
@@ -180,6 +185,8 @@ def build_launch(root, case, project, mode, port=28889, served_model="qwen3.8", 
             "--additional-config", json.dumps(extras["additional_config"], separators=(",", ":")),
             "--interleave-mm-strings", "--log-stats",
         ]
+        if logits_check:
+            command.append("--no-async-scheduling")
         env["HUANYU_TEXT_AB_SERVE_LOG"] = str(root / "serve_console.log")
         shell = ('set -euo pipefail\n'
                  'source "$PROJECT_ROOT/examples/qwen3_6_huanyu/graph_mode.sh"\n'
@@ -237,6 +244,8 @@ def build_launch(root, case, project, mode, port=28889, served_model="qwen3.8", 
                    "trainer.rollout_data_dir=" + hydra_string(root / "rollout_dump"),
                    "++ray_kwargs.ray_init.runtime_env.env_vars.HUANYU_TEXT_AB_DIR=" + hydra_string(root)]
         command.extend("++ray_kwargs.ray_init.runtime_env.env_vars.{}=\"\"".format(key) for key in disabled)
+        if logits_check:
+            command.append("++actor_rollout_ref.rollout.engine_kwargs.vllm_omni.async_scheduling=false")
         for key, value in embedding_env.items():
             prefix = "++ray_kwargs.ray_init.runtime_env.env_vars." + key + "="
             command = [arg for arg in command if not arg.startswith(prefix)]

@@ -38,6 +38,23 @@ def _tag_embedding_requests(manager):
     signature = inspect.signature(original)
     if "request_id" not in signature.parameters or not inspect.iscoroutinefunction(original):
         raise RuntimeError("Embedding A/B requires an async server manager.generate(request_id=...)")
+    original_id = getattr(cls, "_vllm_request_id", None)
+    if not callable(original_id) or inspect.iscoroutinefunction(original_id):
+        raise RuntimeError("Embedding A/B requires manager._vllm_request_id(request_id); "
+                           "cannot safely tag the engine RPC on this verl version")
+
+    @wraps(original_id)
+    def engine_request_id(self, request_id):
+        native_id = original_id(self, request_id)
+        state = _EMBEDDING_REQUEST.get()
+        if state is None or self is not state["manager"]:
+            return native_id
+        if len(state["calls"]) != 1 or state["rpc_calls"]:
+            raise RuntimeError("Embedding A/B requires exactly one engine RPC ID per sample")
+        state["rpc_calls"].append(str(native_id))
+        print("[huanyu-embedding-ab] phase=request_id request_id={} native_request_id={}".format(
+            state["request_id"], native_id), flush=True)
+        return state["request_id"]
 
     @wraps(original)
     async def generate(self, *args, **kwargs):
@@ -50,10 +67,17 @@ def _tag_embedding_requests(manager):
         if "request_id" not in bound.arguments:
             raise RuntimeError("Embedding A/B missing engine request ID")
         state["calls"].append(str(bound.arguments["request_id"]))
-        bound.arguments["request_id"] = state["request_id"]
-        return await original(*bound.args, **bound.kwargs)
+        state["rpc_calls"] = []
+        # Preserve sticky-session routing and native finally/release behavior.
+        # Native generate calls _vllm_request_id(), which normally returns a new
+        # uuid4(). Tagging only this outer argument loses identity at the RPC.
+        result = await original(*bound.args, **bound.kwargs)
+        if len(state["rpc_calls"]) != 1:
+            raise RuntimeError("Embedding A/B did not observe exactly one engine RPC")
+        return result
 
     generate._huanyu_embedding_request_tag = True
+    cls._vllm_request_id = engine_request_id
     cls.generate = generate
 
 
@@ -221,19 +245,23 @@ def install_text_ab_capture():
             if embedding_root:
                 if (Path(embedding_root).expanduser().resolve() != root
                         or os.environ.get("HUANYU_EMBEDDING_AB_SIDE") != "rollout"
-                        or not re.fullmatch(r"[A-Za-z0-9_-]+", metadata["case_id"])):
+                        or not re.fullmatch(r"[0-9a-f]{32}", metadata["case_id"])):
                     raise ValueError("Embedding capture case/side identity does not match text A/B")
                 _tag_embedding_requests(self.server_manager)
                 embedding_state = {
                     "manager": self.server_manager, "calls": [],
+                    "rpc_calls": [],
                     "request_id": "huanyuab.{}.{}".format(metadata["case_id"], metadata["sample_id"]),
                 }
+                record["embedding_request_id"] = embedding_state["request_id"]
+                record["embedding_request_scope"] = "_vllm_request_id_for_server_generate_rpc"
+                _write_json(output, record)
                 embedding_token = _EMBEDDING_REQUEST.set(embedding_state)
             result = await original(self, sampling_params, *args, **kwargs)
             if embedding_state is not None:
                 if len(embedding_state["calls"]) != 1:
                     raise RuntimeError("Embedding A/B did not observe exactly one engine request")
-                record["embedding_request_id"] = embedding_state["request_id"]
+                record["embedding_native_request_id"] = embedding_state["rpc_calls"][0]
             prompt_ids, response_ids = _ids(result.prompt_ids), _ids(result.response_ids)
             decode = self.tokenizer.decode
             record.update(

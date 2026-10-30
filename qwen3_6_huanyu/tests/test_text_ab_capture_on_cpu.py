@@ -11,12 +11,45 @@ import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
+from uuid import uuid4
 
 
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location("huanyu_text_capture_test", ROOT / "text_ab_capture.py")
 capture = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(capture)
+
+
+def native_client(server_callback):
+    """Model the native client boundary, including its second UUID generation."""
+    class Client:
+        def __init__(self):
+            self.server = SimpleNamespace(generate=SimpleNamespace(remote=server_callback))
+            self.routes = []
+            self.releases = []
+
+        async def _acquire_server(self, request_id, **kwargs):
+            self.routes.append((request_id, kwargs))
+            await asyncio.sleep(0)
+            return "replica-0", self.server
+
+        def _release_server(self, server_id, request_id):
+            self.releases.append((server_id, request_id))
+
+        def _vllm_request_id(self, request_id):
+            return uuid4().hex
+
+        async def generate(self, request_id, *, prompt_ids=None, sampling_params=None, **kwargs):
+            server_id, server = await self._acquire_server(request_id, prompt_ids=prompt_ids,
+                                                          sampling_params=sampling_params, **kwargs)
+            try:
+                return await server.generate.remote(request_id=self._vllm_request_id(request_id),
+                                                    prompt_ids=prompt_ids, sampling_params=sampling_params,
+                                                    **kwargs)
+            finally:
+                self._release_server(server_id, request_id=request_id)
+
+    return Client()
 
 
 class Tokenizer:
@@ -38,7 +71,7 @@ class TextCaptureTests(unittest.TestCase):
         self.wav.write_bytes(b"same exported WAV bytes")
         self.digest = hashlib.sha256(self.wav.read_bytes()).hexdigest()
         self.prompt = [{"role": "system", "content": "原始系统提示"}, {"role": "user", "content": "<audio>"}]
-        self.metadata = {"sample_id": "row_000123", "case_id": "case-test-42", "prompt_mode": "system_audio",
+        self.metadata = {"sample_id": "row_000123", "case_id": "a" * 32, "prompt_mode": "system_audio",
                          "prompt": deepcopy(self.prompt), "wav_paths": [str(self.wav)], "wav_sha256": [self.digest]}
         self.kwargs = {
             "raw_prompt": [{"role": "system", "content": [{"type": "text", "text": "原始系统提示"}]},
@@ -110,42 +143,52 @@ class TextCaptureTests(unittest.TestCase):
 
     def test_embedding_request_tag_reaches_real_manager_without_changing_prompt(self):
         observed = []
-        class Manager:
-            async def generate(self, request_id, prompt_ids, sampling_params):
-                observed.append((request_id, prompt_ids, sampling_params))
-                return "unchanged"
+        async def remote(**kwargs):
+            observed.append(kwargs)
+            return "unchanged"
+        audio = [object()]
+        processor_kwargs = {"chunk_length": 0}
         async def native_run(loop, sampling_params, **kwargs):
-            answer = await loop.server_manager.generate("random-native-id", [1, 2, 3], sampling_params)
+            answer = await loop.server_manager.generate(
+                "random-native-id", prompt_ids=[1, 2, 3], sampling_params=sampling_params,
+                audio_data=audio, mm_processor_kwargs=processor_kwargs, priority=7,
+            )
             self.assertEqual(answer, "unchanged")
             return loop.result
         self.Loop.run = native_run
         loop = self.install()
-        loop.server_manager = Manager()
+        loop.server_manager = native_client(remote)
         with patch.dict(os.environ, {"HUANYU_EMBEDDING_AB_DIR": str(self.root / "case"),
                                      "HUANYU_EMBEDDING_AB_SIDE": "rollout"}):
             result = asyncio.run(loop.run(self.sampling, **self.kwargs))
         self.assertIs(result, loop.result)
-        self.assertEqual(observed[0][0], "huanyuab.case-test-42.row_000123")
-        self.assertEqual(observed[0][1], [1, 2, 3])
-        self.assertIs(observed[0][2], self.sampling)
-        self.assertEqual(self.read_record()["embedding_request_id"], observed[0][0])
+        self.assertEqual(observed[0]["request_id"], "huanyuab.{}.row_000123".format("a" * 32))
+        self.assertEqual(observed[0]["prompt_ids"], [1, 2, 3])
+        self.assertIs(observed[0]["sampling_params"], self.sampling)
+        self.assertIs(observed[0]["audio_data"], audio)
+        self.assertIs(observed[0]["mm_processor_kwargs"], processor_kwargs)
+        self.assertEqual(observed[0]["priority"], 7)
+        self.assertEqual(loop.server_manager.routes[0][0], "random-native-id")
+        self.assertEqual(loop.server_manager.releases, [("replica-0", "random-native-id")])
+        self.assertEqual(self.read_record()["embedding_request_id"], observed[0]["request_id"])
+        self.assertRegex(self.read_record()["embedding_native_request_id"], r"^[0-9a-f]{32}$")
         self.assertIsNone(capture._EMBEDDING_REQUEST.get())
-        asyncio.run(loop.server_manager.generate("ordinary-id", [9], {}))
-        self.assertEqual(observed[-1][0], "ordinary-id")
+        asyncio.run(loop.server_manager.generate("ordinary-id", prompt_ids=[9], sampling_params={}))
+        self.assertRegex(observed[-1]["request_id"], r"^[0-9a-f]{32}$")
+        self.assertEqual(loop.server_manager.routes[-1][0], "ordinary-id")
 
     def test_embedding_identity_is_coroutine_local_with_shared_manager(self):
         observed = []
-        class Manager:
-            async def generate(self, request_id, prompt_ids):
-                await asyncio.sleep(0)
-                observed.append((request_id, prompt_ids))
-        manager = Manager()
+        async def remote(request_id, prompt_ids, **kwargs):
+            await asyncio.sleep(0)
+            observed.append((request_id, prompt_ids))
+        manager = native_client(remote)
         capture._tag_embedding_requests(manager)
         async def one(sample):
             state = {"manager": manager, "calls": [], "request_id": sample}
             token = capture._EMBEDDING_REQUEST.set(state)
             try:
-                await manager.generate("random", [sample])
+                await manager.generate("random", prompt_ids=[sample])
             finally:
                 capture._EMBEDDING_REQUEST.reset(token)
             self.assertEqual(state["calls"], ["random"])
@@ -156,10 +199,9 @@ class TextCaptureTests(unittest.TestCase):
 
     def test_embedding_request_missing_or_multiple_never_records_success(self):
         loop = self.install()
-        class Manager:
-            async def generate(self, request_id):
-                return request_id
-        loop.server_manager = Manager()
+        async def remote(request_id, **kwargs):
+            return request_id
+        loop.server_manager = native_client(remote)
         with patch.dict(os.environ, {"HUANYU_EMBEDDING_AB_DIR": str(self.root / "case"),
                                      "HUANYU_EMBEDDING_AB_SIDE": "rollout"}):
             with self.assertRaisesRegex(RuntimeError, "exactly one"):
@@ -176,6 +218,82 @@ class TextCaptureTests(unittest.TestCase):
                 capture._EMBEDDING_REQUEST.reset(token)
         with self.assertRaisesRegex(RuntimeError, "exactly one"):
             asyncio.run(duplicate())
+
+    def test_native_client_exception_releases_route_and_records_tag_on_failed_sample(self):
+        observed = []
+        async def remote(**kwargs):
+            observed.append(kwargs)
+            raise RuntimeError("worker failed")
+        async def native_run(loop, sampling_params, **kwargs):
+            return await loop.server_manager.generate("session-id", sampling_params=sampling_params)
+        self.Loop.run = native_run
+        loop = self.install()
+        loop.server_manager = native_client(remote)
+        with patch.dict(os.environ, {"HUANYU_EMBEDDING_AB_DIR": str(self.root / "case"),
+                                     "HUANYU_EMBEDDING_AB_SIDE": "rollout"}):
+            with self.assertRaisesRegex(RuntimeError, "worker failed"):
+                asyncio.run(loop.run(self.sampling, **self.kwargs))
+        self.assertEqual(loop.server_manager.releases, [("replica-0", "session-id")])
+        self.assertEqual(self.read_record()["status"], "failed")
+        self.assertEqual(self.read_record()["embedding_request_id"], observed[0]["request_id"])
+        self.assertIsNone(capture._EMBEDDING_REQUEST.get())
+
+    def test_unsupported_client_rejected_before_generation_without_partial_patch(self):
+        class Client:
+            async def generate(self, request_id):
+                self.fail("must not generate")
+        original = Client.generate
+        with self.assertRaisesRegex(RuntimeError, "_vllm_request_id"):
+            capture._tag_embedding_requests(Client())
+        self.assertIs(Client.generate, original)
+
+    def test_duplicate_engine_ids_rejected_before_second_rpc(self):
+        observed = []
+        async def remote(**kwargs):
+            observed.append(kwargs)
+        manager = native_client(remote)
+        cls = type(manager)
+        async def generate(self, request_id):
+            server_id, server = await self._acquire_server(request_id)
+            try:
+                for _ in range(2):
+                    await server.generate.remote(request_id=self._vllm_request_id(request_id))
+            finally:
+                self._release_server(server_id, request_id)
+        cls.generate = generate
+        capture._tag_embedding_requests(manager)
+        async def run():
+            token = capture._EMBEDDING_REQUEST.set({"manager": manager, "calls": [], "request_id": "tagged"})
+            try:
+                await manager.generate("session-id")
+            finally:
+                capture._EMBEDDING_REQUEST.reset(token)
+        with self.assertRaisesRegex(RuntimeError, "exactly one engine RPC ID"):
+            asyncio.run(run())
+        self.assertEqual(observed, [{"request_id": "tagged"}])
+        self.assertEqual(manager.releases, [("replica-0", "session-id")])
+
+    def test_tag_does_not_leak_to_other_client_or_unscoped_coroutine(self):
+        observed = []
+        async def remote(**kwargs):
+            observed.append(kwargs)
+        manager = native_client(remote)
+        other = type(manager)()
+        capture._tag_embedding_requests(manager)
+        installed = type(manager).generate
+        capture._tag_embedding_requests(manager)
+        self.assertIs(type(manager).generate, installed)
+        async def run():
+            token = capture._EMBEDDING_REQUEST.set({"manager": manager, "calls": [], "request_id": "tagged"})
+            try:
+                self.assertRegex(other._vllm_request_id("session"), r"^[0-9a-f]{32}$")
+                await manager.generate("session")
+            finally:
+                capture._EMBEDDING_REQUEST.reset(token)
+            await manager.generate("session")
+        asyncio.run(run())
+        self.assertEqual(observed[0]["request_id"], "tagged")
+        self.assertRegex(observed[1]["request_id"], r"^[0-9a-f]{32}$")
 
     def test_install_disabled_has_no_import_and_repeated_install_is_idempotent(self):
         with patch.dict(os.environ, {"HUANYU_TEXT_AB_DIR": ""}):

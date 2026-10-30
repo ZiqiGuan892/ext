@@ -265,6 +265,17 @@ class TextABLauncherTests(unittest.TestCase):
                 self.assertEqual(plan["env"]["HUANYU_EMBEDDING_AB_DIR"], "")
                 self.assertEqual(plan["env"]["HUANYU_EMBEDDING_AB_SIDE"], "")
 
+    def test_logits_capture_requires_embedding_identity_and_synchronous_sampling(self):
+        self.case["logits_check"] = {"enabled": True, "max_steps": 2048}
+        with self.assertRaisesRegex(ValueError, "embedding_check"):
+            self.plan("serve")
+        self.case["embedding_check"] = {"enabled": True, "scope": "llm_inputs_embeds", "strict": True,
+                                       "expected_tp_size": 4}
+        serve, rollout = self.plan("serve"), self.plan("rollout")
+        self.assertIn("--no-async-scheduling", serve["command"])
+        self.assertIs(serve["deploy"]["stages"][0]["async_scheduling"], False)
+        self.assertEqual(hydra_options(rollout)["actor_rollout_ref.rollout.engine_kwargs.vllm_omni.async_scheduling"], "false")
+
     def test_serve_pythonpath_prefers_native_and_retains_unrelated_entries(self):
         native = "/vllm-workspace/vllm-omni"
         stale = "/opt/huawei/dataset/infra_data/code/vllm-omni-xy-qwen-vit"
