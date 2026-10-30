@@ -73,13 +73,15 @@ class TextCaseTests(unittest.TestCase):
             "".join(json.dumps(x, ensure_ascii=False) + "\n" for x in manifest), encoding="utf-8")
         return rows
 
-    def prepare(self, size=3, mode="system_audio", destination=None, embedding=False, logits=False, max_steps=0, invariant=False):
+    def prepare(self, size=3, mode="system_audio", destination=None, embedding=False, logits=False, max_steps=0, invariant=False,
+                forward=False, forward_steps=2, top_k=100):
         args = SimpleNamespace(parquet=str(self.source), export_dir=str(self.export),
                                output_dir=str(destination or self.case), sample_size=size, seed=42,
                                prompt_mode=mode, model_path=str(self.model), enable_thinking="true", tp=4,
                                max_tokens=2048, embedding_check="true" if embedding else "false",
-                               logits_check="true" if logits else "false", logits_max_steps=max_steps,
-                               batch_invariant="true" if invariant else "false")
+                               logits_check="true" if logits else "false", logits_max_steps=max_steps, logits_top_k=top_k,
+                               batch_invariant="true" if invariant else "false",
+                               forward_check="true" if forward else "false", forward_max_steps=forward_steps)
         with redirect_stdout(io.StringIO()):
             self.assertEqual(ab.prepare_case(args), 0)
         return ab.load_case(destination or self.case)
@@ -91,10 +93,33 @@ class TextCaseTests(unittest.TestCase):
         _, limited, _ = self.prepare(embedding=True, logits=True, max_steps=128, destination=self.root / "limited")
         self.assertEqual(limited["logits_check"]["max_steps"], 128)
 
+    def test_top100_default_is_capture_only_and_full_storage_is_explicit(self):
+        self.fixtures(count=3)
+        _, compact, _ = self.prepare(embedding=True, logits=True)
+        self.assertEqual(compact["logits_check"]["top_k"], 100)
+        self.assertEqual(compact["sampling"]["top_k"], -1)
+        _, full, _ = self.prepare(embedding=True, logits=True, top_k=0, destination=self.root / "full")
+        self.assertEqual(full["logits_check"]["top_k"], 0)
+        self.assertEqual(full["sampling"], compact["sampling"])
+        with self.assertRaisesRegex(ValueError, "logits-top-k"):
+            self.prepare(top_k=-1, destination=self.root / "invalid")
+        self.assertFalse((self.root / "invalid").exists())
+
     def test_batch_invariance_is_persisted_in_the_shared_case(self):
         self.fixtures(count=4)
         _, case, _ = self.prepare(size=4, invariant=True)
         self.assertIs(case["engine"]["batch_invariant"], True)
+
+    def test_forward_case_bounds_and_dependencies(self):
+        self.fixtures(count=3)
+        for kwargs in ({"forward": True}, {"forward": True, "embedding": True, "logits": True, "max_steps": 1}):
+            with self.assertRaisesRegex(ValueError, "forward-check"):
+                self.prepare(**kwargs)
+            self.assertFalse(self.case.exists())
+        _, case, _ = self.prepare(embedding=True, logits=True, max_steps=2, forward=True)
+        self.assertEqual(case["forward_check"], {"enabled": True, "max_steps": 2})
+        self.assertEqual(case["sampling"]["max_tokens"], 2048)
+        self.assertFalse(case["engine"]["batch_invariant"])
 
     def test_logits_without_embedding_identity_rejected_before_case_creation(self):
         self.fixtures(count=3)

@@ -115,6 +115,15 @@ def build_launch(root, case, project, mode, port=28889, served_model="qwen3.8", 
     logits_check = case.get("logits_check", {}).get("enabled", False)
     if not isinstance(logits_check, bool) or (logits_check and not embedding_check):
         raise ValueError("logits_check requires embedding_check.enabled=true")
+    logits_top_k = case.get("logits_check", {}).get("top_k", 100)
+    if type(logits_top_k) is not int or logits_top_k < 0:
+        raise ValueError("logits_check.top_k must be a nonnegative integer (0=full)")
+    forward_check = case.get("forward_check", {})
+    if forward_check.get("enabled", False):
+        steps = forward_check.get("max_steps")
+        if (not logits_check or type(steps) is not int
+                or not 1 <= steps <= case["logits_check"]["max_steps"]):
+            raise ValueError("forward_check requires logits_check and a valid bounded max_steps")
     embedding_env = {
         "HUANYU_EMBEDDING_AB_DIR": str(root) if embedding_check and full_weight_audit_dir is None else "",
         "HUANYU_EMBEDDING_AB_SIDE": mode if embedding_check and full_weight_audit_dir is None else "",

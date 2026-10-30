@@ -34,7 +34,7 @@ REQUIRED_PARAMS = ("temperature", "top_p", "top_k", "n", "seed", "max_tokens",
                    "frequency_penalty", "presence_penalty", "stop", "stop_token_ids")
 PARAM_DIAGNOSTICS = {"logprobs", "prompt_logprobs", "logprob_token_ids", "detokenize",
                      "skip_special_tokens", "spaces_between_special_tokens", "output_kind",
-                     "include_stop_str_in_output"}
+                     "include_stop_str_in_output", "skip_clone"}
 METADATA_DIAGNOSTICS = {"max_num_logprobs", "logprob_token_ids"}
 
 
@@ -148,9 +148,25 @@ def snapshot_params(params):
     return snapshot(fields)
 
 
-def capture_vector(logits):
+def _top_indices(values, count):
+    """Linear selection plus a small sort; break ties by ascending token ID."""
+    import numpy as np
+    count = min(count, values.size)
+    if count == values.size:
+        ids = np.arange(values.size)
+    else:
+        cutoff = np.partition(values, values.size - count)[values.size - count]
+        above = np.flatnonzero(values > cutoff)
+        ties = np.flatnonzero(values == cutoff)[:count - above.size]
+        ids = np.concatenate((above, ties))
+    return ids[np.lexsort((ids, -values[ids]))]
+
+
+def capture_vector(logits, top_k=100):
     import numpy as np
     import torch
+    if type(top_k) is not int or top_k < 0:
+        raise ValueError("logits capture top_k must be a nonnegative integer (0=full)")
     if (not isinstance(logits, torch.Tensor) or logits.ndim != 2 or logits.shape[0] != 1
             or logits.shape[1] < 1 or logits.dtype not in (torch.bfloat16, torch.float16, torch.float32, torch.float64)):
         raise ValueError("logits probe requires one real [1, vocab] floating-point row")
@@ -158,17 +174,30 @@ def capture_vector(logits):
     values = cpu.double().numpy().reshape(-1)
     if np.isnan(values).any() or np.isposinf(values).any() or not np.isfinite(values).any():
         raise ValueError("invalid logits (NaN, +inf or all masked)")
-    raw = cpu.view(torch.uint8).numpy().copy()
-    order = np.argsort(-values, kind="stable")[:10]
+    raw = cpu.view(torch.uint8).numpy()
+    order = _top_indices(values, max(2, top_k) if top_k else 10)
     best = int(order[0])
     summary = {"dtype": str(cpu.dtype), "shape": list(cpu.shape), "sha256": _hash(raw.tobytes()),
                "negative_inf_count": int(np.isneginf(values).sum()), "argmax_local": best,
                "max_tie_count": int(np.count_nonzero(values == values[best])),
                "top10": [{"token_id_local": int(i), "logit": float(values[i]) if np.isfinite(values[i]) else "-inf"}
-                         for i in order]}
+                         for i in order[:min(10, top_k) if top_k else 10]]}
     summary["top1_top2_margin"] = (float(values[best] - values[order[1]])
                                   if len(order) > 1 and np.isfinite(values[order[1]]) else None)
-    return summary, raw
+    if top_k:
+        ids = order[:min(top_k, values.size)]
+        payload = {"token_ids_local": ids.tolist(),
+                   "logits": [float(values[i]) if np.isfinite(values[i]) else "-inf" for i in ids]}
+        summary.update(storage="topk_json", requested_top_k=top_k, stored_shape=[1, len(ids)],
+                       topk=payload, topk_sha256=_json_hash(payload),
+                       sha256_scope="full_vocab_original_dtype_bytes")
+        return summary, None
+    summary["storage"] = "full_npz"
+    return summary, raw.copy()
+
+
+def _capture(logits, state):
+    return capture_vector(logits, top_k=state["case"]["logits_check"].get("top_k", 100))
 
 
 def _token_ids(value, name):
@@ -291,7 +320,7 @@ def _bind_sampler(runner, state):
             return greedy(logits)
         if "greedy_input" in event["vectors"]:
             raise RuntimeError("greedy_sample called more than once for one token")
-        event["vectors"]["greedy_input"] = capture_vector(logits)
+        event["vectors"]["greedy_input"] = _capture(logits, state)
         result = greedy(logits)
         event["greedy_token_ids"] = result.detach().to("cpu", non_blocking=False).reshape(-1).tolist()
         return result
@@ -325,7 +354,7 @@ def _bind_sampler(runner, state):
         if pending is None or pending[0] != identity:
             raise RuntimeError("sampler has no matching observed model.compute_logits result")
         event["vectors"]["model_logits"] = pending[1]
-        event["vectors"]["sampler_input"] = capture_vector(bound.arguments["logits"])
+        event["vectors"]["sampler_input"] = _capture(bound.arguments["logits"], state)
         runner._huanyu_pending_logits = None
         token = _SAMPLING.set(event)
         try:
@@ -355,10 +384,11 @@ def _bind_sampler(runner, state):
             _SAMPLING.reset(token)
             vectors = event.pop("vectors")
             event["logits"] = {key: value[0] for key, value in vectors.items()}
-            # TP0 stores full vectors for replicated logits. All ranks retain
-            # byte hashes; sharded reduce-sample stores every vocab shard.
+            event["tensor_storage"] = "topk_json" if all(raw is None for _, raw in vectors.values()) else "full_npz"
+            # Top-K lives inline on every rank. Explicit full storage keeps
+            # replicated vectors on TP0, or every shard for reduce-sample.
             arrays = None
-            if reduce_sample or state["tp_rank"] == 0:
+            if event["tensor_storage"] == "full_npz" and (reduce_sample or state["tp_rank"] == 0):
                 arrays, aliases, seen = {}, {}, {}
                 for key, (summary, raw) in vectors.items():
                     fingerprint = (summary["dtype"], tuple(summary["shape"]), summary["sha256"])
@@ -383,9 +413,19 @@ def _bind_model(runner):
     original = model.compute_logits
     if getattr(original, "_huanyu_logits_bound", False):
         return
+    state = getattr(_native(runner), _MARKER)
+    forward_probe = None
+    if state["case"].get("forward_check", {}).get("enabled", False):
+        from . import forward_probe
+        forward_probe.bind(_native(runner), state)
+        state["forward_manifest"]["compute_logits"] = {"forward": _source(original), "flags": {}}
 
     @wraps(original)
     def compute(self, *args, **kwargs):
+        if forward_probe is not None:
+            bound = inspect.signature(original).bind(*args, **kwargs)
+            bound.apply_defaults()
+            forward_probe.observe("compute_logits", "input", dict(bound.arguments))
         result = original(*args, **kwargs)
         context = _ACTIVE.get()
         if context is not None:
@@ -393,7 +433,10 @@ def _bind_model(runner):
             if identity["step"] < context["state"]["max_steps"]:
                 if getattr(runner, "_huanyu_pending_logits", None) is not None:
                     raise RuntimeError("compute_logits result was never consumed by the instrumented sampler")
-                runner._huanyu_pending_logits = (identity, capture_vector(result))
+                runner._huanyu_pending_logits = (identity, _capture(result, context["state"]))
+            if forward_probe is not None:
+                forward_probe.observe("compute_logits", "output", result)
+                forward_probe.finish(context)
         return result
 
     compute._huanyu_logits_bound = True
@@ -447,6 +490,9 @@ def attach_model_probe(native, config, embedding_state):
     max_steps = check.get("max_steps")
     if isinstance(max_steps, bool) or not isinstance(max_steps, int) or max_steps < 1:
         raise ValueError("logits_check.max_steps must be a positive integer")
+    top_k = check.get("top_k", 100)
+    if type(top_k) is not int or top_k < 0:
+        raise ValueError("logits_check.top_k must be a nonnegative integer (0=full)")
     state = dict(embedding_state, history={}, max_steps=max_steps, runtime_id=uuid.uuid4().hex)
     # Selected live worker config; model path is recorded separately in case.
     sections = {

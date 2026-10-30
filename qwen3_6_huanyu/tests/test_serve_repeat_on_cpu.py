@@ -49,6 +49,7 @@ class ServeRepeatTests(unittest.TestCase):
                               samples=["row_000000", "row_000001"], batch_invariant="false",
                               logits_check="true" if logits else "false"))
         _, self.case, self.rows = repeat.load_case(self.root)
+        self.assertEqual(self.case["logits_check"]["top_k"], 100)
 
     def send(self):
         ab = repeat.sibling("aqa_text_ab")
@@ -155,6 +156,8 @@ class ServeRepeatTests(unittest.TestCase):
             self.assertEqual(sample["matching_baseline_text_requests"], 20)
 
     def test_cli_defaults_disable_inherited_tensor_probes(self):
+        self.source["forward_check"] = {"enabled": True, "max_steps": 2}
+        (self.fixture.case / "case.json").write_text(json.dumps(self.source), encoding="utf-8")
         source_before = (self.fixture.case / "case.json").read_bytes()
         with redirect_stdout(io.StringIO()):
             self.assertEqual(repeat.main([
@@ -164,6 +167,7 @@ class ServeRepeatTests(unittest.TestCase):
         _, case, _ = repeat.load_case(self.root)
         self.assertFalse(case["logits_check"]["enabled"])
         self.assertFalse(case["embedding_check"]["enabled"])
+        self.assertFalse(case["forward_check"]["enabled"])
         self.assertFalse(case["engine"]["batch_invariant"])
         self.assertEqual((self.fixture.case / "case.json").read_bytes(), source_before)
 

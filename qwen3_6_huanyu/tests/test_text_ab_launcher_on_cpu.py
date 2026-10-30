@@ -120,6 +120,26 @@ class TextABLauncherTests(unittest.TestCase):
                 for mode in ("serve", "rollout"):
                     self.assertEqual(self.plan(mode)["env"]["HCCL_OP_EXPANSION_MODE"], expected)
 
+    def test_forward_window_requires_logits_and_preserves_bs1(self):
+        self.case["forward_check"] = {"enabled": True, "max_steps": 2}
+        with self.assertRaisesRegex(ValueError, "forward_check"):
+            self.plan("serve")
+        self.case["embedding_check"] = {"enabled": True}
+        self.case["logits_check"] = {"enabled": True, "max_steps": 2}
+        self.case["engine"]["batch_invariant"] = False
+        for mode in ("serve", "rollout"):
+            plan = self.plan(mode)
+            self.assertEqual(plan["env"]["VLLM_BATCH_INVARIANT"], "0")
+        self.case["forward_check"]["max_steps"] = 3
+        with self.assertRaisesRegex(ValueError, "forward_check"):
+            self.plan("rollout")
+
+    def test_invalid_logit_capture_topk_rejected(self):
+        self.case["logits_check"] = {"enabled": False, "top_k": -1}
+        for mode in ("serve", "rollout"):
+            with self.assertRaisesRegex(ValueError, "top_k"):
+                self.plan(mode)
+
     def test_serve_cli_agrees_with_deploy_and_uses_registered_thinker_stage(self):
         plan = self.plan("serve", port=30001, served_model="aqa-test")
         stage, command = plan["deploy"]["stages"][0], plan["command"]

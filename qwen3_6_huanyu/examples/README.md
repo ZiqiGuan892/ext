@@ -1027,7 +1027,9 @@ python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/aqa_text_ab.py" compare --case-di
 
 每个步骤还保存最终 temperature/top_p/top_k/seed/penalties/stop/EOS/min_tokens/max_tokens 等参数、`all_greedy/all_random`、实际采样元数据、当前生成前缀和词表布局。runtime 记录实际引擎配置、精度开关、执行函数及包装函数的源码指纹。参数既做两端互比，也与 `case.json` 的预期值比较：两端同时被覆盖成相同错误值也不能通过。logprobs 等输出诊断选项单列，避免将“是否返回分数”误认为采样温度差异。
 
-服务器提供的 Ascend 实现存在 `enable_reduce_sample` 分支。探针读取实际开关：开启时保存每个 TP rank 的词表分片并检查全局 argmax；关闭时各 rank 记录完整词表 SHA256，TP0 保存完整向量。两端分片布局不同会明确报告，不能将本地分片直接当作完整词表比较。探针不自动切换此开关，以免掩盖实际差异。
+默认 `--logits-top-k 100`：每个边界只存分数最高的100个token及其ID，逻辑payload由 `[1,V]` 缩为 `[1,min(100,V)]`，直接写入JSON，不生成logits NPZ。仍对原始dtype的完整词表字节计算SHA256，因此top-100以外变化也会使 `bytes_equal=false`，不会误报完全一致。这是**采集参数**，不会修改模型的采样 `top_k`。全量误差无法由top-100恢复：新报告的 `topk_*` 误差仅针对两端都保存的相同token ID，另外报告top-K集合差异，不能按排名直接逐列相减。
+
+服务器提供的 Ascend 实现存在 `enable_reduce_sample` 分支。探针读取实际开关：开启时每个TP rank保存自己词表分片的top-100与完整分片哈希，结合rank和分片宽度检查全局argmax；关闭时每个rank保存完整词表的top-100与哈希。两端分片布局不同会明确报告，不能将本地分片直接当作完整词表比较。探针不自动切换此开关。需要完整向量时显式使用 `--logits-top-k 0`，恢复NPZ模式（非分片模式只在TP0存完整向量）；新比较器仍支持旧NPZ记录。
 
 先用4条数据，保留本次2048输出上限（允许EOS）。当前AQA启动预检要求至少一个train batch（4条），即使是val_only也不能只准备2条。新目录不能与旧实验混用；需两节点代码一致，Ray 按已有32卡验证环境启动。两端顺序运行，避免与已有服务争用同一组NPU。
 
@@ -1041,7 +1043,7 @@ python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/aqa_text_ab.py" prepare \
   --export-dir /opt/huawei/dataset/infra_data/data/validation_vllm \
   --model-path "$MODEL_PATH" --output-dir "$AB_ROOT" \
   --sample-size 4 --seed 42 --prompt-mode system_audio \
-  --max-tokens 2048 --embedding-check true --logits-check true
+  --max-tokens 2048 --embedding-check true --logits-check true --logits-top-k 100
 
 # 终端A：启动带相同精度策略和真实探针的serve，等待服务就绪。
 python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/launch_huanyu_aqa_text_ab.py" serve \
@@ -1059,13 +1061,15 @@ python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/compare_huanyu_prompt_embeddings.
 python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/compare_huanyu_logits.py" --case-dir "$AB_ROOT"
 ```
 
-`--logits-max-steps 0`（默认）取本次 `max_tokens`，包含全部实际生成步骤。可以显式设为128做短窗口诊断；它只限制采集，不改变引擎生成长度。以约248K词表、FP32为例，一个边界每步约0.95MiB；4条、两端、每条2048步约15.2GiB，多个边界数值不同时还会增加。相同向量在同一步文件内去重，其他TP rank在非分片模式下只存摘要。先不要直接对100条做全程向量导出。设备到CPU复制是阻塞的，会减慢推理；不能用本次耗时衡量正常吞吐。
+`--logits-max-steps 0`（默认）取本次 `max_tokens`，包含全部实际生成步骤。可以显式设为128做短窗口诊断；它只限制采集，不改变引擎生成长度。默认top-100大幅减少数值落盘和比较器读取量，报告仍包含请求前缀和采样元数据，整体缩减比例不能直接按V/100估算。完整哈希仍需阻塞复制全词表到CPU，不能消除这部分采集开销；只对候选top-K做排序，避免原来的全词表排序。旧文件不会自动改写或删除，使用新case目录采集。
 
-产物位于 `$AB_ROOT/logits/serve/`、`$AB_ROOT/logits/rollout/`（JSON元数据+无pickle的NPZ向量）；总报告是 `$AB_ROOT/logits_comparison.json`。日志关键词为 `[huanyu-logits-ab]`。读报告时关注：
+只有显式 `--logits-top-k 0` 才产生大体积完整向量：以约248K词表、FP32为例，一个边界每步约0.95MiB；4条、两端、每条2048步约15.2GiB，多个边界数值不同时还会增加。相同完整向量在同一步NPZ中去重。探针会减慢推理；不能用本次耗时衡量正常吞吐。
+
+产物位于 `$AB_ROOT/logits/serve/`、`$AB_ROOT/logits/rollout/`（默认JSON含top-K；仅全量模式另存无pickle的NPZ）；总报告是 `$AB_ROOT/logits_comparison.json`。日志关键词为 `[huanyu-logits-ab]`。读报告时关注：
 
 - `sampling_parameter_differences`：两端最终参数/采样元数据不一致、与case预期不符，或实际贪心选择不成立。
 - `runtime_differences`：引擎配置、reduce-sample、精度环境、源码/包装链差异。差异是线索，本身不是根因证明。
-- `prefill` / `decode`：相同前缀下，各TP rank的三个边界逐字节SHA256比较；有向量的rank还计算数值误差、mask差异和top10。
+- `prefill` / `decode`：相同前缀下，各TP rank三个边界的完整词表SHA256比较；`numeric_comparison_scope=stored_token_id_intersection` 时误差字段为 `topk_max_abs_difference_finite`、`topk_mean_abs_difference_finite` 等，`compared_token_count` 是两端token ID交集大小。只有全量模式的 `numeric_comparison_scope=full_vocab` 才输出原先的全词表误差、mask差异统计。
 - `first_different_logits`：最早发生分歧的步骤和边界；`model_logits` 指向模型前向，`sampler_input` 指向中间处理，`greedy_input` 指向采样前处理。
 - `first_different_token`：首次实际选词分歧；`decode_different_prefix` 保留此后的分数摘要比较，但**不能**把不同前缀造成的差异认定为forward错误。若需继续定位，应另做固定同一前缀的实验。
 
@@ -1074,6 +1078,39 @@ python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/compare_huanyu_logits.py" --case-
 该模式要求单请求、eager、无prefix cache、无chunked prefill、无投机解码，并显式关闭async scheduling，以核对实际CPU前缀与调度步骤。不会修改采样参数来“修正”被覆盖的值，也不会手动调用第二次forward或sampler。本地CPU验证不等同于NPU验证；不支持的服务器接口会报告不完整或停止，而不会产出假PASS。
 
 本次106项CPU回归通过，覆盖探针、比较器、A/B启动器、数据准备及原embedding链路；包含原地修改logits、独立execute/sample生命周期、prefill/decode首次分歧、实际参数被覆盖、TP分片全局argmax、缺步骤/缺rank/损坏文件、提前中断与显式采集窗口的区分。服务器NPU执行尚待验证。
+
+#### 输入一致、prefill logits 不一致时：定位实际 forward 边界
+
+已观测 case `d4e43d6e47a94209817ab70fef85ad66`：4条输入在全部TP rank严格一致，但4条均从 `step=0 / prefill / model_logits` 开始不同；首次选词分歧分别在step 143、53、72、9（从0计数）。这定位到采样前的模型计算，尚未定位到某个算子。最高分附近的BF16并列解释了贪心选词如何分叉，但不能据此断言根因只是正常舍入。该case未开启确定性计算，不能作为开启后的结论。
+
+比较器将 `skip_clone` 保留为内部复制行为诊断，将 `top_k=-1` 和 `0` 视为关闭top-k的等价表示；原值仍保存在记录和 `diagnostic_parameter_differences` / `requested_parameter_normalizations` 中。其他参数覆盖与真实logits差异仍会报出。空 `spec_token_ids` 列表长度不同也不能单独证明BS=2或启用了投机解码。
+
+原生 `Qwen3NextModel.forward` 含 `use_sequence_parallel`，decoder含 `use_attn_reduce_scatter_for_moe`、`layer_scale` 等分支；仅源码SHA一致不足以判断实际路径一致。新 `--forward-check true` 对真实调用进行观察，记录LLM、每层、input/post-attention norm、GDN/全注意力、MLP、可见router/experts、最终norm及compute_logits输入/输出的完整张量SHA256、shape、dtype。包含residual、positions和实际padding，不只取最后一个token。记录实际分支开关及可见实现的源码指纹；attention metadata保留作诊断，物理cache槽位不同不自动视为错误。
+
+沿用上面的完整A/B流程，在**新目录**准备case时增加以下参数（两端依旧BS=1、TP=4，batch invariance关闭）：
+
+```bash
+python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/aqa_text_ab.py" prepare \
+  --parquet /opt/huawei/dataset/infra_data/data/aqa_dataset/validation.parquet \
+  --export-dir /opt/huawei/dataset/infra_data/data/validation_vllm \
+  --model-path "$MODEL_PATH" --output-dir "$AB_ROOT" \
+  --sample-size 4 --seed 42 --prompt-mode system_audio \
+  --max-tokens 2048 --embedding-check true --batch-invariant false \
+  --logits-check true --logits-max-steps 2 \
+  --forward-check true --forward-max-steps 2
+```
+
+serve/rollout启动和请求命令不变。上述参数只限制采集窗口，不改变生成上限。两端完成后：
+
+```bash
+python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/compare_huanyu_prompt_embeddings.py" --case-dir "$AB_ROOT"
+python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/compare_huanyu_logits.py" --case-dir "$AB_ROOT"
+python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/compare_huanyu_forward.py" --case-dir "$AB_ROOT"
+```
+
+产物为 `forward/{serve,rollout}/*.json`、`forward_comparison.json`。forward只保存哈希和元数据，不保存激活矩阵；logits仅保存指定2步。`first_difference`指出按实际调用顺序首次不同的模块输入/输出，优先看prefill：若input相同而attention output不同，则下一步细查该attention及其cache/metadata；若attention输出相同而MLP输出不同，则细查路由、专家及通信。若LLM和最终norm一致、compute_logits输入一致而输出不同，再查LM head。框架在这些边界之间的padding、通信、layer scale也可能导致下一边界输入不同，不能只凭模块名称直接归责。
+
+`MATCH_CAPTURED_BOUNDARIES`仅表示指定窗口的已观察边界一致，不声称全部生成或未观测内部算子一致；`DIFFERENT`包含真实边界差异或运行分支/实现差异，后者单独出现不证明因果；`INCOMPLETE`表示缺rank/步数/必要边界或混入重复记录。请求在采满窗口前EOS也会缺步，需以更短窗口另建case。不同decode前缀不进行数值归因。探针不重跑forward、不修改参数或运算，但阻塞CPU复制会影响执行时序；NPU有效性与最终根因仍须服务器实测。
 
 ### 13.1 开启 Ascend 批量不变性后对比
 
@@ -1185,4 +1222,4 @@ TP=4时应看到4个不同rank的 `SETTINGS_VERIFIED`，实际环境中的 `VLLM
 
 默认模式的 `PASS` 要求40次HTTP响应完整、请求内容符合冻结的case，且各音频的回复文字和单独reasoning字段完全相同、终止状态一致。`DIFFERENT`为输出或终止状态不同；`INCOMPLETE`为缺记录、失败请求、内容被修改等，不能得出一致结论。文本相同不等于回答正确，也不证明logits相同。纯文本比较使用标准库，不读取旧logits/embedding产物；请创建新REPEAT_ROOT，不要直接复用之前启用张量采集的case。
 
-以后需要数值排查时，可在准备新case时显式使用 `--logits-check true`，才会启用原有完整logits与embedding探针，并生成 `logits/serve/`、`embeddings/serve/`、`repeat_comparisons/`。该模式还检查每个TP rank、完整prefill/decode、实际采样设置和worker身份，报告首个分歧位置。全词表logits落盘可能占用数十至数百GiB；默认纯文本模式没有这项开销。本地CPU测试覆盖40次串行请求及两种比较模式；实际NPU结果需运行后读取报告。
+以后需要数值排查时，可在准备新case时显式使用 `--logits-check true --logits-top-k 100`，启用top-100 logits、完整词表哈希与embedding探针，生成 `logits/serve/`、`embeddings/serve/`、`repeat_comparisons/`。该模式还检查每个TP rank、prefill/decode、实际采样设置和worker身份，报告首个分歧位置。仅显式 `--logits-top-k 0` 的全词表logits落盘可能占用数十至数百GiB；默认纯文本模式没有这项开销。本地CPU测试覆盖40次串行请求及两种比较模式；实际NPU结果需运行后读取报告。

@@ -12,6 +12,7 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import re
 import sys
 
 import numpy as np
@@ -20,7 +21,7 @@ import numpy as np
 STAGES = ("model_logits", "sampler_input", "greedy_input")
 PARAM_DIAGNOSTICS = {"logprobs", "prompt_logprobs", "logprob_token_ids", "detokenize",
                      "skip_special_tokens", "spaces_between_special_tokens", "output_kind",
-                     "include_stop_str_in_output"}
+                     "include_stop_str_in_output", "skip_clone"}
 META_DIAGNOSTICS = {"max_num_logprobs", "logprob_token_ids", "generators"}
 DTYPES = {"torch.bfloat16": (np.dtype("<u2"), 2), "torch.float16": (np.dtype("<f2"), 2),
           "torch.float32": (np.dtype("<f4"), 4), "torch.float64": (np.dtype("<f8"), 8)}
@@ -45,6 +46,22 @@ def differences(left, right, excluded=()):
             if key not in excluded and left.get(key, "<absent>") != right.get(key, "<absent>")}
 
 
+def sampling_value(key, value):
+    """Normalize only vLLM's two documented disabled-top-k spellings.
+
+    Keep nonzero top-k changes visible even in greedy runs, and retain the
+    original observed params in capture files and representation diagnostics.
+    """
+    if key == "top_k" and type(value) is int and value in (-1, 0):
+        return 0
+    return value
+
+
+def sampling_differences(left, right):
+    return differences({k: sampling_value(k, v) for k, v in left.items()},
+                       {k: sampling_value(k, v) for k, v in right.items()}, PARAM_DIAGNOSTICS)
+
+
 def _portable(value):
     # Source paths can differ across hosts. The actual code SHA/class must match.
     if isinstance(value, dict):
@@ -58,7 +75,42 @@ def _opaque(value):
     return any(_opaque(v) for v in value) if isinstance(value, list) else False
 
 
+def _load_topk(summary):
+    shape, count = summary.get("shape"), summary.get("requested_top_k")
+    if (summary.get("storage") != "topk_json" or summary.get("dtype") not in DTYPES
+            or not isinstance(shape, list) or len(shape) != 2 or shape[0] != 1
+            or type(shape[1]) is not int or shape[1] < 1 or type(count) is not int or count < 1
+            or summary.get("sha256_scope") != "full_vocab_original_dtype_bytes"
+            or not re.fullmatch(r"[0-9a-f]{64}", summary.get("sha256", ""))):
+        raise ValueError("invalid top-K shape/dtype/full-vocab fingerprint")
+    payload = summary["topk"]
+    ids, values = payload["token_ids_local"], payload["logits"]
+    expected = min(count, shape[1])
+    if (not isinstance(ids, list) or not isinstance(values, list) or len(ids) != expected
+            or len(values) != expected or summary.get("stored_shape") != [1, expected]
+            or any(type(i) is not int or not 0 <= i < shape[1] for i in ids) or len(set(ids)) != len(ids)
+            or canonical_hash(payload) != summary.get("topk_sha256")):
+        raise ValueError("invalid/missing/corrupt top-K payload")
+    if any(type(v) not in (int, float) and v != "-inf" for v in values):
+        raise ValueError("invalid top-K value type")
+    numeric = np.array([float(v) for v in values], dtype=np.float64)
+    if np.isnan(numeric).any() or np.isposinf(numeric).any() or not np.isfinite(numeric[0]):
+        raise ValueError("invalid top-K logits")
+    if sorted(zip(ids, numeric), key=lambda x: (-x[1], x[0])) != list(zip(ids, numeric)):
+        raise ValueError("top-K not in score/token-ID order")
+    top10 = [{"token_id_local": i, "logit": v} for i, v in zip(ids[:10], values[:10])]
+    if summary.get("argmax_local") != ids[0] or summary.get("top10") != top10:
+        raise ValueError("top-K does not match observed argmax/top10")
+    return {"token_ids": np.array(ids, dtype=np.int64), "values": numeric}
+
+
 def load_vectors(path, record):
+    if record.get("tensor_storage") == "topk_json":
+        if record.get("tensor_file"):
+            raise ValueError("unexpected dense payload in top-K record")
+        return {stage: _load_topk(record["logits"][stage]) for stage in STAGES}
+    if any(s.get("storage") == "topk_json" for s in record["logits"].values()):
+        raise ValueError("top-K record missing tensor_storage tag")
     name = record.get("tensor_file")
     if not name:
         if record["tp_rank"] == 0 or record["enable_reduce_sample"]:
@@ -95,12 +147,39 @@ def vector_difference(left, right, a=None, b=None):
               "serve_shape": left["shape"], "rollout_shape": right["shape"],
               "serve_top10": left["top10"], "rollout_top10": right["top10"],
               "serve_top1_top2_margin": left.get("top1_top2_margin"),
-              "rollout_top1_top2_margin": right.get("top1_top2_margin")}
+              "rollout_top1_top2_margin": right.get("top1_top2_margin"),
+              "equality_scope": "full_vocab_bytes_sha256",
+              "numeric_comparison_scope": "not_computed"}
+    if a is not None and b is not None and (isinstance(a, dict) or isinstance(b, dict)):
+        if left["shape"] != right["shape"]:
+            return result
+        def sparse(value):
+            if isinstance(value, dict):
+                return value["token_ids"], value["values"]
+            flat = value.reshape(-1)
+            return np.arange(flat.size), flat
+        ai, av = sparse(a)
+        bi, bv = sparse(b)
+        common, aix, bix = np.intersect1d(ai, bi, assume_unique=True, return_indices=True)
+        x, y = av[aix], bv[bix]
+        finite = np.isfinite(x) & np.isfinite(y)
+        delta = np.abs(x[finite] - y[finite])
+        a_only, b_only = np.setdiff1d(ai, bi), np.setdiff1d(bi, ai)
+        result.update(numeric_comparison_scope="stored_token_id_intersection",
+                      compared_token_count=int(common.size), serve_stored_token_count=int(ai.size),
+                      rollout_stored_token_count=int(bi.size), stored_token_ids_equal=not a_only.size and not b_only.size,
+                      serve_only_token_count=int(a_only.size), rollout_only_token_count=int(b_only.size),
+                      serve_only_token_ids_first100=a_only[:100].tolist(), rollout_only_token_ids_first100=b_only[:100].tolist(),
+                      topk_max_abs_difference_finite=float(delta.max()) if delta.size else None,
+                      topk_mean_abs_difference_finite=float(delta.mean()) if delta.size else None,
+                      topk_numeric_mismatched_elements=int(np.count_nonzero(x != y)),
+                      topk_masking_differences=int(np.count_nonzero(np.isneginf(x) != np.isneginf(y))))
+        return result
     if a is not None and b is not None and a.shape == b.shape:
         finite = np.isfinite(a) & np.isfinite(b)
         delta = np.abs(a[finite] - b[finite])
         indices = np.argwhere(a != b)
-        result.update(max_abs_difference_finite=float(delta.max()) if delta.size else 0.0,
+        result.update(numeric_comparison_scope="full_vocab", max_abs_difference_finite=float(delta.max()) if delta.size else 0.0,
                       mean_abs_difference_finite=float(delta.mean()) if delta.size else 0.0,
                       masking_differences=int(np.count_nonzero(np.isneginf(a) != np.isneginf(b))),
                       numeric_mismatched_elements=int(indices.shape[0]),
@@ -226,14 +305,20 @@ def compare_case(root, case, rows, *, loaded=None):
             for step in sorted(set(left) & set(right)):
                 lp, a = left[step]
                 rp, b = right[step]
-                params = differences(a["sampling_params"], b["sampling_params"], PARAM_DIAGNOSTICS)
+                params = sampling_differences(a["sampling_params"], b["sampling_params"])
                 sampler_call_diff = differences(a.get("sampler_call", {}), b.get("sampler_call", {}),
                                                 {"logprobs_mode_override"})
                 diagnostics = differences(a["sampling_params"], b["sampling_params"])
-                diagnostics = {k: v for k, v in diagnostics.items() if k in PARAM_DIAGNOSTICS}
+                diagnostics = {k: v for k, v in diagnostics.items() if k not in params}
                 requested = {side: {k: {"requested": v, "actual": rec["sampling_params"].get(k, "<absent>")}
-                                    for k, v in case["sampling"].items() if rec["sampling_params"].get(k) != v}
+                                    for k, v in case["sampling"].items()
+                                    if sampling_value(k, rec["sampling_params"].get(k, "<absent>")) != sampling_value(k, v)}
                              for side, rec in (("serve", a), ("rollout", b))}
+                normalizations = {side: {k: {"requested": v, "actual": rec["sampling_params"][k]}
+                                         for k, v in case["sampling"].items()
+                                         if k in rec["sampling_params"] and rec["sampling_params"][k] != v
+                                         and k not in requested[side]}
+                                  for side, rec in (("serve", a), ("rollout", b))}
                 greedy_ok = all(r.get("all_greedy") is True and r.get("all_random") is False
                                 and r.get("greedy_output_matches_sampled") is True for r in (a, b))
                 bonus = any(r.get("sampler_call", {}).get("predict_bonus_token", False) for r in (a, b))
@@ -262,6 +347,7 @@ def compare_case(root, case, rows, *, loaded=None):
                           "sampling_equal": not params and not any(requested.values()) and greedy_ok
                                             and not sampler_call_diff and not bonus,
                           "diagnostic_parameter_differences": diagnostics,
+                          "requested_parameter_normalizations": normalizations,
                           "metadata_differences": differences(_portable(a["sampling_metadata"]),
                                                               _portable(b["sampling_metadata"]), META_DIAGNOSTICS),
                           "logits": {}}
@@ -346,6 +432,8 @@ def compare_case(root, case, rows, *, loaded=None):
                          "status_counts": {s: statuses.count(s) for s in sorted(set(statuses))},
                          "scope": "Actual model output, sampler input and greedy input; same prefix only. "
                                   "Prefill predicts token 0; decode predicts tokens 1 onward. "
+                                  "Byte equality uses full-vocab SHA256 even with top-K storage; "
+                                  "topk_* numeric metrics cover only stored token-ID intersections. "
                                   "Runtime differences are evidence, not automatic causal attribution."},
             "samples": samples}
 

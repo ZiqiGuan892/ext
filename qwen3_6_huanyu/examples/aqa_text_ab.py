@@ -93,8 +93,15 @@ def prepare_case(args):
     if logits_max_steps < 0:
         raise ValueError("logits-max-steps must be nonnegative")
     logits_max_steps = logits_max_steps or args.max_tokens
+    logits_top_k = getattr(args, "logits_top_k", 100)
+    if type(logits_top_k) is not int or logits_top_k < 0:
+        raise ValueError("logits-top-k must be a nonnegative integer (0=full)")
     if logits_check and getattr(args, "embedding_check", "false") != "true":
         raise ValueError("logits-check requires embedding-check=true for request/input identity")
+    forward_check = getattr(args, "forward_check", "false") == "true"
+    forward_steps = getattr(args, "forward_max_steps", 2)
+    if forward_check and (not logits_check or not 1 <= forward_steps <= logits_max_steps):
+        raise ValueError("forward-check requires logits-check and 1 <= forward-max-steps <= logits-max-steps")
     source = Path(args.parquet).expanduser().resolve(strict=True)
     export = Path(args.export_dir).expanduser().resolve(strict=True)
     model = Path(args.model_path).expanduser().resolve(strict=True)
@@ -166,8 +173,9 @@ def prepare_case(args):
         "enable_thinking": args.enable_thinking == "true",
         "embedding_check": {"enabled": getattr(args, "embedding_check", "false") == "true",
                             "scope": "llm_inputs_embeds", "strict": True, "expected_tp_size": args.tp},
-        "logits_check": {"enabled": logits_check, "max_steps": logits_max_steps,
+        "logits_check": {"enabled": logits_check, "max_steps": logits_max_steps, "top_k": logits_top_k,
                          "scope": "model_logits_sampler_input_greedy_input", "strict": True},
+        "forward_check": {"enabled": forward_check, "max_steps": forward_steps},
         "sampling": {"max_tokens": args.max_tokens, "temperature": 0, "top_p": 1, "top_k": -1,
                      "n": 1, "seed": args.seed, "min_tokens": 0, "ignore_eos": False,
                      "repetition_penalty": 1, "frequency_penalty": 0, "presence_penalty": 0},
@@ -450,6 +458,12 @@ def main(argv=None):
                          help="Enable Ascend RL batch invariance on both engines; requires installed custom ops")
     prepare.add_argument("--logits-max-steps", type=int, default=0,
                          help="0 captures through max-tokens/EOS; positive values limit capture. Start with sample-size 4")
+    prepare.add_argument("--logits-top-k", type=int, default=100,
+                         help="Store top-K logits/IDs plus full-vocab SHA256; default 100, 0 stores full NPZ vectors")
+    prepare.add_argument("--forward-check", choices=("true", "false"), default="false",
+                         help="Hash actual LLM layer/submodule boundaries; requires logits-check")
+    prepare.add_argument("--forward-max-steps", type=int, default=2,
+                         help="Bound forward hashing: 1=prefill, 2=prefill plus first decode; no activation payloads")
     prepare.set_defaults(function=prepare_case)
     serve = commands.add_parser("serve", help="Send the shared case to an already-running HTTP service")
     serve.add_argument("--case-dir", required=True)

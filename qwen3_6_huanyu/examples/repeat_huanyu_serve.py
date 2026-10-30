@@ -46,15 +46,21 @@ def prepare(args):
     table_rows = {r["extra_info"]["huanyu_text_ab"]["sample_id"]: r for r in source_table.to_pylist()}
     root = Path(args.output_dir).expanduser().resolve()
     case = copy.deepcopy(original)
+    # Layer tracing is an explicit A/B experiment, not inherited by repeats.
+    case["forward_check"] = {"enabled": False, "max_steps": 2}
     case.update(case_id=uuid.uuid4().hex, sample_size=len(args.samples) * args.repeats)
     # Repeat is a new experiment: the source case supplies inputs, not the
     # batch-invariance policy. A source with this option enabled must not
     # reactivate the incompatible native kernels in the repeat experiment.
     case["engine"]["batch_invariant"] = False
     logits_check = getattr(args, "logits_check", "false") == "true"
+    logits_top_k = getattr(args, "logits_top_k", 100)
+    if type(logits_top_k) is not int or logits_top_k < 0:
+        raise ValueError("logits-top-k must be a nonnegative integer (0=full)")
     case["embedding_check"] = dict(enabled=logits_check, scope="llm_inputs_embeds", strict=True,
                                    expected_tp_size=case["engine"]["tensor_parallel_size"])
     case["logits_check"] = dict(enabled=logits_check, max_steps=case["sampling"]["max_tokens"] if logits_check else 0,
+                                top_k=logits_top_k,
                                 scope="model_logits_sampler_input_greedy_input", strict=True)
     case["serve_repeat"] = dict(source_case=str(source), source_case_id=original["case_id"],
                                 source_case_sha256=ab.sha256(source / "case.json"),
@@ -386,7 +392,9 @@ def main(argv=None):
     prep.add_argument("--batch-invariant", choices=("true", "false"), default="false",
                       help="Repeat requires false independently of the source case; true is rejected")
     prep.add_argument("--logits-check", choices=("true", "false"), default="false",
-                      help="Default false: compare only text; true enables full logits and input embeddings")
+                      help="Default false: compare only text; true enables logits diagnostics and input embeddings")
+    prep.add_argument("--logits-top-k", type=int, default=100,
+                      help="Default 100: store top-K logits/IDs and full-vocab hash; 0 stores full NPZ vectors")
     prep.set_defaults(func=prepare)
     send = commands.add_parser("request")
     send.add_argument("--case-dir", required=True)

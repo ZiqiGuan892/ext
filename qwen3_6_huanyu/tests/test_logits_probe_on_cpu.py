@@ -104,7 +104,7 @@ class LogitsProbeTests(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.case = {"schema_version": 1, "case_id": CASE, "model_path": str(self.root / "model"),
                      "sample_size": 1, "embedding_check": {"enabled": True, "expected_tp_size": 1},
-                     "logits_check": {"enabled": True, "max_steps": 4},
+                     "logits_check": {"enabled": True, "max_steps": 4, "top_k": 0},
                      "engine": {"tensor_parallel_size": 1},
                      "sampling": {"temperature": 0, "top_p": 1, "top_k": -1, "n": 1,
                                   "seed": 42, "max_tokens": 4, "min_tokens": 0, "ignore_eos": False,
@@ -187,6 +187,57 @@ class LogitsProbeTests(unittest.TestCase):
         self.assertEqual(len(item["prefill"]), 1)
         self.assertEqual(len(item["decode"]), 3)
         self.assertTrue(item["full_generation_captured"])
+
+    def test_disabled_top_k_normalization_and_skip_clone_are_diagnostic(self):
+        for side in ("serve", "rollout"):
+            runner = self.runner(side, params={"top_k": 0, "skip_clone": side == "serve"})
+            for _ in range(4):
+                self.step(runner)
+        report = self.report()
+        self.assertEqual(report["summary"]["status"], "PASS")
+        item = report["samples"][0]
+        self.assertEqual(item["sampling_parameter_differences"], [])
+        first = item["prefill"][0]
+        self.assertTrue(first["sampling_equal"])
+        self.assertEqual(first["diagnostic_parameter_differences"]["skip_clone"],
+                         {"serve": True, "rollout": False})
+        for side in ("serve", "rollout"):
+            self.assertEqual(first["requested_parameter_normalizations"][side]["top_k"],
+                             {"requested": -1, "actual": 0})
+            self.assertEqual(self.events(side)[0][1]["sampling_params"]["top_k"], 0)
+
+    def test_disabled_top_k_aliases_between_sides_preserve_raw_difference(self):
+        for side, top_k in (("serve", -1), ("rollout", 0)):
+            runner = self.runner(side, params={"top_k": top_k})
+            for _ in range(4):
+                self.step(runner)
+        report = self.report()
+        self.assertEqual(report["summary"]["status"], "PASS")
+        self.assertEqual(report["samples"][0]["prefill"][0]["diagnostic_parameter_differences"]["top_k"],
+                         {"serve": -1, "rollout": 0})
+
+    def test_nonzero_top_k_override_is_still_reported(self):
+        for side, top_k in (("serve", 0), ("rollout", 20)):
+            runner = self.runner(side, params={"top_k": top_k})
+            for _ in range(4):
+                self.step(runner)
+        item = self.report()["samples"][0]
+        self.assertEqual(item["status"], "DIFFERENT")
+        diff = item["sampling_parameter_differences"][0]
+        self.assertIn("top_k", diff["between_sides"])
+        self.assertEqual(diff["vs_case"]["rollout"]["top_k"], {"requested": -1, "actual": 20})
+
+    def test_parameter_normalization_cannot_hide_a_prefill_logit_difference(self):
+        for side in ("serve", "rollout"):
+            runner = self.runner(side, params={"top_k": 0, "skip_clone": side == "serve"})
+            for _ in range(4):
+                self.step(runner, [1, 2, 3, 0] if side == "serve" else [1, 2, 3.25, 0])
+        item = self.report()["samples"][0]
+        self.assertEqual(item["status"], "DIFFERENT")
+        self.assertEqual(item["sampling_parameter_differences"], [])
+        self.assertEqual(item["first_different_logits"],
+                         {"step": 0, "phase": "prefill", "boundary": "model_logits", "tp_rank": 0})
+        self.assertIsNone(item["first_different_token"])
 
     def test_worker_determinism_is_observed_without_importing_or_mutating_ascend(self):
         module = ModuleType("vllm_ascend.batch_invariant")
@@ -364,12 +415,117 @@ class LogitsProbeTests(unittest.TestCase):
             self.step(runner)
 
     def test_bf16_negative_infinity_and_signed_zero_preserved(self):
-        summary, raw = probe.capture_vector(torch.tensor([[-0.0, float("-inf"), 2.0]], dtype=torch.bfloat16))
+        summary, raw = probe.capture_vector(torch.tensor([[-0.0, float("-inf"), 2.0]], dtype=torch.bfloat16), top_k=0)
         self.assertEqual(summary["negative_inf_count"], 1)
         self.assertEqual(summary["argmax_local"], 2)
         self.assertEqual(raw.shape, (1, 6))
         other, _ = probe.capture_vector(torch.tensor([[0.0, float("-inf"), 2.0]], dtype=torch.bfloat16))
         self.assertNotEqual(summary["sha256"], other["sha256"])
+
+    def test_default_top100_bounded_storage_and_full_vocab_hash(self):
+        tensor = torch.arange(248320, dtype=torch.float32).reshape(1, -1)
+        summary, raw = probe.capture_vector(tensor)
+        self.assertIsNone(raw)
+        self.assertEqual(summary["stored_shape"], [1, 100])
+        self.assertEqual(summary["shape"], [1, 248320])
+        self.assertEqual(summary["topk"]["token_ids_local"], list(range(248319, 248219, -1)))
+        self.assertLess(len(json.dumps(summary)), 5000)
+        full, raw = probe.capture_vector(tensor, top_k=0)
+        self.assertEqual(summary["sha256"], full["sha256"])
+        self.assertEqual(raw.size, 248320 * 4)
+
+    def test_compact_prefill_decode_matches_without_npz_or_sampling_changes(self):
+        self.case["logits_check"]["top_k"] = 100
+        self.both()
+        report = self.report()
+        self.assertEqual(report["summary"]["status"], "PASS")
+        self.assertFalse(list((self.root / "logits").rglob("*.npz")))
+        self.assertEqual(self.events("serve")[0][1]["sampling_params"]["top_k"], -1)
+        value = report["samples"][0]["prefill"][0]["logits"]["model_logits"]
+        self.assertEqual(value["numeric_comparison_scope"], "stored_token_id_intersection")
+        self.assertEqual(value["topk_max_abs_difference_finite"], 0.0)
+        self.assertNotIn("max_abs_difference_finite", value)
+
+    def test_change_outside_top100_cannot_pass(self):
+        self.case["logits_check"]["top_k"] = 100
+        for side in ("serve", "rollout"):
+            runner = self.runner(side)
+            vector = list(range(128, 0, -1))
+            if side == "rollout":
+                vector[-1] += 0.25
+            for _ in range(4):
+                self.step(runner, vector)
+        item = self.report()["samples"][0]
+        self.assertEqual(item["status"], "DIFFERENT")
+        self.assertEqual(item["first_different_logits"]["step"], 0)
+        v = item["prefill"][0]["logits"]["model_logits"]
+        self.assertFalse(v["bytes_equal"])
+        self.assertEqual(v["topk_numeric_mismatched_elements"], 0)
+        self.assertTrue(v["stored_token_ids_equal"])
+
+    def test_topk_compares_by_token_id_not_rank_position(self):
+        a, _ = probe.capture_vector(torch.tensor([[10., 9., 8., 0.]]), top_k=3)
+        b, _ = probe.capture_vector(torch.tensor([[10., 7., 8., 9.]]), top_k=3)
+        result = compare.vector_difference(a, b, compare._load_topk(a), compare._load_topk(b))
+        self.assertEqual(result["compared_token_count"], 2)
+        self.assertEqual(result["topk_max_abs_difference_finite"], 0.0)
+        self.assertEqual(result["serve_only_token_ids_first100"], [1])
+        self.assertEqual(result["rollout_only_token_ids_first100"], [3])
+
+    def test_ties_at_topk_cutoff_choose_lowest_ids(self):
+        tensor = torch.tensor([[2., 2., 2., 1., float("-inf")]], dtype=torch.bfloat16)
+        summary, _ = probe.capture_vector(tensor, top_k=2)
+        self.assertEqual(summary["topk"]["token_ids_local"], [0, 1])
+        self.assertEqual(summary["max_tie_count"], 3)
+        self.assertEqual(summary["top1_top2_margin"], 0)
+        compare._load_topk(summary)
+        summary, _ = probe.capture_vector(tensor, top_k=100)
+        self.assertEqual(summary["stored_shape"], [1, 5])
+        self.assertEqual(summary["topk"]["logits"][-1], "-inf")
+        compare._load_topk(summary)
+
+    def test_full_and_topk_records_can_be_compared(self):
+        for side, count in (("serve", 0), ("rollout", 2)):
+            self.case["logits_check"]["top_k"] = count
+            runner = self.runner(side)
+            for _ in range(4):
+                self.step(runner)
+        self.assertEqual(self.report()["summary"]["status"], "PASS")
+
+    def test_corrupt_or_missing_topk_payload_never_passes(self):
+        self.case["logits_check"]["top_k"] = 100
+        self.both()
+        path, event = self.events("serve")[0]
+        for mode in ("corrupt", "missing", "duplicate_ids"):
+            broken = copy.deepcopy(event)
+            if mode == "missing":
+                del broken["logits"]["model_logits"]["topk"]
+            elif mode == "corrupt":
+                broken["logits"]["model_logits"]["topk"]["logits"][0] += 1
+            else:
+                value = broken["logits"]["model_logits"]
+                value["topk"]["token_ids_local"][1] = value["topk"]["token_ids_local"][0]
+                value["topk_sha256"] = compare.canonical_hash(value["topk"])
+            path.write_text(json.dumps(broken), encoding="utf-8")
+            self.assertEqual(self.report()["summary"]["status"], "INCOMPLETE")
+
+    def test_compact_sharded_vocab_still_verifies_global_argmax(self):
+        self.case["logits_check"]["top_k"] = 100
+        self.case["engine"]["tensor_parallel_size"] = 2
+        self.case["sampling"]["max_tokens"] = 1
+        with patch.object(_ascend_fixture, "enabled", True):
+            for side in ("serve", "rollout"):
+                for rank in range(2):
+                    with patch.object(_ascend_fixture, "rank", rank):
+                        runner = self.runner(side, rank=rank, tp=2, reduced=True, sampler_type=SuppliedAscendSampler)
+                        self.step(runner, [1, 2, 3, 0] if rank == 0 else [1, 5, 2, 0])
+        self.assertEqual(self.report()["summary"]["status"], "PASS")
+        self.assertFalse(list((self.root / "logits").rglob("*.npz")))
+
+    def test_invalid_capture_topk_rejected(self):
+        for value in (-1, True, 1.5):
+            with self.assertRaisesRegex(ValueError, "top_k"):
+                probe.capture_vector(torch.ones(1, 4), top_k=value)
 
     def test_nan_and_bad_batch_rejected(self):
         for tensor in (torch.tensor([[float("nan"), 1.0]]), torch.zeros(2, 4), torch.tensor([[float("-inf")]])):
