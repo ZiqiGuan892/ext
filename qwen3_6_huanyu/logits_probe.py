@@ -398,6 +398,9 @@ def _bind_sampler(runner, state):
                         arrays[key] = raw
                 event["tensor_keys"] = aliases
             _write(state, event, arrays)
+            if state["case"].get("forward_check", {}).get("until_eos"):
+                from .forward_probe import record_termination
+                record_termination(state, event)
             if identity["step"] == 0:
                 print("[huanyu-logits-ab] side=%s sample=%s tp=%s all_greedy=%s reduce_sample=%s params=%s" %
                       (state["side"], identity["sample_id"], state["tp_rank"], event.get("all_greedy"),

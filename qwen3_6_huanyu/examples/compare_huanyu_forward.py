@@ -75,12 +75,16 @@ def compare_case(root, case, rows):
         raise ValueError("case requires --forward-check true")
     steps, tp = check["max_steps"], case["engine"]["tensor_parallel_size"]
     expected = {r["sample_id"] for r in rows}
-    records, errors = {}, []
+    until_eos = check.get("until_eos", False)
+    records, terminals, errors = {}, {}, []
+    streams = defaultdict(dict)
     for side in ("serve", "rollout"):
         for path in sorted((Path(root) / "forward" / side).glob("*.json")):
             try:
                 r = read(path)
-                if (r.get("format") != "huanyu_forward_v1" or r.get("case_id") != case["case_id"]
+                terminal = r.get("kind") == "termination"
+                expected_format = "huanyu_forward_termination_v1" if terminal else "huanyu_forward_v1"
+                if (r.get("format") != expected_format or r.get("case_id") != case["case_id"]
                         or r.get("side") != side or r.get("tp_size") != tp
                         or r.get("sample_id") not in expected or r.get("status") != "CAPTURED"
                         or type(r.get("tp_rank")) is not int or not 0 <= r["tp_rank"] < tp
@@ -93,6 +97,23 @@ def compare_case(root, case, rows):
                     raise ValueError("prefix/phase mismatch")
                 if any(type(v) is not int or v < 0 for v in r["prompt_token_ids"] + r["prefix_token_ids"]):
                     raise ValueError("invalid token IDs")
+                if terminal:
+                    params, selected = r["sampling_params"], r["sampled_token_ids"]
+                    if (not until_eos or len(selected) != 1 or type(selected[0]) is not int or selected[0] < 0
+                            or params["max_tokens"] != case["sampling"]["max_tokens"]
+                            or type(params["ignore_eos"]) is not bool or type(params["min_tokens"]) is not int):
+                        raise ValueError("invalid termination sampling evidence")
+                    stop_ids = params.get("all_stop_token_ids", params.get("stop_token_ids", [])) or []
+                    reason = ("max_tokens" if r["step"] + 1 == params["max_tokens"] else
+                              "stop_token" if not params["ignore_eos"] and r["step"] + 1 >= params["min_tokens"]
+                              and selected[0] in stop_ids else None)
+                    if reason is None or r["terminal_evidence"] != reason:
+                        raise ValueError("invalid termination reason")
+                    key = (r["sample_id"], side, r["tp_rank"])
+                    if key in terminals:
+                        raise ValueError("duplicate termination marker")
+                    terminals[key] = r
+                    continue
                 observed = [(e["name"], e["boundary"]) for e in r["events"]]
                 if (not r["required"] or not {"llm", "norm", "compute_logits"}.issubset(r["required"])
                         or len(set(observed)) != len(observed)
@@ -103,20 +124,71 @@ def compare_case(root, case, rows):
                 key = (r["sample_id"], side, r["step"], r["tp_rank"])
                 if key in records:
                     raise ValueError("duplicate sample/step/rank: use a new case directory")
-                records[key] = r
+                # Full-generation traces can contain hundreds of thousands of
+                # module trees. Keep a small index and load only one pair of
+                # trees for the actual comparison, rather than retaining all
+                # activation fingerprints in RAM.
+                records[key] = {"path": path, "runtime_id": r["runtime_id"],
+                                "prompt_token_sha256": r["prompt_token_sha256"],
+                                "prefix_token_sha256": r["prefix_token_sha256"]}
+                streams[(r["sample_id"], side, r["tp_rank"])][r["step"]] = records[key]
             except (OSError, ValueError, KeyError, TypeError) as error:
                 errors.append({"file": str(path), "error": str(error)})
     samples = []
     for sample in sorted(expected):
         item = {"sample_id": sample, "status": "MATCH_CAPTURED_BOUNDARIES", "steps": [],
-                "first_difference": None, "issues": []}
+                "first_difference": None, "issues": [], "coverage": [], "unpaired_after_termination": 0}
         runtimes = defaultdict(set)
-        for step in range(steps):
+        ends = {}
+        if until_eos:
+            for side in ("serve", "rollout"):
+                endings = set()
+                prefix_hashes = {}
+                for rank in range(tp):
+                    terminal = terminals.get((sample, side, rank))
+                    observed_steps = sorted(streams[(sample, side, rank)])
+                    if terminal is None:
+                        item["issues"].append("missing termination evidence side=%s rank=%d" % (side, rank))
+                        continue
+                    count = terminal["step"] + 1
+                    ends[(side, rank)] = count
+                    endings.add((count, terminal["prefix_token_sha256"], tuple(terminal["sampled_token_ids"])))
+                    complete = observed_steps == list(range(count))
+                    item["coverage"].append({"side": side, "tp_rank": rank, "generated_steps": count,
+                                             "captured_steps": len(observed_steps), "complete": complete,
+                                             "terminal_evidence": terminal["terminal_evidence"]})
+                    if not complete:
+                        item["issues"].append("non-contiguous/truncated forward capture side=%s rank=%d" % (side, rank))
+                    for index in observed_steps:
+                        rec = records[(sample, side, index, rank)]
+                        history_key = (terminal["prefix_token_sha256"], index)
+                        if history_key not in prefix_hashes:
+                            prefix_hashes[history_key] = canonical_hash(terminal["prefix_token_ids"][:index])
+                        if (rec["runtime_id"] != terminal["runtime_id"]
+                                or rec["prompt_token_sha256"] != terminal["prompt_token_sha256"]
+                                or rec["prefix_token_sha256"] != prefix_hashes[history_key]):
+                            item["issues"].append("forward history disagrees with termination side=%s rank=%d step=%d" % (side, rank, index))
+                if len(endings) > 1:
+                    item["issues"].append("TP ranks disagree on termination side=" + side)
+        compared_steps = (max([index + 1 for side in ("serve", "rollout") for rank in range(tp)
+                              for index in streams[(sample, side, rank)]] + list(ends.values()) + [0])
+                          if until_eos else steps)
+        for step in range(compared_steps):
             rank_prefixes = defaultdict(set)
             for rank in range(tp):
                 a, b = (records.get((sample, side, step, rank)) for side in ("serve", "rollout"))
                 if a is None or b is None:
+                    if until_eos and all(r is not None or step >= ends.get((side, rank), steps)
+                                         for side, r in (("serve", a), ("rollout", b))):
+                        if a is not None or b is not None:
+                            item["unpaired_after_termination"] += 1
+                        continue
                     item["issues"].append("missing step=%d rank=%d" % (step, rank))
+                    continue
+                try:
+                    a, b = read(a["path"]), read(b["path"])
+                except (OSError, ValueError) as error:
+                    item["issues"].append("cannot reload step=%d rank=%d: %s" % (step, rank, error))
                     continue
                 for side, r in (("serve", a), ("rollout", b)):
                     runtimes[(side, rank)].add(r["runtime_id"])
@@ -131,19 +203,30 @@ def compare_case(root, case, rows):
                     if a["required"] != b["required"]:
                         row["first_difference"] = {"reason": "required boundary topology differs"}
                     else:
-                        for x, y in zip(a["events"], b["events"]):
+                        equal_inputs, last_equal = set(), None
+                        for event_index, (x, y) in enumerate(zip(a["events"], b["events"])):
                             if (x["name"], x["boundary"]) != (y["name"], y["boundary"]):
                                 row["first_difference"] = {"reason": "execution order differs", "serve": x["name"] + "." + x["boundary"],
-                                                           "rollout": y["name"] + "." + y["boundary"]}
+                                                           "rollout": y["name"] + "." + y["boundary"],
+                                                           "event_index": event_index, "last_equal_boundary": last_equal}
                                 break
                             delta = first_difference(x["value"], y["value"])
                             if delta:
-                                row["first_difference"] = {"name": x["name"], "boundary": x["boundary"], "difference": delta}
+                                row["first_difference"] = {"name": x["name"], "boundary": x["boundary"], "difference": delta,
+                                                           "event_index": event_index, "last_equal_boundary": last_equal,
+                                                           "module_input_equal": x["name"] in equal_inputs}
                                 break
+                            last_equal = {"name": x["name"], "boundary": x["boundary"]}
+                            if x["boundary"] == "input":
+                                equal_inputs.add(x["name"])
                         if row["first_difference"] is None and len(a["events"]) != len(b["events"]):
                             row["first_difference"] = {"reason": "executed boundary counts differ"}
-                    if row["first_difference"] and item["first_difference"] is None:
-                        item["first_difference"] = {k: row[k] for k in ("step", "phase", "tp_rank", "first_difference")}
+                    if row["first_difference"]:
+                        candidate = {k: row[k] for k in ("step", "phase", "tp_rank", "first_difference")}
+                        def order(value):
+                            return (value["step"], value["first_difference"].get("event_index", -1), value["tp_rank"])
+                        if item["first_difference"] is None or order(candidate) < order(item["first_difference"]):
+                            item["first_difference"] = candidate
                 item["steps"].append(row)
             if any(len(v) > 1 for v in rank_prefixes.values()):
                 item["issues"].append("TP ranks disagree on prefix step=%d" % step)
@@ -155,11 +238,14 @@ def compare_case(root, case, rows):
             item["issues"].append("different decode prefixes: cannot compare forward outputs")
         if errors or item["issues"]:
             item["status"] = "INCOMPLETE"
+        item["full_generation_captured"] = bool(until_eos and not errors and not item["issues"]
+                                                and len(item["coverage"]) == 2 * tp
+                                                and all(c["complete"] for c in item["coverage"]))
         samples.append(item)
     status = "INCOMPLETE" if errors or not samples or any(s["status"] == "INCOMPLETE" for s in samples) else (
         "DIFFERENT" if any(s["status"] == "DIFFERENT" for s in samples) else "MATCH_CAPTURED_BOUNDARIES")
     return {"summary": {"case_id": case["case_id"], "status": status, "samples": len(samples),
-                        "max_steps": steps, "errors": errors,
+                        "max_steps": steps, "until_eos": until_eos, "errors": errors,
                         "scope": "Full tensor hashes at observed boundaries on common prefixes; no activation values stored. "
                                  "Matching hashes do not prove unobserved kernels/cache states or later steps equal. "
                                  "Runtime/metadata differences alone do not establish causation."}, "samples": samples}

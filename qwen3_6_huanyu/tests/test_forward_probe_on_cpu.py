@@ -105,6 +105,19 @@ class Native(torch.nn.Module):
         return hidden_states[-1:, :]
 
 
+class GreedySampler(torch.nn.Module):
+    @staticmethod
+    def greedy_sample(logits):
+        return logits.argmax(dim=-1).view(-1)
+
+    def sample(self, logits, sampling_metadata):
+        return self.greedy_sample(logits), None
+
+    def forward(self, logits, sampling_metadata, predict_bonus_token=False):
+        selected, _ = self.sample(logits.float(), sampling_metadata)
+        return NS(sampled_token_ids=selected[:, None].int())
+
+
 class ForwardProbeTests(unittest.TestCase):
     def setUp(self):
         base = ROOT.parents[2] / "artifacts/forward_probe_tests"
@@ -123,7 +136,7 @@ class ForwardProbeTests(unittest.TestCase):
         native.thinker.llm.model.use_sequence_parallel = sequence_parallel
         state = {"root": self.root, "side": side, "case": self.case, "rows": {SAMPLE: {}},
                  "tp_rank": rank, "tp_size": self.case["engine"]["tensor_parallel_size"],
-                 "runtime_id": side + str(rank), "history": {}, "max_steps": 2}
+                 "runtime_id": side + str(rank), "history": {}, "max_steps": self.case["logits_check"]["max_steps"]}
         setattr(native, probe._MARKER, state)
         runner = NS(model=native, input_batch=NS(req_ids=[REQUEST]),
                     requests={REQUEST: NS(prompt_token_ids=[8, 9], output_token_ids=[])})
@@ -170,6 +183,168 @@ class ForwardProbeTests(unittest.TestCase):
         self.assertEqual(first["step"], 0)
         self.assertEqual(first["first_difference"]["name"], "layers.1.self_attn")
         self.assertEqual(first["first_difference"]["boundary"], "output")
+        self.assertTrue(first["first_difference"]["module_input_equal"])
+        self.assertEqual(first["first_difference"]["last_equal_boundary"],
+                         {"name": "layers.1.self_attn", "boundary": "input"})
+
+    def full_case(self, limit=4):
+        self.case["sampling"] = {"max_tokens": limit}
+        self.case["logits_check"]["max_steps"] = limit
+        self.case["forward_check"].update(max_steps=limit, until_eos=True)
+
+    def terminate(self, state, prefix, *, reason="stop_token", selected=9, status="complete"):
+        prompt = [8, 9]
+        event = dict(request_id=REQUEST, sample_id=SAMPLE, step=len(prefix),
+                     phase="decode" if prefix else "prefill", prompt_token_ids=prompt,
+                     prompt_token_sha256=compare.canonical_hash(prompt), prefix_token_ids=prefix,
+                     prefix_token_sha256=compare.canonical_hash(prefix), sampled_token_ids=[selected],
+                     terminal_evidence=reason, status=status,
+                     sampling_params={"max_tokens": self.case["sampling"]["max_tokens"],
+                                      "ignore_eos": False, "min_tokens": 0, "all_stop_token_ids": [9]})
+        forward.record_termination(state, event)
+
+    def full_both(self, lengths=(2, 2)):
+        for side, count in zip(("serve", "rollout"), lengths):
+            runner, state = self.runner(side)
+            for step in range(count):
+                self.step(runner, state, [1] * step)
+            reason = "max_tokens" if count == self.case["sampling"]["max_tokens"] else "stop_token"
+            self.terminate(state, [1] * (count - 1), reason=reason)
+
+    def test_early_eos_is_complete_without_fictitious_missing_decode(self):
+        self.full_case()
+        self.full_both()
+        item = self.report()["samples"][0]
+        self.assertEqual(item["status"], "MATCH_CAPTURED_BOUNDARIES")
+        self.assertEqual(item["issues"], [])
+        self.assertTrue(item["full_generation_captured"])
+        self.assertEqual([c["generated_steps"] for c in item["coverage"]], [2, 2])
+
+    def test_real_sampler_closes_trace_after_separate_execute_and_sample_calls(self):
+        self.full_case()
+        for side in ("serve", "rollout"):
+            runner, state = self.runner(side)
+            state["config"] = {}
+            runner.execute_model = runner.model.compute_logits
+            runner.sampler = GreedySampler()
+            runner.requests[REQUEST].sampling_params = NS(
+                temperature=0, top_p=1, top_k=-1, n=1, seed=42, max_tokens=4,
+                min_tokens=0, ignore_eos=False, repetition_penalty=1,
+                frequency_penalty=0, presence_penalty=0, stop=[],
+                stop_token_ids=[3], all_stop_token_ids=[3])
+            metadata = NS(all_greedy=True, all_random=False, temperature=None,
+                          top_p=None, top_k=None)
+            probe._bind_sampler(runner, state)
+            token = probe._ACTIVE.set({"runner": runner, "state": state})
+            try:
+                hidden = runner.model.thinker.llm.model(
+                    None, torch.arange(2), inputs_embeds=torch.arange(8.).reshape(2, 4))
+                logits = runner.model.compute_logits(hidden)
+            finally:
+                probe._ACTIVE.reset(token)
+            self.assertFalse(list((self.root / "forward" / side).glob("*termination*.json")))
+            # Real NPU runners may invoke sample_tokens in a separate context.
+            token = probe._ACTIVE.set({"runner": runner, "state": state})
+            try:
+                result = runner.sampler(logits, metadata)
+            finally:
+                probe._ACTIVE.reset(token)
+            self.assertEqual(result.sampled_token_ids.tolist(), [[3]])
+            marker = next((self.root / "forward" / side).glob("*termination*.json"))
+            self.assertEqual(json.loads(marker.read_text())["terminal_evidence"], "stop_token")
+        item = self.report()["samples"][0]
+        self.assertEqual(item["status"], "MATCH_CAPTURED_BOUNDARIES")
+        self.assertTrue(item["full_generation_captured"])
+
+    def test_first_token_eos_and_length_limit_are_both_valid(self):
+        for count in (1, 4):
+            with self.subTest(count=count):
+                # Each subtest uses a separate case directory, not overwrites.
+                self.root = self.root / str(count)
+                self.root.mkdir()
+                self.full_case()
+                self.full_both((count, count))
+                self.assertTrue(self.report()["samples"][0]["full_generation_captured"])
+
+    def test_deletion_or_invalid_terminal_evidence_cannot_pass(self):
+        self.full_case()
+        self.full_both()
+        marker = next((self.root / "forward/serve").glob("*termination*.json"))
+        original = marker.read_bytes()
+        for mode in ("missing", "bad_stop", "runtime", "history"):
+            with self.subTest(mode=mode):
+                if mode == "missing":
+                    marker.unlink()
+                else:
+                    record = json.loads(original)
+                    if mode == "bad_stop":
+                        record["sampled_token_ids"] = [8]
+                    elif mode == "runtime":
+                        record["runtime_id"] = "other"
+                    else:
+                        record["prefix_token_ids"] = [7]
+                        record["prefix_token_sha256"] = compare.canonical_hash([7])
+                    marker.write_text(json.dumps(record), encoding="utf-8")
+                self.assertEqual(self.report()["summary"]["status"], "INCOMPLETE")
+                marker.write_bytes(original)
+
+    def test_missing_middle_forward_and_duplicate_terminal_are_incomplete(self):
+        self.full_case()
+        self.full_both((4, 4))
+        marker = next((self.root / "forward/serve").glob("*termination*.json"))
+        duplicate = marker.with_name("duplicate.json")
+        duplicate.write_bytes(marker.read_bytes())
+        self.assertEqual(self.report()["summary"]["status"], "INCOMPLETE")
+        duplicate.unlink()
+        next((self.root / "forward/serve").glob("*-step00001-*.json")).unlink()
+        self.assertEqual(self.report()["summary"]["status"], "INCOMPLETE")
+
+    def test_different_termination_lengths_are_reported_without_false_missing_steps(self):
+        self.full_case()
+        self.full_both((1, 2))
+        item = self.report()["samples"][0]
+        self.assertTrue(item["full_generation_captured"])
+        self.assertEqual(item["unpaired_after_termination"], 1)
+
+    def test_late_decode_difference_identifies_module_and_equal_input(self):
+        self.full_case()
+        for side in ("serve", "rollout"):
+            runner, state = self.runner(side)
+            for step in range(4):
+                if side == "rollout" and step == 3:
+                    runner.model.thinker.llm.model.layers[0].linear_attn.delta = 0.25
+                self.step(runner, state, [1] * step)
+            self.terminate(state, [1, 1, 1], reason="max_tokens")
+        first = self.report()["samples"][0]["first_difference"]
+        self.assertEqual(first["step"], 3)
+        self.assertEqual(first["first_difference"]["name"], "layers.0.linear_attn")
+        self.assertTrue(first["first_difference"]["module_input_equal"])
+
+    def test_earliest_module_across_tp_ranks_wins_over_rank_zero(self):
+        self.case["engine"]["tensor_parallel_size"] = 2
+        for side in ("serve", "rollout"):
+            for rank in range(2):
+                runner, state = self.runner(side, rank=rank)
+                if side == "rollout":
+                    llm = runner.model.thinker.llm.model
+                    target = llm.layers[0].linear_attn if rank == 1 else llm.layers[1].self_attn
+                    target.delta = 0.25
+                self.step(runner, state)
+                self.step(runner, state, [1])
+        first = self.report()["samples"][0]["first_difference"]
+        self.assertEqual(first["tp_rank"], 1)
+        self.assertEqual(first["first_difference"]["name"], "layers.0.linear_attn")
+
+    def test_input_difference_is_not_attributed_to_module_internal_arithmetic(self):
+        self.both()
+        path = next((self.root / "forward/rollout").glob("*-step00000-*.json"))
+        record = compare.read(path)
+        entry = next(e for e in record["events"] if e["name"] == "layers.1.self_attn" and e["boundary"] == "input")
+        entry["value"]["hidden_states"]["sha256"] = "0" * 64
+        path.write_text(json.dumps(record), encoding="utf-8")
+        first = self.report()["samples"][0]["first_difference"]["first_difference"]
+        self.assertEqual(first["boundary"], "input")
+        self.assertFalse(first["module_input_equal"])
 
     def test_runtime_flags_not_hidden_by_identical_forward_source(self):
         self.both(sequence_parallel=True)

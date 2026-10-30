@@ -124,14 +124,16 @@ def build_launch(root, case, project, mode, port=28889, served_model="qwen3.8", 
         if (not logits_check or type(steps) is not int
                 or not 1 <= steps <= case["logits_check"]["max_steps"]):
             raise ValueError("forward_check requires logits_check and a valid bounded max_steps")
+        if forward_check.get("until_eos") and steps != max_tokens:
+            raise ValueError("forward_check.until_eos requires max_steps=max_tokens")
     embedding_env = {
         "HUANYU_EMBEDDING_AB_DIR": str(root) if embedding_check and full_weight_audit_dir is None else "",
         "HUANYU_EMBEDDING_AB_SIDE": mode if embedding_check and full_weight_audit_dir is None else "",
     }
     env.update(embedding_env)
-    blocking = "1" if batch_invariant or repeat else env.get("ASCEND_LAUNCH_BLOCKING", "0")
-    if blocking not in ("0", "1"):
-        raise ValueError("ASCEND_LAUNCH_BLOCKING must be 0 or 1")
+    # A/B determinism is independent of batch invariance. Inheriting the shell
+    # here made standalone serve deterministic while Ray workers kept defaults.
+    blocking = "1"
     env.update({
         "PROJECT_ROOT": str(project), "MODEL_PATH": checkpoint,
         "HUANYU_PRECISION_PROFILE": "full", "HUANYU_GRAPH_MODE": "0",
@@ -147,19 +149,18 @@ def build_launch(root, case, project, mode, port=28889, served_model="qwen3.8", 
         "TASK_QUEUE_ENABLE": "0", "ASCEND_LAUNCH_BLOCKING": blocking,
         "HCCL_OP_EXPANSION_MODE": env.get("HCCL_OP_EXPANSION_MODE") or "AIV",
     })
-    deterministic_env = {}
-    if batch_invariant or repeat:
-        deterministic_env = {
-            "HCCL_DETERMINISTIC": "strict" if repeat else "true", "ASCEND_LAUNCH_BLOCKING": "1",
-            "NCCL_DETERMINISTIC": "1", "LCCL_DETERMINISTIC": "1",
-        }
-        env.update(deterministic_env)
+    deterministic_env = {
+        "HCCL_DETERMINISTIC": "true" if batch_invariant else "strict", "ASCEND_LAUNCH_BLOCKING": "1",
+        "NCCL_DETERMINISTIC": "1", "LCCL_DETERMINISTIC": "1",
+    }
+    env.update(deterministic_env)
+    env["HUANYU_TEXT_AB_DETERMINISM"] = "0" if repeat else "1"
+    env["HUANYU_TEXT_AB_SIDE"] = mode
     # Activate batch invariance through the actor engine's RL config. Setting
     # VLLM_BATCH_INVARIANT=1 in the shared Ray environment would also enable it
     # on GenRM, which has different cache/chunked-prefill settings. Clear stale
     # inherited flags; native Ascend sets it to 1 for the requested engine.
-    if "batch_invariant" in engine:
-        env["VLLM_BATCH_INVARIANT"] = "0"
+    env["VLLM_BATCH_INVARIANT"] = "0"
     if repeat:
         # The repeat experiment must not load incompatible batch-invariant
         # kernels, even when a reused shell previously enabled them.
@@ -293,15 +294,13 @@ def build_launch(root, case, project, mode, port=28889, served_model="qwen3.8", 
             command.append("++actor_rollout_ref.rollout.engine_kwargs.vllm_omni.async_scheduling=false")
         command.append("++actor_rollout_ref.rollout.engine_kwargs.vllm_omni.additional_config.rl_config.enable_batch_invariant="
                        + str(batch_invariant).lower())
+        command.append("++actor_rollout_ref.rollout.engine_kwargs.vllm_omni.additional_config.rl_config.enabled=true")
         if batch_invariant:
-            command.extend([
-                "++actor_rollout_ref.rollout.engine_kwargs.vllm_omni.additional_config.rl_config.enabled=true",
-                "++actor_rollout_ref.rollout.engine_kwargs.vllm_omni.block_size=128",
-            ])
+            command.append("++actor_rollout_ref.rollout.engine_kwargs.vllm_omni.block_size=128")
         worker_env = dict(deterministic_env, ASCEND_LAUNCH_BLOCKING=blocking,
-                          HUANYU_TEXT_AB_BATCH_INVARIANT=env["HUANYU_TEXT_AB_BATCH_INVARIANT"])
-        if "batch_invariant" in engine:
-            worker_env["VLLM_BATCH_INVARIANT"] = "0"
+                          HUANYU_TEXT_AB_BATCH_INVARIANT=env["HUANYU_TEXT_AB_BATCH_INVARIANT"],
+                          HUANYU_TEXT_AB_DETERMINISM=env["HUANYU_TEXT_AB_DETERMINISM"],
+                          HUANYU_TEXT_AB_SIDE=mode, VLLM_BATCH_INVARIANT="0")
         command.extend("++ray_kwargs.ray_init.runtime_env.env_vars." + key + "=" + hydra_string(value)
                        for key, value in worker_env.items())
         for key, value in embedding_env.items():
@@ -348,15 +347,18 @@ def main(argv=None):
         plan = build_launch(root, case, project, args.mode, args.port, args.served_model, args.full_weight_audit_dir)
         print("[huanyu-text-ab] " + " ".join(shlex.quote(arg) for arg in plan["command"]), flush=True)
         notice = None
-        if case["engine"].get("batch_invariant") or case.get("serve_repeat"):
+        if plan["env"]["HUANYU_TEXT_AB_DETERMINISM"] == "1" or case.get("serve_repeat"):
             batch_invariant = bool(case["engine"].get("batch_invariant"))
             notice = ("[huanyu-determinism] requested rl_config.enable_batch_invariant="
                       + str(batch_invariant).lower() + " VLLM_BATCH_INVARIANT="
                       + plan["env"].get("VLLM_BATCH_INVARIANT", "0") + " "
                       "HCCL_DETERMINISTIC=" + plan["env"]["HCCL_DETERMINISTIC"] + " "
-                      "ASCEND_LAUNCH_BLOCKING=1 NCCL_DETERMINISTIC=1 LCCL_DETERMINISTIC=1 "
+                      "ASCEND_LAUNCH_BLOCKING=" + plan["env"]["ASCEND_LAUNCH_BLOCKING"] + " "
+                      "NCCL_DETERMINISTIC=" + plan["env"]["NCCL_DETERMINISTIC"] + " "
+                      "LCCL_DETERMINISTIC=" + plan["env"]["LCCL_DETERMINISTIC"] + " "
                       + ("block_size=128 " if batch_invariant else "")
-                      + "BS=1 graph=eager repeat_worker_check="
+                      + "BS=1 graph=eager ab_worker_check=" + plan["env"]["HUANYU_TEXT_AB_DETERMINISM"]
+                      + " repeat_worker_check="
                       + str(bool(case.get("serve_repeat"))).lower())
             print(notice, flush=True)
         if args.dry_run:
@@ -388,6 +390,7 @@ def main(argv=None):
                 "HUANYU_FULL_WEIGHT_AUDIT_DIR", "HUANYU_FULL_WEIGHT_AUDIT_RUN_ID",
                 "HUANYU_EMBEDDING_AB_DIR", "HUANYU_EMBEDDING_AB_SIDE",
                 "HUANYU_SERVE_REPEAT_DETERMINISM",
+                "HUANYU_TEXT_AB_DETERMINISM", "HUANYU_TEXT_AB_SIDE",
             )
         }
         snapshot["selected_environment"].update({

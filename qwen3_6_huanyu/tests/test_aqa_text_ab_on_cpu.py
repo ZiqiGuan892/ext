@@ -90,6 +90,8 @@ class TextCaseTests(unittest.TestCase):
         self.fixtures(count=3)
         _, case, _ = self.prepare(embedding=True, logits=True)
         self.assertEqual(case["logits_check"]["max_steps"], case["sampling"]["max_tokens"])
+        self.assertEqual(case["determinism_check"], {"enabled": True, "torch_deterministic_algorithms": True,
+                                                   "torch_deterministic_warn_only": False})
         _, limited, _ = self.prepare(embedding=True, logits=True, max_steps=128, destination=self.root / "limited")
         self.assertEqual(limited["logits_check"]["max_steps"], 128)
 
@@ -117,15 +119,37 @@ class TextCaseTests(unittest.TestCase):
                 self.prepare(**kwargs)
             self.assertFalse(self.case.exists())
         _, case, _ = self.prepare(embedding=True, logits=True, max_steps=2, forward=True)
-        self.assertEqual(case["forward_check"], {"enabled": True, "max_steps": 2})
+        self.assertEqual(case["forward_check"], {"enabled": True, "max_steps": 2, "until_eos": False})
         self.assertEqual(case["sampling"]["max_tokens"], 2048)
         self.assertFalse(case["engine"]["batch_invariant"])
+
+    def test_forward_until_eos_covers_all_possible_decode_steps(self):
+        self.fixtures(count=3)
+        with self.assertRaisesRegex(ValueError, "forward-check"):
+            self.prepare(embedding=True, logits=True, max_steps=2, forward=True, forward_steps=0)
+        self.assertFalse(self.case.exists())
+        _, case, _ = self.prepare(embedding=True, logits=True, forward=True, forward_steps=0)
+        self.assertEqual(case["forward_check"], {"enabled": True, "max_steps": 2048, "until_eos": True})
 
     def test_logits_without_embedding_identity_rejected_before_case_creation(self):
         self.fixtures(count=3)
         with self.assertRaisesRegex(ValueError, "embedding-check"):
             self.prepare(logits=True)
         self.assertFalse(self.case.exists())
+
+    def test_random50_full_forward_case_reuses_identical_manifest_and_parquet(self):
+        self.fixtures(count=53)
+        _, case, rows = self.prepare(size=50, embedding=True, logits=True, forward=True, forward_steps=0)
+        self.assertEqual([r["source_row_index"] for r in rows], sorted(random.Random(42).sample(range(53), 50)))
+        subset = pq.read_table(case["subset_parquet"]).to_pylist()
+        self.assertEqual(len(subset), 50)
+        for manifest, rollout in zip(rows, subset):
+            self.assertEqual(manifest["prompt"], rollout["prompt"])
+            self.assertEqual(manifest["wav_paths"], rollout["audios"])
+        self.assertTrue(case["determinism_check"]["enabled"])
+        self.assertFalse(case["engine"]["batch_invariant"])
+        self.assertEqual(case["logits_check"]["top_k"], 100)
+        self.assertTrue(case["forward_check"]["until_eos"])
 
     def server(self, root=None, **kwargs):
         args = SimpleNamespace(case_dir=str(root or self.case), url="http://localhost:28889/v1/chat/completions",

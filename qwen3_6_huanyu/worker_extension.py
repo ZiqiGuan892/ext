@@ -24,6 +24,9 @@ class HuanyuColocateWorkerExtension(vLLMOmniColocateWorkerExtension):
 
 report_policy("rollout-worker")
 bind_huanyu_weight_reload(HuanyuColocateWorkerExtension)
+if os.environ.get("HUANYU_TEXT_AB_DETERMINISM") == "1":
+    from .ab_determinism import install_ab_determinism_check
+    install_ab_determinism_check()
 if os.environ.get("HUANYU_SERVE_REPEAT_DETERMINISM") == "1":
     from .repeat_determinism import install_repeat_determinism_check
     install_repeat_determinism_check()

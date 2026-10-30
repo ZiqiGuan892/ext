@@ -100,6 +100,9 @@ def prepare_case(args):
         raise ValueError("logits-check requires embedding-check=true for request/input identity")
     forward_check = getattr(args, "forward_check", "false") == "true"
     forward_steps = getattr(args, "forward_max_steps", 2)
+    forward_until_eos = forward_steps == 0
+    if forward_until_eos:
+        forward_steps = args.max_tokens
     if forward_check and (not logits_check or not 1 <= forward_steps <= logits_max_steps):
         raise ValueError("forward-check requires logits-check and 1 <= forward-max-steps <= logits-max-steps")
     source = Path(args.parquet).expanduser().resolve(strict=True)
@@ -171,11 +174,13 @@ def prepare_case(args):
         "sample_size": len(rows), "selection_seed": args.seed, "prompt_mode": args.prompt_mode,
         "manifest_sha256": sha256(manifest), "checkpoint_file_sha256": fingerprints,
         "enable_thinking": args.enable_thinking == "true",
+        "determinism_check": {"enabled": True, "torch_deterministic_algorithms": True,
+                              "torch_deterministic_warn_only": False},
         "embedding_check": {"enabled": getattr(args, "embedding_check", "false") == "true",
                             "scope": "llm_inputs_embeds", "strict": True, "expected_tp_size": args.tp},
         "logits_check": {"enabled": logits_check, "max_steps": logits_max_steps, "top_k": logits_top_k,
                          "scope": "model_logits_sampler_input_greedy_input", "strict": True},
-        "forward_check": {"enabled": forward_check, "max_steps": forward_steps},
+        "forward_check": {"enabled": forward_check, "max_steps": forward_steps, "until_eos": forward_until_eos},
         "sampling": {"max_tokens": args.max_tokens, "temperature": 0, "top_p": 1, "top_k": -1,
                      "n": 1, "seed": args.seed, "min_tokens": 0, "ignore_eos": False,
                      "repetition_penalty": 1, "frequency_penalty": 0, "presence_penalty": 0},
@@ -463,7 +468,7 @@ def main(argv=None):
     prepare.add_argument("--forward-check", choices=("true", "false"), default="false",
                          help="Hash actual LLM layer/submodule boundaries; requires logits-check")
     prepare.add_argument("--forward-max-steps", type=int, default=2,
-                         help="Bound forward hashing: 1=prefill, 2=prefill plus first decode; no activation payloads")
+                         help="0=through EOS/max-tokens; 1=prefill; 2=prefill plus first decode; hashes only")
     prepare.set_defaults(function=prepare_case)
     serve = commands.add_parser("serve", help="Send the shared case to an already-running HTTP service")
     serve.add_argument("--case-dir", required=True)

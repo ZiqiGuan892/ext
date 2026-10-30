@@ -1079,6 +1079,49 @@ python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/compare_huanyu_logits.py" --case-
 
 本次106项CPU回归通过，覆盖探针、比较器、A/B启动器、数据准备及原embedding链路；包含原地修改logits、独立execute/sample生命周期、prefill/decode首次分歧、实际参数被覆盖、TP分片全局argmax、缺步骤/缺rank/损坏文件、提前中断与显式采集窗口的区分。服务器NPU执行尚待验证。
 
+#### A/B 两侧确定性设置与 batch invariance 分开控制
+
+case `bbe8a6c74d024f71b00e367c5474cd32` 的实际日志显示：serve 为
+`HCCL_DETERMINISTIC=true / ASCEND_LAUNCH_BLOCKING=1 / NCCL_DETERMINISTIC=1 / LCCL_DETERMINISTIC=1`，
+rollout 则为 `null / 0 / null / 0`；两侧 `torch_deterministic_algorithms=false`，
+`VLLM_BATCH_INVARIANT=0`。因此该次结果不是两侧均启用相同确定性设置的实验。
+根因是启动器曾只在 batch-invariant 或 repeat 分支内强制传递这些变量；
+普通 A/B 关闭 batch invariance 后，serve 可以继承 shell 设置，而 Ray worker 没有得到显式覆盖。
+这证明了实验配置不对齐，尚不能证明它就是 logits 差异的唯一原因。
+
+修复后的普通 A/B 启动器无论是否采集 logits，都会向两侧设置相同变量并显式转发
+Ray runtime_env。使用 `--batch-invariant false` 时实际预期为：
+
+```text
+HCCL_DETERMINISTIC=strict
+ASCEND_LAUNCH_BLOCKING=1
+NCCL_DETERMINISTIC=1
+LCCL_DETERMINISTIC=1
+VLLM_BATCH_INVARIANT=0
+torch_deterministic_algorithms=true
+torch_deterministic_warn_only=false
+batch_invariant_registered=false（原生模块未加载时可能为null）
+```
+
+`ab_determinism.py` 通过必经的 worker factory 挂接 `init_device`：先检查已传入的环境，
+在原生设备/通信初始化前调用 `torch.use_deterministic_algorithms(True, warn_only=False)`，
+初始化后再次核对环境、Torch 状态和 batch-invariant 注册状态。缺失或被覆盖时直接报错，
+不在已初始化的进程里悄悄补环境。成功日志为
+`[huanyu-determinism] actual scope=ab_worker_init status=SETTINGS_VERIFIED`，包含 side/rank。
+该开关只作用于本 A/B 的 Huanyu 推理 worker，不启用普通训练的 Torch 全局确定性，
+也不改变独立 repeat/control 实验原有的设置。
+
+新准备的 `case.json` 写入 `determinism_check`；logits 比较器同时核对两侧与 case 的预期，
+避免“两侧都关闭但相同”误判通过。旧报告没有该契约时仍按原始证据解释，不追溯改写。
+已有 case 的启动器也会强制传参，但重新实验应使用新目录、新 case，保持产物来源明确。
+上面的 prepare/serve/rollout 命令不变，继续指定 `--batch-invariant false`。
+
+这些检查确认开关生效，不承诺所有自定义 NPU 算子或不同机器上的数值必然逐位相同。
+ASCEND_LAUNCH_BLOCKING控制同步执行；NCCL变量也不是NPU通信确定性的证据。
+Torch 对已知不支持确定性的操作会按严格模式报错，不降级为仅告警；参见
+[PyTorch API](https://docs.pytorch.org/docs/stable/generated/torch.use_deterministic_algorithms.html)。
+最终仍需比较同一 case、同一前缀的输入、forward、logits 和实际选词。
+
 #### 输入一致、prefill logits 不一致时：定位实际 forward 边界
 
 已观测 case `d4e43d6e47a94209817ab70fef85ad66`：4条输入在全部TP rank严格一致，但4条均从 `step=0 / prefill / model_logits` 开始不同；首次选词分歧分别在step 143、53、72、9（从0计数）。这定位到采样前的模型计算，尚未定位到某个算子。最高分附近的BF16并列解释了贪心选词如何分叉，但不能据此断言根因只是正常舍入。该case未开启确定性计算，不能作为开启后的结论。
@@ -1110,7 +1153,125 @@ python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/compare_huanyu_forward.py" --case
 
 产物为 `forward/{serve,rollout}/*.json`、`forward_comparison.json`。forward只保存哈希和元数据，不保存激活矩阵；logits仅保存指定2步。`first_difference`指出按实际调用顺序首次不同的模块输入/输出，优先看prefill：若input相同而attention output不同，则下一步细查该attention及其cache/metadata；若attention输出相同而MLP输出不同，则细查路由、专家及通信。若LLM和最终norm一致、compute_logits输入一致而输出不同，再查LM head。框架在这些边界之间的padding、通信、layer scale也可能导致下一边界输入不同，不能只凭模块名称直接归责。
 
-`MATCH_CAPTURED_BOUNDARIES`仅表示指定窗口的已观察边界一致，不声称全部生成或未观测内部算子一致；`DIFFERENT`包含真实边界差异或运行分支/实现差异，后者单独出现不证明因果；`INCOMPLETE`表示缺rank/步数/必要边界或混入重复记录。请求在采满窗口前EOS也会缺步，需以更短窗口另建case。不同decode前缀不进行数值归因。探针不重跑forward、不修改参数或运算，但阻塞CPU复制会影响执行时序；NPU有效性与最终根因仍须服务器实测。
+`MATCH_CAPTURED_BOUNDARIES`仅表示已观察边界一致，不声称未观测内部算子一致；`DIFFERENT`包含真实边界差异或运行分支/实现差异，后者单独出现不证明因果；`INCOMPLETE`表示缺rank/步数/必要边界或混入重复记录。上述固定2步窗口在提前EOS时仍可能缺步；下面的 `--forward-max-steps 0` 模式使用实际终止证据检查完整生成，允许正常提前结束。不同decode前缀不进行数值归因。探针不重跑forward、不修改参数或运算，但阻塞CPU复制会影响执行时序；NPU有效性与最终根因仍须服务器实测。
+
+#### 50条随机验证样本：两侧确定性、Top-100 logits、定位首次不同的模块
+
+该流程在同一 case 中随机抽取50条，serve 与 rollout 共用同一份清单、WAV、system prompt 和显式采样配置。
+保留 system 原文，只向 user 消息发送音频，不发送问题文字或 ground truth。
+两侧为 BS=1、TP=4、贪心解码、最多2048个输出token；冻结 encoder/projector，只做首次同步后的验证，不更新梯度。
+`VLLM_BATCH_INVARIANT=0`；上节的 worker 检查强制验证三项环境变量、LCCL 和 Torch 确定性开关，
+serve 的 shell 与 rollout 的 Ray worker 都必须通过，不能仅依据启动器的 requested 日志判断。
+
+先完成各节点环境准备及 Ray 集群启动；沿用现有32卡环境（16卡Actor/rollout + 16卡GenRM）。
+`validation_vllm/manifest.jsonl` 及其中的WAV必须覆盖抽中的样本。serve 和 rollout 顺序运行，避免同时占用相同NPU。
+每次实验使用新目录，以下命令中的 `AB_ROOT` 在所有终端必须是**同一个实际路径**。
+
+```bash
+export PROJECT_ROOT=/opt/huawei/dataset/infra_data/code/verl_omni_qwen36_gzq_new
+export MODEL_PATH=/opt/huawei/dataset/model_gy/downloaded_models/2748
+export RM_MODEL_PATH=/opt/huawei/dataset/model_gy/downloaded_models/Qwen3.5-35B-A3B
+export HUANYU_VLLM_OMNI_ROOT=/vllm-workspace/vllm-omni
+export RAY_ADDRESS=auto
+export HCCL_DETERMINISTIC=strict
+export ASCEND_LAUNCH_BLOCKING=1
+export NCCL_DETERMINISTIC=1
+export LCCL_DETERMINISTIC=1
+export VLLM_BATCH_INVARIANT=0
+export AB_ROOT="$PROJECT_ROOT/runs/huanyu_modules50_$(date +%Y%m%d_%H%M%S)"
+echo "AB_ROOT=$AB_ROOT"
+
+python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/aqa_text_ab.py" prepare \
+  --parquet /opt/huawei/dataset/infra_data/data/aqa_dataset/validation.parquet \
+  --export-dir /opt/huawei/dataset/infra_data/data/validation_vllm \
+  --model-path "$MODEL_PATH" --output-dir "$AB_ROOT" \
+  --sample-size 50 --seed 42 --prompt-mode system_audio --enable-thinking true \
+  --tp 4 --max-tokens 2048 --batch-invariant false --embedding-check true \
+  --logits-check true --logits-top-k 100 --logits-max-steps 0 \
+  --forward-check true --forward-max-steps 0
+
+# 终端A：启动serve，等待服务就绪。输出自动记录到 $AB_ROOT/serve_console.log。
+python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/launch_huanyu_aqa_text_ab.py" serve \
+  --case-dir "$AB_ROOT" --port 28889 --served-model qwen3.8
+```
+
+终端B中先设置同一个 `PROJECT_ROOT` 和刚才打印的 `AB_ROOT`，再串行发送50条请求：
+
+```bash
+python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/aqa_text_ab.py" serve \
+  --case-dir "$AB_ROOT" --url http://localhost:28889/v1/chat/completions \
+  --model qwen3.8 --timeout-s 3600
+```
+
+所有请求完成后，终端A停止本次serve释放NPU，保留该终端的环境，运行验证：
+
+```bash
+set -o pipefail
+python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/launch_huanyu_aqa_text_ab.py" rollout \
+  --case-dir "$AB_ROOT" 2>&1 | tee "$AB_ROOT/rollout_console.log"
+
+# 两侧都应有 actual worker 记录，且无 FAILED。核对每个worker/rank，不只取第一行。
+grep -nE 'huanyu-determinism.*(ab_worker_init|actual side=|FAILED)' \
+  "$AB_ROOT/serve_console.log" "$AB_ROOT/rollout_console.log"
+```
+
+成功的 worker 初始化记录含 `scope=ab_worker_init status=SETTINGS_VERIFIED`、`side` 和 `rank`；
+logits探针的 `actual side=serve/rollout` 记录再次观察采集时的环境及Torch状态。
+三项必需值为 `HCCL_DETERMINISTIC=strict`、`ASCEND_LAUNCH_BLOCKING=1`、`NCCL_DETERMINISTIC=1`，
+同时应有 `LCCL_DETERMINISTIC=1`、`VLLM_BATCH_INVARIANT=0`、`torch_deterministic_algorithms=true`。
+这证明设置已生效；NCCL变量本身不控制HCCL，仍以实际输出比较确认复现性。
+
+两侧全部结束后分别运行以下比较（存在差异时比较器会返回非零；不要用 `&&` 串联）：
+
+```bash
+# 此命令同时生成文字比较和 embedding_summary.json，不要重复单独生成同名embedding报告。
+python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/aqa_text_ab.py" compare --case-dir "$AB_ROOT"
+python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/compare_huanyu_logits.py" --case-dir "$AB_ROOT"
+python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/compare_huanyu_forward.py" --case-dir "$AB_ROOT"
+
+# 直接查看首次出现差异的模块与输入/输出边界。
+python3 - <<'PY'
+import json, os
+from pathlib import Path
+root = Path(os.environ['AB_ROOT'])
+r = json.loads((root / 'forward_comparison.json').read_text())
+print('SUMMARY:', r['summary'])
+for s in r['samples']:
+    first = s.get('first_difference') or {}
+    boundary = first.get('first_difference') or {}
+    print(s['sample_id'], s['status'],
+          'full_capture=', s['full_generation_captured'],
+          'step=', first.get('step'), 'phase=', first.get('phase'), 'tp=', first.get('tp_rank'),
+          'module=', boundary.get('name'), 'boundary=', boundary.get('boundary'),
+          'input_equal=', boundary.get('module_input_equal'),
+          'last_equal=', boundary.get('last_equal_boundary'),
+          'reason=', boundary.get('reason'), 'issues=', s['issues'])
+PY
+```
+
+产物与解释：
+
+| 文件 | 检查内容 |
+| --- | --- |
+| `summary.json`、`comparison.jsonl` / `.csv` | 50条文字是否完整配对、回复是否完全一致；不把文字一致等同于答案正确 |
+| `embedding_summary.json` | 同一case、全部TP rank的真实LLM输入及音频位置是否严格相同 |
+| `logits_comparison.json` | prefill和每步decode的模型logits、sampler输入、greedy输入；实际采样参数及确定性设置 |
+| `forward_comparison.json` | 首次不同的层/模块、input/output边界、step、TP rank、该模块输入是否一致、此前最后一个一致边界 |
+
+例如 `name=layers.12.linear_attn, boundary=output, module_input_equal=true` 表示该次调用的显式输入一致，
+首次观察到差异的是第12层GDN模块输出，应继续查该模块内计算及其隐式cache/metadata。
+若 `boundary=input`，表示差异已在进入该模块前产生，需要查上一个边界到该输入之间的通信、padding、residual或layer scale，
+不能直接归因于这个模块。报告按token step、实际模块执行次序、TP rank选择首次差异；不是按rank0优先选结果。
+可见的 router/experts 会单独观察；没有独立Python模块边界的融合算子只能定位到其外层模块，不能据此声称已经找到内部具体指令。
+
+`--forward-max-steps 0` 覆盖prefill及EOS/长度上限前的全部decode；实际sampler会保存终止证据，
+`full_generation_captured=true` 要求所有rank从0步到实际终止连续完整。没有终止证据或中途丢步会报告 `INCOMPLETE`。
+选词分叉后两侧前缀不同，后续边界只保留记录，不用于判断forward根因；优先分析分叉前的首次不同模块。
+Top-100之外的logits不落盘，但完整词表原始dtype字节的SHA256仍用于严格相等检查；Top-100误差统计只覆盖存储token的交集。
+forward保存整个张量哈希，不保存激活值。比较器按小索引读取成对模块树，避免将50条的所有模块树同时常驻内存；
+完整采集仍有CPU复制、哈希计算和大量文件I/O开销，不能拿这一轮耗时评估训练/推理吞吐。
+
+上述功能经本地CPU回归验证；50条真实NPU结果需要在服务器运行后确认。
 
 ### 13.1 开启 Ascend 批量不变性后对比
 

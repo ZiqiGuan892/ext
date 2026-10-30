@@ -46,6 +46,7 @@ def worker_modules(*, fail=None):
     reload = load_file(PACKAGE + ".weight_reload", ROOT / "weight_reload.py")
     modules = {BASE_MODULE: base, PACKAGE: package, reload.__name__: reload}
     for module_name, installer in (
+        ("ab_determinism", "install_ab_determinism_check"),
         ("repeat_determinism", "install_repeat_determinism_check"),
         ("processor_compat", "install_huanyu_processor_compat"),
         ("rollout_precision", "install_huanyu_rollout_precision"),
@@ -66,6 +67,19 @@ def worker_modules(*, fail=None):
 
 
 class WorkerExtensionTests(unittest.TestCase):
+    def test_ab_check_is_mandatory_without_embedding_or_logits_probe(self):
+        for fail in (None, "ab_determinism"):
+            with self.subTest(fail=fail), patch.dict(os.environ, {
+                    "HUANYU_TEXT_AB_DETERMINISM": "1", "HUANYU_SERVE_REPEAT_DETERMINISM": "",
+                    "HUANYU_EMBEDDING_AB_DIR": ""}), worker_modules(fail=fail) as (_, events, _), \
+                    redirect_stdout(io.StringIO()):
+                if fail:
+                    with self.assertRaisesRegex(RuntimeError, "ab_determinism unavailable"):
+                        load_file(PACKAGE + ".worker_extension", ROOT / "worker_extension.py")
+                else:
+                    load_file(PACKAGE + ".worker_extension", ROOT / "worker_extension.py")
+                self.assertEqual(events[0], "ab_determinism")
+
     def test_repeat_check_installs_at_worker_factory_without_tensor_probes(self):
         for fail in (None, "repeat_determinism"):
             with self.subTest(fail=fail), patch.dict(os.environ, {
@@ -155,6 +169,9 @@ class WorkerExtensionTests(unittest.TestCase):
             self.assertEqual(extra["additional_config"]["weight_nz_mode"], 0)
             self.assertEqual(adapter.get_stage_engine_extras(1), {})
         self.assertEqual(parent_extras["additional_config"], {"weight_nz_mode": 0})
+        with patch.dict(os.environ, {"HUANYU_TEXT_AB_BATCH_INVARIANT": "0"}):
+            self.assertEqual(adapter.get_stage_engine_extras(0)["additional_config"]["rl_config"],
+                             {"enabled": True, "enable_batch_invariant": False})
 
         # Execute the real local server's deploy writer with only its external
         # IO dependencies stubbed. This checks the rendered per-stage contract,

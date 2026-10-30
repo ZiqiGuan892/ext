@@ -133,6 +133,15 @@ class TextABLauncherTests(unittest.TestCase):
         self.case["forward_check"]["max_steps"] = 3
         with self.assertRaisesRegex(ValueError, "forward_check"):
             self.plan("rollout")
+        self.case["forward_check"].update(max_steps=2, until_eos=True)
+        for mode in ("serve", "rollout"):
+            with self.assertRaisesRegex(ValueError, "until_eos"):
+                self.plan(mode)
+        limit = self.case["sampling"]["max_tokens"]
+        self.case["forward_check"]["max_steps"] = limit
+        self.case["logits_check"]["max_steps"] = limit
+        for mode in ("serve", "rollout"):
+            self.assertEqual(self.plan(mode)["env"]["VLLM_BATCH_INVARIANT"], "0")
 
     def test_invalid_logit_capture_topk_rejected(self):
         self.case["logits_check"] = {"enabled": False, "top_k": -1}
@@ -210,19 +219,41 @@ class TextABLauncherTests(unittest.TestCase):
         self.assertFalse(stage["enable_prefix_caching"])
         self.assertFalse(any("reward_model" in k and "batch_invariant" in k for k in options))
 
-    def test_external_launch_blocking_is_preserved_and_forwarded_to_ray(self):
+    def test_ab_forces_identical_determinism_without_batch_invariance(self):
         self.case["engine"]["batch_invariant"] = False
-        with patch.dict(os.environ, {"ASCEND_LAUNCH_BLOCKING": "1", "VLLM_BATCH_INVARIANT": "1"}):
+        expected = {"ASCEND_LAUNCH_BLOCKING": "1", "VLLM_BATCH_INVARIANT": "0",
+                    "HCCL_DETERMINISTIC": "strict", "NCCL_DETERMINISTIC": "1",
+                    "LCCL_DETERMINISTIC": "1", "HUANYU_TEXT_AB_DETERMINISM": "1"}
+        with patch.dict(os.environ, {**{key: "invalid" for key in expected}, "VLLM_BATCH_INVARIANT": "1"}):
             for mode in ("serve", "rollout"):
                 plan = self.plan(mode)
-                self.assertEqual(plan["env"]["ASCEND_LAUNCH_BLOCKING"], "1")
-                self.assertEqual(plan["env"]["VLLM_BATCH_INVARIANT"], "0")
+                self.assertEqual({k: plan["env"][k] for k in expected}, expected)
+                self.assertEqual(plan["env"]["HUANYU_TEXT_AB_SIDE"], mode)
                 if mode == "rollout":
-                    self.assertEqual(json.loads(hydra_options(plan)[
-                        "ray_kwargs.ray_init.runtime_env.env_vars.ASCEND_LAUNCH_BLOCKING"]), "1")
-        with patch.dict(os.environ, {"ASCEND_LAUNCH_BLOCKING": "invalid"}):
-            with self.assertRaisesRegex(ValueError, "ASCEND_LAUNCH_BLOCKING"):
-                self.plan("rollout")
+                    options = hydra_options(plan)
+                    for key, value in dict(expected, HUANYU_TEXT_AB_SIDE=mode).items():
+                        self.assertEqual(json.loads(options["ray_kwargs.ray_init.runtime_env.env_vars." + key]), value)
+                    self.assertEqual(options["actor_rollout_ref.rollout.engine_kwargs.vllm_omni.additional_config.rl_config.enabled"], "true")
+                    self.assertEqual(options["actor_rollout_ref.rollout.engine_kwargs.vllm_omni.additional_config.rl_config.enable_batch_invariant"], "false")
+
+    def test_ab_missing_environment_and_legacy_case_still_get_explicit_flags(self):
+        with patch.dict(os.environ, {}, clear=True):
+            for mode in ("serve", "rollout"):
+                plan = self.plan(mode)
+                self.assertEqual(plan["env"]["HCCL_DETERMINISTIC"], "strict")
+                self.assertEqual(plan["env"]["VLLM_BATCH_INVARIANT"], "0")
+                self.assertEqual(plan["env"]["HUANYU_TEXT_AB_DETERMINISM"], "1")
+
+    def test_nonbatch_ab_prints_requested_settings_and_saves_worker_contract(self):
+        with patch.object(LAUNCHER.subprocess, "call", return_value=0):
+            status, stdout, stderr = self.invoke("serve")
+        self.assertEqual(status, 0, stderr)
+        self.assertIn("[huanyu-determinism] requested", stdout)
+        self.assertIn("ab_worker_check=1", stdout)
+        self.assertIn("HCCL_DETERMINISTIC=strict", stdout)
+        snapshot = json.loads((self.root / "serve.launch.json").read_text())
+        self.assertEqual(snapshot["selected_environment"]["HUANYU_TEXT_AB_DETERMINISM"], "1")
+        self.assertIn("ab_worker_check=1", (self.root / "serve_console.log").read_text())
 
     def test_repeat_disables_batch_invariance_despite_ambient_enable(self):
         self.case["serve_repeat"] = {"concurrency": 1}
@@ -240,6 +271,7 @@ class TextABLauncherTests(unittest.TestCase):
                          stage["engine_extras"]["additional_config"]["rl_config"])
         self.assertEqual(plan["env"]["HUANYU_EMBEDDING_AB_DIR"], "")
         self.assertEqual(plan["env"]["HUANYU_TEXT_AB_BATCH_INVARIANT"], "0")
+        self.assertEqual(plan["env"]["HUANYU_TEXT_AB_DETERMINISM"], "0")
         self.assertNotIn("block_size", stage)
         self.assertNotIn("--block-size", plan["command"])
         self.assertEqual(stage["max_num_seqs"], 1)

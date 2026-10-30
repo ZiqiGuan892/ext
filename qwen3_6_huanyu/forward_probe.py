@@ -164,3 +164,27 @@ def finish(context):
         json.dump(event, stream, ensure_ascii=False, indent=2, allow_nan=False)
         stream.write("\n")
     context["forward_trace"] = None
+
+
+def record_termination(state, event):
+    """Attach actual sampler termination to full-generation forward coverage.
+
+    compute_logits runs before sampling, sometimes in another runner method.
+    Store a separate final marker rather than guessing EOS from missing traces.
+    """
+    check = state["case"].get("forward_check", {})
+    if (not check.get("enabled") or not check.get("until_eos")
+            or event.get("status") != "complete" or not event.get("terminal_evidence")):
+        return
+    fields = ("request_id", "sample_id", "step", "phase", "prompt_token_ids", "prompt_token_sha256",
+              "prefix_token_ids", "prefix_token_sha256", "sampled_token_ids", "terminal_evidence", "sampling_params")
+    record = {key: event[key] for key in fields}
+    record.update(format="huanyu_forward_termination_v1", kind="termination", status="CAPTURED",
+                  case_id=state["case"]["case_id"], side=state["side"], tp_rank=state["tp_rank"],
+                  tp_size=state["tp_size"], runtime_id=state["runtime_id"])
+    folder = Path(state["root"]) / "forward" / state["side"]
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / ("%s-termination-tp%d-%s.json" % (record["sample_id"], state["tp_rank"], uuid.uuid4().hex))
+    with path.open("x", encoding="utf-8") as stream:
+        json.dump(record, stream, ensure_ascii=False, allow_nan=False)
+        stream.write("\n")

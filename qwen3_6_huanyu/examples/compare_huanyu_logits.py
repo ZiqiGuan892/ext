@@ -287,6 +287,29 @@ def compare_case(root, case, rows, *, loaded=None):
                                        _portable({k: b_runtime.get(k) for k in runtime_keys}))
             if runtime_diff:
                 item["runtime_differences"].append({"tp_rank": rank, "differences": runtime_diff})
+            # New A/B cases require the actual settings even when both sides
+            # silently lost identical flags. Old reports remain interpretable;
+            # standalone repeat/control cases have their own contract.
+            if case.get("determinism_check", {}).get("enabled") and not case.get("serve_repeat"):
+                batch = case["engine"].get("batch_invariant", False)
+                requested = {
+                    "environment": {"VLLM_BATCH_INVARIANT": "1" if batch else "0",
+                                    "HCCL_DETERMINISTIC": "strict", "ASCEND_LAUNCH_BLOCKING": "1",
+                                    "NCCL_DETERMINISTIC": "1", "LCCL_DETERMINISTIC": "1"},
+                    "torch_deterministic_algorithms": True, "torch_deterministic_warn_only": False,
+                }
+                for side, runtime in (("serve", a_runtime), ("rollout", b_runtime)):
+                    actual = runtime.get("determinism") or {}
+                    missing = [k for k in requested if k not in actual]
+                    if missing:
+                        item["issues"].append({"side": side, "tp_rank": rank,
+                                               "error": "missing determinism evidence: " + ", ".join(missing)})
+                    diff = differences(requested, {k: actual.get(k) for k in requested})
+                    if not batch and actual.get("batch_invariant_registered"):
+                        diff["batch_invariant_registered"] = {"expected": False, "actual": True}
+                    if diff:
+                        item["runtime_differences"].append({"side": side, "tp_rank": rank,
+                                                            "vs_case_determinism": diff})
             if case["engine"].get("batch_invariant"):
                 expected_env = {"VLLM_BATCH_INVARIANT": "1", "HCCL_DETERMINISTIC": "strict",
                                 "ASCEND_LAUNCH_BLOCKING": "1", "NCCL_DETERMINISTIC": "1",

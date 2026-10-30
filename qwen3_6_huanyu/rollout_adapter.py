@@ -31,8 +31,9 @@ class Qwen36HuanyuRolloutAdapter(Qwen36WhisperRolloutAdapter):
             # Keep generated stage extras and outer CLI kwargs consistent:
             # native deploy precedence may replace the entire additional_config.
             # This adapter belongs to the actor, not the separate GenRM pipeline.
-            if os.environ.get("HUANYU_TEXT_AB_BATCH_INVARIANT") == "1":
+            batch_mode = os.environ.get("HUANYU_TEXT_AB_BATCH_INVARIANT")
+            if batch_mode in ("0", "1"):
                 additional = dict(extras.get("additional_config", {}))
-                additional["rl_config"] = {"enabled": True, "enable_batch_invariant": True}
+                additional["rl_config"] = {"enabled": True, "enable_batch_invariant": batch_mode == "1"}
                 extras["additional_config"] = additional
         return extras

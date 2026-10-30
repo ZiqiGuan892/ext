@@ -268,6 +268,39 @@ class LogitsProbeTests(unittest.TestCase):
         self.assertEqual(report["summary"]["status"], "INCOMPLETE")
         self.assertTrue(any("registration" in x["error"] for x in report["samples"][0]["issues"]))
 
+    def test_ab_determinism_requires_both_actual_settings_even_if_logits_equal(self):
+        self.case["determinism_check"] = {"enabled": True}
+        actual = {"environment": {"VLLM_BATCH_INVARIANT": "0", "HCCL_DETERMINISTIC": "strict",
+                                  "ASCEND_LAUNCH_BLOCKING": "1", "NCCL_DETERMINISTIC": "1",
+                                  "LCCL_DETERMINISTIC": "1"},
+                  "batch_invariant_registered": False, "torch_deterministic_algorithms": True,
+                  "torch_deterministic_warn_only": False}
+        with patch.object(probe, "_determinism_state", return_value=actual):
+            self.both()
+        self.assertEqual(self.report()["summary"]["status"], "PASS")
+        paths = list((self.root / "logits").rglob("runtime-*.json"))
+        originals = {p: compare.read(p) for p in paths}
+        for bad in ("flags", "torch", "warn_only", "registered", "missing"):
+            with self.subTest(bad=bad):
+                for p, original in originals.items():
+                    record = copy.deepcopy(original)
+                    state = record["determinism"]
+                    if bad == "flags":
+                        state["environment"].update(HCCL_DETERMINISTIC=None, LCCL_DETERMINISTIC="0")
+                    elif bad == "torch":
+                        state["torch_deterministic_algorithms"] = False
+                    elif bad == "warn_only":
+                        state["torch_deterministic_warn_only"] = True
+                    elif bad == "registered":
+                        state["batch_invariant_registered"] = True
+                    else:
+                        del record["determinism"]
+                    p.write_text(json.dumps(record), encoding="utf-8")
+                report = self.report()
+                self.assertEqual(report["summary"]["status"], "INCOMPLETE" if bad == "missing" else "DIFFERENT")
+                self.assertIsNone(report["samples"][0]["first_different_logits"])
+                self.assertTrue(any("vs_case_determinism" in r for r in report["samples"][0]["runtime_differences"]))
+
     def test_requested_batch_mode_requires_final_worker_values_and_registration(self):
         self.case["engine"]["batch_invariant"] = True
         actual = {"environment": {"VLLM_BATCH_INVARIANT": "1", "HCCL_DETERMINISTIC": "strict",
