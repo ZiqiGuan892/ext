@@ -1141,7 +1141,7 @@ grep -E 'huanyu-determinism|Enabling batch-invariant|skipping batch-invariant' \
 
 `repeat_huanyu_serve.py` 固定复用已有case的 `row_000899`、`row_000418`，各20次、共40次。默认仅记录并比较文字，不采集logits或embedding，也不生成张量NPZ。保留原system、音频、thinking、采样设置；不把ground_truth或问题描述加回请求。顺序为899→418→899→418，客户端逐条等待完整响应，服务端max_num_seqs=1。仅请求ID不同；`manifest.jsonl` 的 `source_sample_id/repetition` 保存对应关系。准备时不重新随机抽样，不重新解码/编码WAV。
 
-这次测试的是同一serve内部的文本可重复性，不启动verl训练。环境准备沿用已有环境，需停止占用同一卡/端口的旧服务，再用启动器加载新case。测试期间不要向该服务发送其他请求，不要中途重启。默认模式不观测worker身份、最终采样元数据或数值运算；报告会将这些明确标为NOT_OBSERVED/NOT_COLLECTED，不能由文本PASS推断数值精度相同。
+这次测试的是同一serve内部的文本可重复性，不启动verl训练。环境准备沿用已有环境，需停止占用同一卡/端口的旧服务，再用启动器加载新case。测试期间不要向该服务发送其他请求，不要中途重启。纯文本模式会检查worker初始化时的确定性设置，但不跟踪每次响应所属的worker、最终采样元数据或数值运算；比较报告仍将这些标为NOT_OBSERVED/NOT_COLLECTED，不能由文本PASS推断数值精度相同。
 
 ```bash
 export PROJECT_ROOT=/opt/huawei/dataset/infra_data/code/verl_omni_qwen36_gzq_new
@@ -1151,7 +1151,7 @@ export REPEAT_ROOT="$PROJECT_ROOT/runs/huanyu_serve_repeat_$(date +%Y%m%d_%H%M%S
 
 python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/repeat_huanyu_serve.py" prepare \
   --source-case "$AB_ROOT" --output-dir "$REPEAT_ROOT" \
-  --samples row_000899 row_000418 --repeats 20 --batch-invariant false --logits-check false
+  --samples row_000899 row_000418 --repeats 20 --batch-invariant true --logits-check false
 echo "$REPEAT_ROOT"
 
 # 终端A：启动服务，等待就绪。使用case中的checkpoint，TP=4、eager、BS=1。
@@ -1168,7 +1168,15 @@ python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/repeat_huanyu_serve.py" compare \
   --case-dir "$REPEAT_ROOT"
 ```
 
-默认关闭此前不兼容的VLLM_BATCH_INVARIANT，启动器仍强制HCCL_DETERMINISTIC=true、ASCEND_LAUNCH_BLOCKING=1、NCCL_DETERMINISTIC=1、LCCL_DETERMINISTIC=1，保持eager、单请求、关闭prefix cache、chunked prefill和async scheduling。它们不保证所有算子逐bit确定。若已修复原生batch-invariant算子兼容性，可在准备新case时改成 `--batch-invariant true`。纯文本模式只保留请求配置和启动日志，不宣称验证了worker最终生效设置。
+repeat现在强制开启确定性设置，独立于source case是否开启embedding/logits探针或batch-invariant；不会修改source case。新case的 `engine.batch_invariant=true`，启动时同时强制 `rl_config.enabled=true`、`rl_config.enable_batch_invariant=true`、`VLLM_BATCH_INVARIANT=1`、`HCCL_DETERMINISTIC=strict`、`LCCL_DETERMINISTIC=1`、`ASCEND_LAUNCH_BLOCKING=1`、`NCCL_DETERMINISTIC=1`。保持eager、单请求、关闭prefix cache、chunked prefill和async scheduling。`--batch-invariant false`会报错；旧的关闭该开关的repeat case只能分析已有结果，需重新prepare新目录才能启动和发送请求。
+
+`serve_console.log`会同时保存启动器的 `[huanyu-determinism] requested`，以及每个TP worker完成原生设备初始化后的 `[huanyu-determinism] actual scope=worker_init status=SETTINGS_VERIFIED`。后者检查上述环境、原生Ascend batch-invariant算子注册和 `torch.are_deterministic_algorithms_enabled()`，并记录 `torch_deterministic_warn_only`。这个检查不采集张量，也不依赖logits探针；若原生初始化被跳过、注册状态无法确认或设置被覆盖，worker会报错停止，不会静默降级。原生算子构建/兼容性仍需满足服务器版本的要求。
+
+```bash
+grep -n 'huanyu-determinism' "$REPEAT_ROOT/serve_console.log"
+```
+
+TP=4时应看到4个不同rank的 `SETTINGS_VERIFIED`，只出现requested不代表worker已经完成检查。检查通过确认的是启动设置，仍需用40次请求验证文本是否重复一致；它不保证每个自定义算子逐bit确定。ASCEND_LAUNCH_BLOCKING控制同步执行，NCCL变量也不能代替NPU的HCCL确定性检查。
 
 输出均在REPEAT_ROOT：
 

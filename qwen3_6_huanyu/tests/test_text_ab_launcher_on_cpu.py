@@ -204,6 +204,61 @@ class TextABLauncherTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "ASCEND_LAUNCH_BLOCKING"):
                 self.plan("rollout")
 
+    def test_repeat_forces_native_settings_despite_ambient_disable(self):
+        self.case["serve_repeat"] = {"concurrency": 1}
+        self.case["engine"]["batch_invariant"] = True
+        wanted = {"VLLM_BATCH_INVARIANT": "1", "HCCL_DETERMINISTIC": "strict",
+                  "ASCEND_LAUNCH_BLOCKING": "1", "NCCL_DETERMINISTIC": "1", "LCCL_DETERMINISTIC": "1",
+                  "HUANYU_SERVE_REPEAT_DETERMINISM": "1"}
+        with patch.dict(os.environ, {key: "0" for key in wanted}):
+            plan = self.plan("serve")
+        self.assertEqual({key: plan["env"][key] for key in wanted}, wanted)
+        stage = plan["deploy"]["stages"][0]
+        self.assertEqual(stage["engine_extras"]["additional_config"]["rl_config"],
+                         {"enabled": True, "enable_batch_invariant": True})
+        self.assertEqual(json.loads(cli_option(plan["command"], "--additional-config"))["rl_config"],
+                         stage["engine_extras"]["additional_config"]["rl_config"])
+        self.assertEqual(plan["env"]["HUANYU_EMBEDDING_AB_DIR"], "")
+        self.assertEqual(stage["max_num_seqs"], 1)
+        self.assertFalse(stage["async_scheduling"])
+        self.case["engine"]["batch_invariant"] = False
+        with self.assertRaisesRegex(ValueError, "prepare a new repeat case"):
+            self.plan("serve")
+
+    def test_non_repeat_clears_worker_check_including_ray_environment(self):
+        with patch.dict(os.environ, {"HUANYU_SERVE_REPEAT_DETERMINISM": "1"}):
+            for mode in ("serve", "rollout"):
+                plan = self.plan(mode)
+                self.assertEqual(plan["env"]["HUANYU_SERVE_REPEAT_DETERMINISM"], "")
+                if mode == "rollout":
+                    self.assertEqual(json.loads(hydra_options(plan)[
+                        "ray_kwargs.ray_init.runtime_env.env_vars.HUANYU_SERVE_REPEAT_DETERMINISM"]), "")
+
+    def test_text_only_repeat_records_request_in_log_before_child_starts(self):
+        self.case["serve_repeat"] = {"concurrency": 1}
+        self.case["engine"]["batch_invariant"] = True
+        self.write_case()
+        with patch.object(LAUNCHER.subprocess, "call") as call:
+            status, _, error = self.invoke("serve", "--dry-run")
+        self.assertEqual(status, 0, error)
+        self.assertFalse((self.root / "serve_console.log").exists())
+        call.assert_not_called()
+
+        def start(argv, env):
+            log = (self.root / "serve_console.log").read_text(encoding="utf-8")
+            self.assertIn("[huanyu-determinism] requested", log)
+            self.assertIn("HCCL_DETERMINISTIC=strict", log)
+            self.assertIn("repeat_worker_check=true", log)
+            self.assertNotIn("actual", log)  # Parent cannot certify worker state.
+            self.assertEqual(env["HUANYU_EMBEDDING_AB_DIR"], "")
+            return 0
+
+        with patch.object(LAUNCHER.subprocess, "call", side_effect=start):
+            status, _, error = self.invoke("serve")
+        self.assertEqual(status, 0, error)
+        snapshot = json.loads((self.root / "serve.launch.json").read_text(encoding="utf-8"))
+        self.assertEqual(snapshot["selected_environment"]["HUANYU_SERVE_REPEAT_DETERMINISM"], "1")
+
     def test_full_audit_propagates_to_ray_and_never_overwrites_text_run(self):
         audit = self.temp / "new audit"
         plan = self.plan("rollout", full_weight_audit_dir=audit)

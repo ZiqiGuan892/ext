@@ -25,6 +25,8 @@ def sibling(name):
 
 
 def prepare(args):
+    if getattr(args, "batch_invariant", "true") != "true":
+        raise ValueError("repeat requires --batch-invariant true; deterministic initialization must not be disabled")
     import pyarrow as pa
     import pyarrow.parquet as pq
 
@@ -45,7 +47,9 @@ def prepare(args):
     root = Path(args.output_dir).expanduser().resolve()
     case = copy.deepcopy(original)
     case.update(case_id=uuid.uuid4().hex, sample_size=len(args.samples) * args.repeats)
-    case["engine"]["batch_invariant"] = args.batch_invariant == "true"
+    # Repeat is a new experiment: the source case supplies inputs, not the
+    # determinism policy. In particular an embedding-only source may lack it.
+    case["engine"]["batch_invariant"] = True
     logits_check = getattr(args, "logits_check", "false") == "true"
     case["embedding_check"] = dict(enabled=logits_check, scope="llm_inputs_embeds", strict=True,
                                    expected_tp_size=case["engine"]["tensor_parallel_size"])
@@ -115,6 +119,8 @@ def load_case(directory):
 
 def request(args):
     root, case, rows = load_case(args.case_dir)
+    if case["engine"].get("batch_invariant") is not True:
+        raise ValueError("prepare a new repeat case with batch_invariant=true before sending requests")
     # The shared client makes blocking calls one at a time; no retries, resume
     # or parallel tasks can silently mix different serving processes.
     args.skip_existing = False
@@ -376,7 +382,8 @@ def main(argv=None):
     prep.add_argument("--output-dir", required=True)
     prep.add_argument("--samples", nargs="+", default=["row_000899", "row_000418"])
     prep.add_argument("--repeats", type=int, default=20)
-    prep.add_argument("--batch-invariant", choices=("true", "false"), default="false")
+    prep.add_argument("--batch-invariant", choices=("true", "false"), default="true",
+                      help="Repeat requires true independently of the source case; false is rejected")
     prep.add_argument("--logits-check", choices=("true", "false"), default="false",
                       help="Default false: compare only text; true enables full logits and input embeddings")
     prep.set_defaults(func=prepare)

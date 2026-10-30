@@ -46,6 +46,7 @@ def worker_modules(*, fail=None):
     reload = load_file(PACKAGE + ".weight_reload", ROOT / "weight_reload.py")
     modules = {BASE_MODULE: base, PACKAGE: package, reload.__name__: reload}
     for module_name, installer in (
+        ("repeat_determinism", "install_repeat_determinism_check"),
         ("processor_compat", "install_huanyu_processor_compat"),
         ("rollout_precision", "install_huanyu_rollout_precision"),
         ("cache_precision", "install_huanyu_cache_precision"),
@@ -65,6 +66,20 @@ def worker_modules(*, fail=None):
 
 
 class WorkerExtensionTests(unittest.TestCase):
+    def test_repeat_check_installs_at_worker_factory_without_tensor_probes(self):
+        for fail in (None, "repeat_determinism"):
+            with self.subTest(fail=fail), patch.dict(os.environ, {
+                    "HUANYU_SERVE_REPEAT_DETERMINISM": "1", "HUANYU_EMBEDDING_AB_DIR": ""}), \
+                    worker_modules(fail=fail) as (_, events, _), redirect_stdout(io.StringIO()):
+                if fail:
+                    with self.assertRaisesRegex(RuntimeError, "repeat_determinism unavailable"):
+                        load_file(PACKAGE + ".worker_extension", ROOT / "worker_extension.py")
+                else:
+                    module = load_file(PACKAGE + ".worker_extension", ROOT / "worker_extension.py")
+                    self.assertNotIn("init_device", module.HuanyuColocateWorkerExtension.__dict__)
+                    module.HuanyuColocateWorkerExtension()
+                self.assertEqual(events[0], "repeat_determinism")
+
     def test_factory_import_installs_all_hooks_without_external_registry(self):
         with worker_modules() as (base, events, reload), redirect_stdout(io.StringIO()) as output:
             module = load_file(PACKAGE + ".worker_extension", ROOT / "worker_extension.py")

@@ -26,8 +26,8 @@ def load(name, path):
 repeat = load("serve_repeat_cpu", ROOT / "examples/repeat_huanyu_serve.py")
 text_fixture = load("serve_repeat_text_fixture", ROOT / "tests/test_aqa_text_ab_on_cpu.py")
 probe_fixture = load("serve_repeat_probe_fixture", ROOT / "tests/test_logits_probe_on_cpu.py")
-ENV = {"HCCL_DETERMINISTIC": "true", "ASCEND_LAUNCH_BLOCKING": "1", "NCCL_DETERMINISTIC": "1",
-       "LCCL_DETERMINISTIC": "1", "VLLM_BATCH_INVARIANT": "0"}
+ENV = {"HCCL_DETERMINISTIC": "strict", "ASCEND_LAUNCH_BLOCKING": "1", "NCCL_DETERMINISTIC": "1",
+       "LCCL_DETERMINISTIC": "1", "VLLM_BATCH_INVARIANT": "1"}
 
 
 class ServeRepeatTests(unittest.TestCase):
@@ -46,7 +46,7 @@ class ServeRepeatTests(unittest.TestCase):
     def prepare(self, count=2, logits=True):
         with redirect_stdout(io.StringIO()):
             repeat.prepare(NS(source_case=self.fixture.case, output_dir=self.root, repeats=count,
-                              samples=["row_000000", "row_000001"], batch_invariant="false",
+                              samples=["row_000000", "row_000001"], batch_invariant="true",
                               logits_check="true" if logits else "false"))
         _, self.case, self.rows = repeat.load_case(self.root)
 
@@ -75,7 +75,7 @@ class ServeRepeatTests(unittest.TestCase):
     def captures(self, difference=None):
         helper = probe_fixture.LogitsProbeTests()
         helper.root, helper.case, helper.rows = self.root, self.case, self.rows
-        actual = dict(environment=ENV, batch_invariant_registered=False, torch_deterministic_algorithms=False)
+        actual = dict(environment=ENV, batch_invariant_registered=True, torch_deterministic_algorithms=True)
         for rank in range(4):
             first = self.rows[0]["sample_id"]
             first_id = "huanyuab.{}.{}".format(self.case["case_id"], first)
@@ -155,6 +155,7 @@ class ServeRepeatTests(unittest.TestCase):
             self.assertEqual(sample["matching_baseline_text_requests"], 20)
 
     def test_cli_defaults_disable_inherited_tensor_probes(self):
+        source_before = (self.fixture.case / "case.json").read_bytes()
         with redirect_stdout(io.StringIO()):
             self.assertEqual(repeat.main([
                 "prepare", "--source-case", str(self.fixture.case), "--output-dir", str(self.root),
@@ -163,6 +164,36 @@ class ServeRepeatTests(unittest.TestCase):
         _, case, _ = repeat.load_case(self.root)
         self.assertFalse(case["logits_check"]["enabled"])
         self.assertFalse(case["embedding_check"]["enabled"])
+        self.assertTrue(case["engine"]["batch_invariant"])
+        self.assertEqual((self.fixture.case / "case.json").read_bytes(), source_before)
+
+    def test_source_determinism_never_controls_repeat(self):
+        for enabled in (None, False, True):
+            with self.subTest(source_batch_invariant=enabled):
+                self.source["engine"].pop("batch_invariant", None)
+                if enabled is not None:
+                    self.source["engine"]["batch_invariant"] = enabled
+                path = self.fixture.case / "case.json"
+                path.write_text(json.dumps(self.source), encoding="utf-8")
+                before = path.read_bytes()
+                self.root = self.fixture.root / ("repeat-" + str(enabled))
+                self.prepare(logits=False)
+                self.assertTrue(self.case["engine"]["batch_invariant"])
+                self.assertEqual(path.read_bytes(), before)
+
+    def test_explicit_disable_rejected_before_creating_case(self):
+        with self.assertRaisesRegex(ValueError, "requires --batch-invariant true"):
+            repeat.prepare(NS(batch_invariant="false"))
+        self.assertFalse(self.root.exists())
+
+    def test_old_case_remains_readable_but_cannot_send_new_requests(self):
+        self.prepare(logits=False)
+        self.send()
+        self.case["engine"]["batch_invariant"] = False
+        (self.root / "case.json").write_text(json.dumps(self.case), encoding="utf-8")
+        self.compare("PASS")  # Old text comparisons still describe old outputs.
+        with self.assertRaisesRegex(ValueError, "prepare a new repeat case"):
+            repeat.request(self.fixture.server(root=self.root))
 
     def test_text_difference_without_tensor_files_is_reported(self):
         self.prepare(logits=False)
@@ -278,7 +309,7 @@ class ServeRepeatTests(unittest.TestCase):
     def test_missing_sample_rejected_without_random_fallback(self):
         with self.assertRaisesRegex(ValueError, "absent"):
             repeat.prepare(NS(source_case=self.fixture.case, output_dir=self.root, repeats=20,
-                              samples=["row_000899", "row_000418"], batch_invariant="false"))
+                              samples=["row_000899", "row_000418"], batch_invariant="true"))
         self.assertFalse(self.root.exists())
 
 

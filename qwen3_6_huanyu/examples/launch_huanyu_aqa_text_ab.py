@@ -70,6 +70,8 @@ def build_launch(root, case, project, mode, port=28889, served_model="qwen3.8", 
     batch_invariant = engine.get("batch_invariant", False)
     if not isinstance(batch_invariant, bool):
         raise ValueError("engine.batch_invariant must be a boolean")
+    if repeat and not batch_invariant:
+        raise ValueError("repeat requires batch_invariant=true; prepare a new repeat case with the current script")
     if full_weight_audit_dir is not None and mode != "rollout":
         raise ValueError("--full-weight-audit-dir is only supported for rollout (audit-only)")
     for key, expected in {"temperature": 0, "top_p": 1, "top_k": -1, "n": 1,
@@ -104,6 +106,7 @@ def build_launch(root, case, project, mode, port=28889, served_model="qwen3.8", 
         "HUANYU_FULL_WEIGHT_AUDIT_DIR", "HUANYU_FULL_WEIGHT_AUDIT_RUN_ID",
         "HUANYU_AUDIO_PROBE_DIR", "HUANYU_AUDIO_PROBE_ARM_FILE", "HUANYU_AUDIO_PROBE_FEATURE_ID",
         "HUANYU_EMBEDDING_AB_DIR", "HUANYU_EMBEDDING_AB_SIDE",
+        "HUANYU_SERVE_REPEAT_DETERMINISM",
     )
     env.update({key: "" for key in disabled})
     embedding_check = case.get("embedding_check", {}).get("enabled", False)
@@ -138,7 +141,7 @@ def build_launch(root, case, project, mode, port=28889, served_model="qwen3.8", 
     deterministic_env = {}
     if batch_invariant or repeat:
         deterministic_env = {
-            "HCCL_DETERMINISTIC": "true", "ASCEND_LAUNCH_BLOCKING": "1",
+            "HCCL_DETERMINISTIC": "strict" if repeat else "true", "ASCEND_LAUNCH_BLOCKING": "1",
             "NCCL_DETERMINISTIC": "1", "LCCL_DETERMINISTIC": "1",
         }
         env.update(deterministic_env)
@@ -148,6 +151,11 @@ def build_launch(root, case, project, mode, port=28889, served_model="qwen3.8", 
     # inherited flags; native Ascend sets it to 1 for the requested engine.
     if "batch_invariant" in engine:
         env["VLLM_BATCH_INVARIANT"] = "0"
+    if repeat:
+        # Standalone serving has no shared GenRM process. Force this before
+        # native imports too, then verify native initialization in each worker.
+        env["VLLM_BATCH_INVARIANT"] = "1"
+        env["HUANYU_SERVE_REPEAT_DETERMINISM"] = "1"
     env["HUANYU_TEXT_AB_BATCH_INVARIANT"] = "1" if batch_invariant else "0"
     # Optional arithmetic switches must not leak different shell defaults into
     # the two runs. full sets the remaining reference switches to one itself.
@@ -330,15 +338,14 @@ def main(argv=None):
         project = Path(args.project_root).expanduser().resolve(strict=True)
         plan = build_launch(root, case, project, args.mode, args.port, args.served_model, args.full_weight_audit_dir)
         print("[huanyu-text-ab] " + " ".join(shlex.quote(arg) for arg in plan["command"]), flush=True)
+        notice = None
         if case["engine"].get("batch_invariant"):
-            print("[huanyu-determinism] requested rl_config.enable_batch_invariant=true "
-                  "HCCL_DETERMINISTIC=true (native worker upgrades to strict) "
-                  "ASCEND_LAUNCH_BLOCKING=1 NCCL_DETERMINISTIC=1 LCCL_DETERMINISTIC=1 "
-                  "block_size=128 graph=eager", flush=True)
-        elif case.get("serve_repeat"):
-            print("[huanyu-determinism] repeat test: HCCL_DETERMINISTIC=true "
-                  "ASCEND_LAUNCH_BLOCKING=1 NCCL_DETERMINISTIC=1 LCCL_DETERMINISTIC=1 "
-                  "VLLM_BATCH_INVARIANT=0 BS=1 graph=eager; these are requested settings", flush=True)
+            notice = ("[huanyu-determinism] requested rl_config.enable_batch_invariant=true "
+                      "HCCL_DETERMINISTIC=" + plan["env"]["HCCL_DETERMINISTIC"] + " "
+                      "ASCEND_LAUNCH_BLOCKING=1 NCCL_DETERMINISTIC=1 LCCL_DETERMINISTIC=1 "
+                      "block_size=128 BS=1 graph=eager repeat_worker_check="
+                      + str(bool(case.get("serve_repeat"))).lower())
+            print(notice, flush=True)
         if args.dry_run:
             return 0
         if not Path(case["model_path"]).is_dir() or not Path(case["subset_parquet"]).is_file():
@@ -367,6 +374,7 @@ def main(argv=None):
                 "HUANYU_TRAIN_AUDIO_ENCODER", "HUANYU_TRAIN_AUDIO_PROJECTOR",
                 "HUANYU_FULL_WEIGHT_AUDIT_DIR", "HUANYU_FULL_WEIGHT_AUDIT_RUN_ID",
                 "HUANYU_EMBEDDING_AB_DIR", "HUANYU_EMBEDDING_AB_SIDE",
+                "HUANYU_SERVE_REPEAT_DETERMINISM",
             )
         }
         snapshot["selected_environment"].update({
@@ -380,6 +388,11 @@ def main(argv=None):
             with (root / "serve.deploy.yaml").open("x", encoding="utf-8") as stream:
                 json.dump(plan["deploy"], stream, ensure_ascii=False, indent=2)
                 stream.write("\n")
+            # The child installs tee only after this parent has printed the
+            # request. Persist it explicitly, including in text-only repeat.
+            if notice:
+                with (root / "serve_console.log").open("a", encoding="utf-8") as stream:
+                    stream.write(notice + "\n")
         return subprocess.call(plan["argv"], env=plan["env"])
     except (OSError, ValueError, KeyError) as exc:
         print("[huanyu-text-ab] ERROR: {}".format(exc), file=sys.stderr)
