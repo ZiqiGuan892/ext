@@ -19,6 +19,7 @@ import math
 import os
 from pathlib import Path
 import socket
+import sys
 from types import MethodType
 import uuid
 
@@ -237,6 +238,25 @@ def _reduce_sample(sampler):
     return False  # Upstream Sampler.greedy_sample has no reduce-sample branch.
 
 
+def _determinism_state():
+    import torch
+
+    # Observe the already-initialized worker; importing the Ascend module here
+    # could itself change execution. Unknown version markers stay unknown.
+    module = sys.modules.get("vllm_ascend.batch_invariant")
+    registered = None
+    if module is not None and hasattr(module, "_batch_invariant_LIB"):
+        registered = module._batch_invariant_LIB is not None
+    return {
+        "environment": {key: os.environ.get(key) for key in (
+            "VLLM_BATCH_INVARIANT", "HCCL_DETERMINISTIC", "ASCEND_LAUNCH_BLOCKING",
+            "NCCL_DETERMINISTIC", "LCCL_DETERMINISTIC")},
+        "batch_invariant_registered": registered,
+        "torch_deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
+        "torch_deterministic_warn_only": torch.is_deterministic_algorithms_warn_only_enabled(),
+    }
+
+
 def _bind_sampler(runner, state):
     sampler = getattr(runner, "sampler", None)
     if sampler is None:
@@ -259,7 +279,10 @@ def _bind_sampler(runner, state):
                                  or k in ("HUANYU_GRAPH_MODE", "HCCL_OP_EXPANSION_MODE", "ASCEND_WEIGHT_NZ_MODE")}}
     llm = getattr(getattr(getattr(runner.model, "thinker", None), "llm", None), "model", None)
     runtime["llm_forward"] = _source(llm.forward) if llm is not None else None
+    runtime["determinism"] = _determinism_state()
     _write(state, runtime)
+    print("[huanyu-determinism] actual side=%s tp_rank=%s %s" % (
+        state["side"], state["tp_rank"], json.dumps(runtime["determinism"], sort_keys=True)), flush=True)
 
     @wraps(greedy)
     def observe_greedy(self, logits):

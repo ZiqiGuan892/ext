@@ -132,6 +132,13 @@ class WorkerExtensionTests(unittest.TestCase):
         self.assertNotIn("worker_extension_cls", parent_extras)
         self.assertEqual(adapter.get_stage_engine_extras(1), {})
         self.assertIs(registry["qwen3_6_huanyu"], adapter)
+        with patch.dict(os.environ, {"HUANYU_TEXT_AB_BATCH_INVARIANT": "1"}):
+            extra = adapter.get_stage_engine_extras(0)
+            self.assertEqual(extra["additional_config"]["rl_config"],
+                             {"enabled": True, "enable_batch_invariant": True})
+            self.assertEqual(extra["additional_config"]["weight_nz_mode"], 0)
+            self.assertEqual(adapter.get_stage_engine_extras(1), {})
+        self.assertEqual(parent_extras["additional_config"], {"weight_nz_mode": 0})
 
         # Execute the real local server's deploy writer with only its external
         # IO dependencies stubbed. This checks the rendered per-stage contract,
@@ -148,13 +155,14 @@ class WorkerExtensionTests(unittest.TestCase):
         exec(compile(compiled, str(server_path), "exec"), scope)
         server = SimpleNamespace(config=SimpleNamespace(tensor_model_parallel_size=4))
         kwargs = {}
-        with patch.dict(os.environ, {"TEST_DEVICES": "4,5,6,7"}):
+        with patch.dict(os.environ, {"TEST_DEVICES": "4,5,6,7", "HUANYU_TEXT_AB_BATCH_INVARIANT": "1"}):
             scope["_write_deploy_config"](server, kwargs, "qwen3_6_huanyu", adapter, "thinker_only")
         try:
             saved = json.loads(Path(kwargs["deploy_config"]).read_text())
             self.assertEqual(saved["stages"][0]["engine_extras"]["worker_extension_cls"], expected)
             self.assertEqual(saved["stages"][0]["devices"], "0,1,2,3")
             self.assertEqual(saved["stages"][0]["tensor_parallel_size"], 4)
+            self.assertTrue(saved["stages"][0]["engine_extras"]["additional_config"]["rl_config"]["enable_batch_invariant"])
         finally:
             server._temp_deploy_ctx.cleanup()
 

@@ -164,6 +164,46 @@ class TextABLauncherTests(unittest.TestCase):
         self.assertEqual(Path(plan["command"][1]),
                          self.project / "examples/qwen3_6_huanyu/run_huanyu_aqa_audio_train.sh")
 
+    def test_batch_invariance_reaches_both_engines_and_ray_without_enabling_genrm(self):
+        self.case["engine"]["batch_invariant"] = True
+        with patch.dict(os.environ, {"ASCEND_LAUNCH_BLOCKING": "0", "VLLM_BATCH_INVARIANT": "1"}):
+            serve, rollout = self.plan("serve"), self.plan("rollout")
+        stage = serve["deploy"]["stages"][0]
+        options = hydra_options(rollout)
+        self.assertEqual(stage["engine_extras"]["additional_config"]["rl_config"],
+                         {"enabled": True, "enable_batch_invariant": True})
+        self.assertEqual(cli_option(serve["command"], "--block-size"), "128")
+        self.assertEqual(stage["block_size"], 128)
+        prefix = "actor_rollout_ref.rollout.engine_kwargs.vllm_omni."
+        self.assertEqual(options[prefix + "additional_config.rl_config.enabled"], "true")
+        self.assertEqual(options[prefix + "additional_config.rl_config.enable_batch_invariant"], "true")
+        self.assertEqual(options[prefix + "block_size"], "128")
+        expected = {"HCCL_DETERMINISTIC": "true", "ASCEND_LAUNCH_BLOCKING": "1",
+                    "NCCL_DETERMINISTIC": "1", "LCCL_DETERMINISTIC": "1", "VLLM_BATCH_INVARIANT": "0",
+                    "HUANYU_TEXT_AB_BATCH_INVARIANT": "1"}
+        for key, value in expected.items():
+            self.assertEqual(serve["env"][key], value)
+            self.assertEqual(rollout["env"][key], value)
+            self.assertEqual(json.loads(options["ray_kwargs.ray_init.runtime_env.env_vars." + key]), value)
+        self.assertTrue(stage["enforce_eager"])
+        self.assertFalse(stage["enable_chunked_prefill"])
+        self.assertFalse(stage["enable_prefix_caching"])
+        self.assertFalse(any("reward_model" in k and "batch_invariant" in k for k in options))
+
+    def test_external_launch_blocking_is_preserved_and_forwarded_to_ray(self):
+        self.case["engine"]["batch_invariant"] = False
+        with patch.dict(os.environ, {"ASCEND_LAUNCH_BLOCKING": "1", "VLLM_BATCH_INVARIANT": "1"}):
+            for mode in ("serve", "rollout"):
+                plan = self.plan(mode)
+                self.assertEqual(plan["env"]["ASCEND_LAUNCH_BLOCKING"], "1")
+                self.assertEqual(plan["env"]["VLLM_BATCH_INVARIANT"], "0")
+                if mode == "rollout":
+                    self.assertEqual(json.loads(hydra_options(plan)[
+                        "ray_kwargs.ray_init.runtime_env.env_vars.ASCEND_LAUNCH_BLOCKING"]), "1")
+        with patch.dict(os.environ, {"ASCEND_LAUNCH_BLOCKING": "invalid"}):
+            with self.assertRaisesRegex(ValueError, "ASCEND_LAUNCH_BLOCKING"):
+                self.plan("rollout")
+
     def test_full_audit_propagates_to_ray_and_never_overwrites_text_run(self):
         audit = self.temp / "new audit"
         plan = self.plan("rollout", full_weight_audit_dir=audit)

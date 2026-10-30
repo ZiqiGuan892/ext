@@ -174,7 +174,8 @@ def prepare_case(args):
         "engine": {"tensor_parallel_size": args.tp, "prompt_length": 3072,
                    "max_model_len": context, "max_num_batched_tokens": context,
                    "max_num_seqs": 1, "dtype": "bfloat16", "gpu_memory_utilization": 0.5,
-                   "enforce_eager": True},
+                   "enforce_eager": True,
+                   "batch_invariant": getattr(args, "batch_invariant", "false") == "true"},
     }
     # Written last: a failed preparation never looks like a completed case.
     write_json(root / "case.json", case)
@@ -437,8 +438,10 @@ def main(argv=None):
                          help="Collect actual LLM input embeddings on both engines (default: true)")
     prepare.add_argument("--logits-check", choices=("true", "false"), default="false",
                          help="Capture final worker sampling controls and actual logits/greedy decisions")
+    prepare.add_argument("--batch-invariant", choices=("true", "false"), default="false",
+                         help="Enable Ascend RL batch invariance on both engines; requires installed custom ops")
     prepare.add_argument("--logits-max-steps", type=int, default=0,
-                         help="0 captures through max-tokens/EOS; positive values limit capture. Start with sample-size 2")
+                         help="0 captures through max-tokens/EOS; positive values limit capture. Start with sample-size 4")
     prepare.set_defaults(function=prepare_case)
     serve = commands.add_parser("serve", help="Send the shared case to an already-running HTTP service")
     serve.add_argument("--case-dir", required=True)

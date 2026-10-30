@@ -1029,7 +1029,7 @@ python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/aqa_text_ab.py" compare --case-di
 
 服务器提供的 Ascend 实现存在 `enable_reduce_sample` 分支。探针读取实际开关：开启时保存每个 TP rank 的词表分片并检查全局 argmax；关闭时各 rank 记录完整词表 SHA256，TP0 保存完整向量。两端分片布局不同会明确报告，不能将本地分片直接当作完整词表比较。探针不自动切换此开关，以免掩盖实际差异。
 
-先用2条数据，保留本次2048输出上限（允许EOS）。新目录不能与旧实验混用；需两节点代码一致，Ray 按已有32卡验证环境启动。两端顺序运行，避免与已有服务争用同一组NPU。
+先用4条数据，保留本次2048输出上限（允许EOS）。当前AQA启动预检要求至少一个train batch（4条），即使是val_only也不能只准备2条。新目录不能与旧实验混用；需两节点代码一致，Ray 按已有32卡验证环境启动。两端顺序运行，避免与已有服务争用同一组NPU。
 
 ```bash
 export PROJECT_ROOT=/opt/huawei/dataset/infra_data/code/verl_omni_qwen36_gzq_new
@@ -1040,7 +1040,7 @@ python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/aqa_text_ab.py" prepare \
   --parquet /opt/huawei/dataset/infra_data/data/aqa_dataset/validation.parquet \
   --export-dir /opt/huawei/dataset/infra_data/data/validation_vllm \
   --model-path "$MODEL_PATH" --output-dir "$AB_ROOT" \
-  --sample-size 2 --seed 42 --prompt-mode system_audio \
+  --sample-size 4 --seed 42 --prompt-mode system_audio \
   --max-tokens 2048 --embedding-check true --logits-check true
 
 # 终端A：启动带相同精度策略和真实探针的serve，等待服务就绪。
@@ -1059,7 +1059,7 @@ python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/compare_huanyu_prompt_embeddings.
 python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/compare_huanyu_logits.py" --case-dir "$AB_ROOT"
 ```
 
-`--logits-max-steps 0`（默认）取本次 `max_tokens`，包含全部实际生成步骤。可以显式设为128做短窗口诊断；它只限制采集，不改变引擎生成长度。以约248K词表、FP32为例，一个边界每步约0.95MiB；2条、两端、每条2048步约7.6GiB，多个边界数值不同时还会增加。相同向量在同一步文件内去重，其他TP rank在非分片模式下只存摘要。先不要直接对100条做全程向量导出。设备到CPU复制是阻塞的，会减慢推理；不能用本次耗时衡量正常吞吐。
+`--logits-max-steps 0`（默认）取本次 `max_tokens`，包含全部实际生成步骤。可以显式设为128做短窗口诊断；它只限制采集，不改变引擎生成长度。以约248K词表、FP32为例，一个边界每步约0.95MiB；4条、两端、每条2048步约15.2GiB，多个边界数值不同时还会增加。相同向量在同一步文件内去重，其他TP rank在非分片模式下只存摘要。先不要直接对100条做全程向量导出。设备到CPU复制是阻塞的，会减慢推理；不能用本次耗时衡量正常吞吐。
 
 产物位于 `$AB_ROOT/logits/serve/`、`$AB_ROOT/logits/rollout/`（JSON元数据+无pickle的NPZ向量）；总报告是 `$AB_ROOT/logits_comparison.json`。日志关键词为 `[huanyu-logits-ab]`。读报告时关注：
 
@@ -1074,3 +1074,65 @@ python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/compare_huanyu_logits.py" --case-
 该模式要求单请求、eager、无prefix cache、无chunked prefill、无投机解码，并显式关闭async scheduling，以核对实际CPU前缀与调度步骤。不会修改采样参数来“修正”被覆盖的值，也不会手动调用第二次forward或sampler。本地CPU验证不等同于NPU验证；不支持的服务器接口会报告不完整或停止，而不会产出假PASS。
 
 本次106项CPU回归通过，覆盖探针、比较器、A/B启动器、数据准备及原embedding链路；包含原地修改logits、独立execute/sample生命周期、prefill/decode首次分歧、实际参数被覆盖、TP分片全局argmax、缺步骤/缺rank/损坏文件、提前中断与显式采集窗口的区分。服务器NPU执行尚待验证。
+
+### 13.1 开启 Ascend 批量不变性后对比
+
+准备case时增加 `--batch-invariant true`，两端共同启用 `additional_config.rl_config.enabled=true` 和 `enable_batch_invariant=true`；stage extras和外层参数均携带该配置，避免deploy合并时被覆盖。保持TP4、BF16、贪心、max_num_seqs=1，关闭prefix cache、chunked prefill和async scheduling，block_size=128。保留full精度策略和eager：当前Python reference与完整输入/logits探针不支持图捕获，不能直接叠加官方示例的PIECEWISE。
+
+依照 [Ascend 批量不变性文档](https://docs.vllm.ai/projects/ascend/en/latest/user_guide/feature_guide/batch_invariance.html)，两节点须已有匹配当前版本的自定义算子；只在运行时export编译变量不会补齐安装。先在两节点的训练Python环境检查：
+
+```bash
+python3 - <<'PY'
+import torch
+import batch_invariant_ops
+print(torch.ops.batch_invariant_ops.npu_matmul_batch_invariant)
+PY
+```
+
+该检查只验证扩展可导入/接口存在；失败时先按相同版本的Ascend源码安装算子，不能宣称测试已启用。Huanyu自定义模型的效果仍需实测。
+
+```bash
+export PROJECT_ROOT=/opt/huawei/dataset/infra_data/code/verl_omni_qwen36_gzq_new
+export MODEL_PATH=/opt/huawei/dataset/model_gy/downloaded_models/2748
+export RM_MODEL_PATH=/opt/huawei/dataset/model_gy/downloaded_models/Qwen3.5-35B-A3B
+export HCCL_DETERMINISTIC=true
+export ASCEND_LAUNCH_BLOCKING=1
+export NCCL_DETERMINISTIC=1
+export LCCL_DETERMINISTIC=1
+export AB_ROOT="$PROJECT_ROOT/runs/huanyu_deterministic_ab_$(date +%Y%m%d_%H%M%S)"
+echo "$AB_ROOT"
+
+python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/aqa_text_ab.py" prepare \
+  --parquet /opt/huawei/dataset/infra_data/data/aqa_dataset/validation.parquet \
+  --export-dir /opt/huawei/dataset/infra_data/data/validation_vllm \
+  --model-path "$MODEL_PATH" --output-dir "$AB_ROOT" \
+  --sample-size 4 --seed 42 --prompt-mode system_audio --enable-thinking true \
+  --max-tokens 2048 --batch-invariant true \
+  --embedding-check true --logits-check true --logits-max-steps 0
+
+# 终端A，等待服务就绪。
+python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/launch_huanyu_aqa_text_ab.py" serve \
+  --case-dir "$AB_ROOT" --port 28889 --served-model qwen3.8
+
+# 终端B设为同一个PROJECT_ROOT和AB_ROOT后执行。
+python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/aqa_text_ab.py" serve \
+  --case-dir "$AB_ROOT" --url http://localhost:28889/v1/chat/completions \
+  --model qwen3.8 --timeout-s 3600
+
+# 请求完成后Ctrl-C退出本次serve、释放NPU；Ray沿用已有32卡环境。
+set -o pipefail
+RAY_ADDRESS=auto python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/launch_huanyu_aqa_text_ab.py" rollout \
+  --case-dir "$AB_ROOT" 2>&1 | tee "$AB_ROOT/rollout_console.log"
+
+python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/aqa_text_ab.py" compare --case-dir "$AB_ROOT"
+python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/compare_huanyu_logits.py" --case-dir "$AB_ROOT"
+
+grep -E 'huanyu-determinism|Enabling batch-invariant|skipping batch-invariant' \
+  "$AB_ROOT/serve_console.log" "$AB_ROOT/rollout_console.log"
+```
+
+启动器为两端设置HCCL=true、ASCEND_LAUNCH_BLOCKING=1、NCCL=1、LCCL=1，并显式转发Ray runtime_env；底层脚本保留外部ASCEND_LAUNCH_BLOCKING值。`ASCEND_LAUNCH_BLOCKING=1`是算子同步执行/定位异步报错开关，会影响性能，不是硬件数值确定性保证，见[torch_npu说明](https://github.com/Ascend/pytorch/blob/master/docs/zh/api/environment_variable/op_execution/ASCEND_LAUNCH_BLOCKING.md)。NPU通信走HCCL；NCCL_DETERMINISTIC按请求保留，不作为NPU确定性依据。
+
+`VLLM_BATCH_INVARIANT`在共享Ray环境先清为0，随后由Actor引擎的RL配置在创建worker前启用；避免把GenRM也切到需要不同cache配置的模式。已启动推理worker的`[huanyu-determinism] actual`与`logits/*/runtime-*.json`才是最终证据：VLLM_BATCH_INVARIANT=1、HCCL_DETERMINISTIC=strict（原生初始化从true升级）、其余三项=1、batch_invariant_registered=true、torch_deterministic_algorithms=true。仅requested日志或launch.json不够。未知版本无法确认注册则INCOMPLETE；两端同时未启用也不能PASS。注册成功并不证明每个自定义算子都满足不变性，最终仍比较prefill和所有decode的实际logits/选词。
+
+135项CPU回归通过，包括最终环境观测、两侧均未生效的反例、Ray传递和生成deploy中的参数保留；尚未在NPU验证。此前HTTP500 `Stage-0 has no live replica`需另查原始worker异常，开启这些参数本身不能证明该故障已修复。

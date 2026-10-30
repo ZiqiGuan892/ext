@@ -188,6 +188,45 @@ class LogitsProbeTests(unittest.TestCase):
         self.assertEqual(len(item["decode"]), 3)
         self.assertTrue(item["full_generation_captured"])
 
+    def test_worker_determinism_is_observed_without_importing_or_mutating_ascend(self):
+        module = ModuleType("vllm_ascend.batch_invariant")
+        module._batch_invariant_LIB = object()
+        with patch.dict(sys.modules, {module.__name__: module}), patch.dict(os.environ, {
+            "HCCL_DETERMINISTIC": "strict", "ASCEND_LAUNCH_BLOCKING": "1"}):
+            actual = probe._determinism_state()
+        self.assertTrue(actual["batch_invariant_registered"])
+        self.assertEqual(actual["environment"]["HCCL_DETERMINISTIC"], "strict")
+        self.assertEqual(actual["environment"]["ASCEND_LAUNCH_BLOCKING"], "1")
+
+    def test_both_engines_silently_skipping_batch_invariance_cannot_pass(self):
+        self.case["engine"]["batch_invariant"] = True
+        self.both()
+        for path in (self.root / "logits").rglob("*.json"):
+            record = compare.read(path)
+            if record["kind"] == "runtime":
+                record["determinism"]["batch_invariant_registered"] = False
+                path.write_text(json.dumps(record), encoding="utf-8")
+        report = self.report()
+        self.assertEqual(report["summary"]["status"], "DIFFERENT")
+        self.assertTrue(report["samples"][0]["runtime_differences"])
+
+    def test_missing_native_registration_evidence_is_incomplete(self):
+        self.case["engine"]["batch_invariant"] = True
+        self.both()
+        report = self.report()
+        self.assertEqual(report["summary"]["status"], "INCOMPLETE")
+        self.assertTrue(any("registration" in x["error"] for x in report["samples"][0]["issues"]))
+
+    def test_requested_batch_mode_requires_final_worker_values_and_registration(self):
+        self.case["engine"]["batch_invariant"] = True
+        actual = {"environment": {"VLLM_BATCH_INVARIANT": "1", "HCCL_DETERMINISTIC": "strict",
+                                  "ASCEND_LAUNCH_BLOCKING": "1", "NCCL_DETERMINISTIC": "1",
+                                  "LCCL_DETERMINISTIC": "1"},
+                  "batch_invariant_registered": True, "torch_deterministic_algorithms": True}
+        with patch.object(probe, "_determinism_state", return_value=actual):
+            self.both()
+        self.assertEqual(self.report()["summary"]["status"], "PASS")
+
     def test_observer_does_not_change_actual_forward_and_preserves_pre_mutation_bytes(self):
         runner = self.runner("serve", penalty=4.0)
         output = self.step(runner)

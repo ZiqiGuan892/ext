@@ -73,12 +73,13 @@ class TextCaseTests(unittest.TestCase):
             "".join(json.dumps(x, ensure_ascii=False) + "\n" for x in manifest), encoding="utf-8")
         return rows
 
-    def prepare(self, size=3, mode="system_audio", destination=None, embedding=False, logits=False, max_steps=0):
+    def prepare(self, size=3, mode="system_audio", destination=None, embedding=False, logits=False, max_steps=0, invariant=False):
         args = SimpleNamespace(parquet=str(self.source), export_dir=str(self.export),
                                output_dir=str(destination or self.case), sample_size=size, seed=42,
                                prompt_mode=mode, model_path=str(self.model), enable_thinking="true", tp=4,
                                max_tokens=2048, embedding_check="true" if embedding else "false",
-                               logits_check="true" if logits else "false", logits_max_steps=max_steps)
+                               logits_check="true" if logits else "false", logits_max_steps=max_steps,
+                               batch_invariant="true" if invariant else "false")
         with redirect_stdout(io.StringIO()):
             self.assertEqual(ab.prepare_case(args), 0)
         return ab.load_case(destination or self.case)
@@ -89,6 +90,11 @@ class TextCaseTests(unittest.TestCase):
         self.assertEqual(case["logits_check"]["max_steps"], case["sampling"]["max_tokens"])
         _, limited, _ = self.prepare(embedding=True, logits=True, max_steps=128, destination=self.root / "limited")
         self.assertEqual(limited["logits_check"]["max_steps"], 128)
+
+    def test_batch_invariance_is_persisted_in_the_shared_case(self):
+        self.fixtures(count=4)
+        _, case, _ = self.prepare(size=4, invariant=True)
+        self.assertIs(case["engine"]["batch_invariant"], True)
 
     def test_logits_without_embedding_identity_rejected_before_case_creation(self):
         self.fixtures(count=3)

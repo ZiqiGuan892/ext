@@ -201,11 +201,26 @@ def compare_case(root, case, rows):
             if a_runtime is None or b_runtime is None:
                 item["issues"].append({"tp_rank": rank, "error": "missing live worker runtime record"})
                 continue
-            runtime_keys = ("config", "enable_reduce_sample", "sampler_forward", "greedy_sample", "sampler_sample", "compute_logits", "llm_forward", "precision_env")
-            runtime_diff = differences(_portable({k: a_runtime[k] for k in runtime_keys}),
-                                       _portable({k: b_runtime[k] for k in runtime_keys}))
+            runtime_keys = ("config", "enable_reduce_sample", "sampler_forward", "greedy_sample", "sampler_sample", "compute_logits", "llm_forward", "precision_env", "determinism")
+            runtime_diff = differences(_portable({k: a_runtime.get(k) for k in runtime_keys}),
+                                       _portable({k: b_runtime.get(k) for k in runtime_keys}))
             if runtime_diff:
                 item["runtime_differences"].append({"tp_rank": rank, "differences": runtime_diff})
+            if case["engine"].get("batch_invariant"):
+                expected_env = {"VLLM_BATCH_INVARIANT": "1", "HCCL_DETERMINISTIC": "strict",
+                                "ASCEND_LAUNCH_BLOCKING": "1", "NCCL_DETERMINISTIC": "1",
+                                "LCCL_DETERMINISTIC": "1"}
+                for side, runtime in (("serve", a_runtime), ("rollout", b_runtime)):
+                    actual = runtime.get("determinism") or {}
+                    if actual.get("batch_invariant_registered") is None:
+                        item["issues"].append({"side": side, "tp_rank": rank,
+                                               "error": "cannot verify native batch-invariant registration"})
+                    requested = dict(environment=expected_env, batch_invariant_registered=True,
+                                     torch_deterministic_algorithms=True)
+                    diff = differences(requested, {k: actual.get(k) for k in requested})
+                    if diff:
+                        item["runtime_differences"].append({"side": side, "tp_rank": rank,
+                                                            "vs_case_determinism": diff})
             for step in sorted(set(left) & set(right)):
                 lp, a = left[step]
                 rp, b = right[step]

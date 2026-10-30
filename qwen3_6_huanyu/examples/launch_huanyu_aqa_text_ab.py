@@ -64,6 +64,9 @@ def file_hash(path):
 def build_launch(root, case, project, mode, port=28889, served_model="qwen3.8", full_weight_audit_dir=None):
     """Return an argv/environment/deploy plan; never execute or import vLLM here."""
     sampling, engine = case["sampling"], case["engine"]
+    batch_invariant = engine.get("batch_invariant", False)
+    if not isinstance(batch_invariant, bool):
+        raise ValueError("engine.batch_invariant must be a boolean")
     if full_weight_audit_dir is not None and mode != "rollout":
         raise ValueError("--full-weight-audit-dir is only supported for rollout (audit-only)")
     for key, expected in {"temperature": 0, "top_p": 1, "top_k": -1, "n": 1,
@@ -111,6 +114,9 @@ def build_launch(root, case, project, mode, port=28889, served_model="qwen3.8", 
         "HUANYU_EMBEDDING_AB_SIDE": mode if embedding_check and full_weight_audit_dir is None else "",
     }
     env.update(embedding_env)
+    blocking = "1" if batch_invariant else env.get("ASCEND_LAUNCH_BLOCKING", "0")
+    if blocking not in ("0", "1"):
+        raise ValueError("ASCEND_LAUNCH_BLOCKING must be 0 or 1")
     env.update({
         "PROJECT_ROOT": str(project), "MODEL_PATH": checkpoint,
         "HUANYU_PRECISION_PROFILE": "full", "HUANYU_GRAPH_MODE": "0",
@@ -123,9 +129,23 @@ def build_launch(root, case, project, mode, port=28889, served_model="qwen3.8", 
         "ASCEND_ENABLE_TRANS_DATA_CACHE": "0",
         "VLLM_ASCEND_ENABLE_NZ": "0", "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
         "VLLM_USE_V1": "0", "USE_OPTIMIZED_MODEL": "0", "MULTI_STREAM_MEMORY_REUSE": "2",
-        "TASK_QUEUE_ENABLE": "0", "ASCEND_LAUNCH_BLOCKING": "0",
+        "TASK_QUEUE_ENABLE": "0", "ASCEND_LAUNCH_BLOCKING": blocking,
         "HCCL_OP_EXPANSION_MODE": env.get("HCCL_OP_EXPANSION_MODE") or "AIV",
     })
+    deterministic_env = {}
+    if batch_invariant:
+        deterministic_env = {
+            "HCCL_DETERMINISTIC": "true", "ASCEND_LAUNCH_BLOCKING": "1",
+            "NCCL_DETERMINISTIC": "1", "LCCL_DETERMINISTIC": "1",
+        }
+        env.update(deterministic_env)
+    # Activate batch invariance through the actor engine's RL config. Setting
+    # VLLM_BATCH_INVARIANT=1 in the shared Ray environment would also enable it
+    # on GenRM, which has different cache/chunked-prefill settings. Clear stale
+    # inherited flags; native Ascend sets it to 1 for the requested engine.
+    if "batch_invariant" in engine:
+        env["VLLM_BATCH_INVARIANT"] = "0"
+    env["HUANYU_TEXT_AB_BATCH_INVARIANT"] = "1" if batch_invariant else "0"
     # Optional arithmetic switches must not leak different shell defaults into
     # the two runs. full sets the remaining reference switches to one itself.
     for key in (
@@ -154,7 +174,8 @@ def build_launch(root, case, project, mode, port=28889, served_model="qwen3.8", 
             "interleave_mm_strings": True,
             "limit_mm_per_prompt": {"image": 96, "audio": 64, "video": 1},
             "media_io_kwargs": {"video": {"fps": 1, "num_frames": 128}},
-            "additional_config": {"weight_nz_mode": 0, "rl_config": {"enabled": True}},
+            "additional_config": {"weight_nz_mode": 0, "rl_config": {
+                "enabled": True, "enable_batch_invariant": batch_invariant}},
             "worker_extension_cls": "verl_omni_ext.models.qwen3_6_huanyu.worker_extension.HuanyuColocateWorkerExtension",
         }
         engine_values = {
@@ -166,6 +187,8 @@ def build_launch(root, case, project, mode, port=28889, served_model="qwen3.8", 
         }
         if logits_check:
             engine_values["async_scheduling"] = False
+        if batch_invariant:
+            engine_values["block_size"] = 128
         # This is the same registered pipeline/stage/extras used by the Huanyu
         # rollout adapter. JSON is valid YAML and needs no YAML dependency.
         deploy = {"pipeline": "qwen3_6_whisper_thinker_only", "stages": [{
@@ -187,6 +210,8 @@ def build_launch(root, case, project, mode, port=28889, served_model="qwen3.8", 
         ]
         if logits_check:
             command.append("--no-async-scheduling")
+        if batch_invariant:
+            command.extend(["--block-size", "128"])
         env["HUANYU_TEXT_AB_SERVE_LOG"] = str(root / "serve_console.log")
         shell = ('set -euo pipefail\n'
                  'source "$PROJECT_ROOT/examples/qwen3_6_huanyu/graph_mode.sh"\n'
@@ -246,6 +271,19 @@ def build_launch(root, case, project, mode, port=28889, served_model="qwen3.8", 
         command.extend("++ray_kwargs.ray_init.runtime_env.env_vars.{}=\"\"".format(key) for key in disabled)
         if logits_check:
             command.append("++actor_rollout_ref.rollout.engine_kwargs.vllm_omni.async_scheduling=false")
+        command.append("++actor_rollout_ref.rollout.engine_kwargs.vllm_omni.additional_config.rl_config.enable_batch_invariant="
+                       + str(batch_invariant).lower())
+        if batch_invariant:
+            command.extend([
+                "++actor_rollout_ref.rollout.engine_kwargs.vllm_omni.additional_config.rl_config.enabled=true",
+                "++actor_rollout_ref.rollout.engine_kwargs.vllm_omni.block_size=128",
+            ])
+        worker_env = dict(deterministic_env, ASCEND_LAUNCH_BLOCKING=blocking,
+                          HUANYU_TEXT_AB_BATCH_INVARIANT=env["HUANYU_TEXT_AB_BATCH_INVARIANT"])
+        if "batch_invariant" in engine:
+            worker_env["VLLM_BATCH_INVARIANT"] = "0"
+        command.extend("++ray_kwargs.ray_init.runtime_env.env_vars." + key + "=" + hydra_string(value)
+                       for key, value in worker_env.items())
         for key, value in embedding_env.items():
             prefix = "++ray_kwargs.ray_init.runtime_env.env_vars." + key + "="
             command = [arg for arg in command if not arg.startswith(prefix)]
@@ -289,6 +327,11 @@ def main(argv=None):
         project = Path(args.project_root).expanduser().resolve(strict=True)
         plan = build_launch(root, case, project, args.mode, args.port, args.served_model, args.full_weight_audit_dir)
         print("[huanyu-text-ab] " + " ".join(shlex.quote(arg) for arg in plan["command"]), flush=True)
+        if case["engine"].get("batch_invariant"):
+            print("[huanyu-determinism] requested rl_config.enable_batch_invariant=true "
+                  "HCCL_DETERMINISTIC=true (native worker upgrades to strict) "
+                  "ASCEND_LAUNCH_BLOCKING=1 NCCL_DETERMINISTIC=1 LCCL_DETERMINISTIC=1 "
+                  "block_size=128 graph=eager", flush=True)
         if args.dry_run:
             return 0
         if not Path(case["model_path"]).is_dir() or not Path(case["subset_parquet"]).is_file():
@@ -319,6 +362,10 @@ def main(argv=None):
                 "HUANYU_EMBEDDING_AB_DIR", "HUANYU_EMBEDDING_AB_SIDE",
             )
         }
+        snapshot["selected_environment"].update({
+            key: plan["env"].get(key) for key in ("VLLM_BATCH_INVARIANT", "HCCL_DETERMINISTIC",
+                                                "ASCEND_LAUNCH_BLOCKING", "NCCL_DETERMINISTIC", "LCCL_DETERMINISTIC")
+        })
         with target.open("x", encoding="utf-8") as stream:
             json.dump(snapshot, stream, ensure_ascii=False, indent=2)
             stream.write("\n")

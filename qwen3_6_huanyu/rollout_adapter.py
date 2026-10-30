@@ -1,5 +1,7 @@
 """Select the existing Huanyu-capable vLLM wrapper with an isolated verl alias."""
 
+import os
+
 from verl_omni.pipelines.model_base import OmniRolloutPipelineBase
 from verl_omni_ext.models.qwen3_6_whisper.rollout_adapter import Qwen36WhisperRolloutAdapter
 
@@ -26,4 +28,11 @@ class Qwen36HuanyuRolloutAdapter(Qwen36WhisperRolloutAdapter):
             extras["worker_extension_cls"] = (
                 "verl_omni_ext.models.qwen3_6_huanyu.worker_extension.HuanyuColocateWorkerExtension"
             )
+            # Keep generated stage extras and outer CLI kwargs consistent:
+            # native deploy precedence may replace the entire additional_config.
+            # This adapter belongs to the actor, not the separate GenRM pipeline.
+            if os.environ.get("HUANYU_TEXT_AB_BATCH_INVARIANT") == "1":
+                additional = dict(extras.get("additional_config", {}))
+                additional["rl_config"] = {"enabled": True, "enable_batch_invariant": True}
+                extras["additional_config"] = additional
         return extras
