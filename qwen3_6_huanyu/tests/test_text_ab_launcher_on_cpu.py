@@ -204,24 +204,27 @@ class TextABLauncherTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "ASCEND_LAUNCH_BLOCKING"):
                 self.plan("rollout")
 
-    def test_repeat_forces_native_settings_despite_ambient_disable(self):
+    def test_repeat_disables_batch_invariance_despite_ambient_enable(self):
         self.case["serve_repeat"] = {"concurrency": 1}
-        self.case["engine"]["batch_invariant"] = True
-        wanted = {"VLLM_BATCH_INVARIANT": "1", "HCCL_DETERMINISTIC": "strict",
+        self.case["engine"]["batch_invariant"] = False
+        wanted = {"VLLM_BATCH_INVARIANT": "0", "HCCL_DETERMINISTIC": "strict",
                   "ASCEND_LAUNCH_BLOCKING": "1", "NCCL_DETERMINISTIC": "1", "LCCL_DETERMINISTIC": "1",
                   "HUANYU_SERVE_REPEAT_DETERMINISM": "1"}
-        with patch.dict(os.environ, {key: "0" for key in wanted}):
+        with patch.dict(os.environ, {**{key: "0" for key in wanted}, "VLLM_BATCH_INVARIANT": "1"}):
             plan = self.plan("serve")
         self.assertEqual({key: plan["env"][key] for key in wanted}, wanted)
         stage = plan["deploy"]["stages"][0]
         self.assertEqual(stage["engine_extras"]["additional_config"]["rl_config"],
-                         {"enabled": True, "enable_batch_invariant": True})
+                         {"enabled": True, "enable_batch_invariant": False})
         self.assertEqual(json.loads(cli_option(plan["command"], "--additional-config"))["rl_config"],
                          stage["engine_extras"]["additional_config"]["rl_config"])
         self.assertEqual(plan["env"]["HUANYU_EMBEDDING_AB_DIR"], "")
+        self.assertEqual(plan["env"]["HUANYU_TEXT_AB_BATCH_INVARIANT"], "0")
+        self.assertNotIn("block_size", stage)
+        self.assertNotIn("--block-size", plan["command"])
         self.assertEqual(stage["max_num_seqs"], 1)
         self.assertFalse(stage["async_scheduling"])
-        self.case["engine"]["batch_invariant"] = False
+        self.case["engine"]["batch_invariant"] = True
         with self.assertRaisesRegex(ValueError, "prepare a new repeat case"):
             self.plan("serve")
 
@@ -236,7 +239,7 @@ class TextABLauncherTests(unittest.TestCase):
 
     def test_text_only_repeat_records_request_in_log_before_child_starts(self):
         self.case["serve_repeat"] = {"concurrency": 1}
-        self.case["engine"]["batch_invariant"] = True
+        self.case["engine"]["batch_invariant"] = False
         self.write_case()
         with patch.object(LAUNCHER.subprocess, "call") as call:
             status, _, error = self.invoke("serve", "--dry-run")
@@ -248,6 +251,9 @@ class TextABLauncherTests(unittest.TestCase):
             log = (self.root / "serve_console.log").read_text(encoding="utf-8")
             self.assertIn("[huanyu-determinism] requested", log)
             self.assertIn("HCCL_DETERMINISTIC=strict", log)
+            self.assertIn("VLLM_BATCH_INVARIANT=0", log)
+            self.assertIn("rl_config.enable_batch_invariant=false", log)
+            self.assertNotIn("block_size=128", log)
             self.assertIn("repeat_worker_check=true", log)
             self.assertNotIn("actual", log)  # Parent cannot certify worker state.
             self.assertEqual(env["HUANYU_EMBEDDING_AB_DIR"], "")

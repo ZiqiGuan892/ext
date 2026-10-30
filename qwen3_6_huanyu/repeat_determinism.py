@@ -1,9 +1,9 @@
 """Verify native repeat-worker initialization without recording any tensors.
 
-Only the standalone repeat launcher enables this check. It observes the native
-registration after init_device; it must not initialize kernels itself, which
-would hide a skipped native initialization. Verified settings are not a proof
-of bitwise reproducibility of every operator.
+Only the standalone repeat launcher enables this check. Batch-invariant kernels
+must remain disabled, while communication and synchronous-execution settings
+are retained. Torch deterministic algorithms are observed, not required or
+enabled here. Verified settings do not prove bitwise reproducibility.
 """
 
 from functools import wraps
@@ -18,7 +18,7 @@ _GATE = "HUANYU_SERVE_REPEAT_DETERMINISM"
 _MARKER = "_huanyu_repeat_determinism_check"
 _WORKER = "vllm_omni.platforms.npu.worker.npu_ar_worker"
 _EXPECTED = {
-    "VLLM_BATCH_INVARIANT": "1", "HCCL_DETERMINISTIC": "strict",
+    "VLLM_BATCH_INVARIANT": "0", "HCCL_DETERMINISTIC": "strict",
     "LCCL_DETERMINISTIC": "1", "ASCEND_LAUNCH_BLOCKING": "1", "NCCL_DETERMINISTIC": "1",
 }
 
@@ -27,18 +27,17 @@ def verify_worker_determinism(worker):
     import torch
 
     # Inspect only the already-imported module: importing it here could run
-    # registration and turn missing native setup into a false success.
+    # registration and change the very state being checked.
     module = sys.modules.get("vllm_ascend.batch_invariant")
-    registered = getattr(module, "_batch_invariant_LIB", None) is not None
+    registered = (module._batch_invariant_LIB is not None
+                  if module is not None and hasattr(module, "_batch_invariant_LIB") else None)
     environment = {key: os.environ.get(key) for key in _EXPECTED}
     deterministic = torch.are_deterministic_algorithms_enabled()
     errors = [key + " must be " + value for key, value in _EXPECTED.items() if environment[key] != value]
-    if not registered:
-        errors.append("native Ascend batch-invariant registration is missing or unsupported")
-    if not deterministic:
-        errors.append("torch deterministic algorithms are disabled")
+    if registered:
+        errors.append("native Ascend batch-invariant kernels are still registered; restart with the option disabled")
     state = dict(host=socket.gethostname(), pid=os.getpid(), rank=getattr(worker, "rank", None),
-                 environment=environment, batch_invariant_registered=registered,
+                 environment=environment, batch_invariance_requested=False, batch_invariant_registered=registered,
                  torch_deterministic_algorithms=deterministic,
                  torch_deterministic_warn_only=torch.is_deterministic_algorithms_warn_only_enabled(),
                  errors=errors)
@@ -47,7 +46,7 @@ def verify_worker_determinism(worker):
           + json.dumps(state, sort_keys=True), flush=True)
     if errors:
         raise RuntimeError("Huanyu repeat determinism check failed: " + "; ".join(errors)
-                           + ". Check native batch-invariant kernel/build support; no fallback is allowed.")
+                           + ". Restart with the current repeat launcher and batch_invariant=false.")
 
 
 def install_repeat_determinism_check():

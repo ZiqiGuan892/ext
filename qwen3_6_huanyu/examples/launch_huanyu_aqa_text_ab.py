@@ -70,8 +70,8 @@ def build_launch(root, case, project, mode, port=28889, served_model="qwen3.8", 
     batch_invariant = engine.get("batch_invariant", False)
     if not isinstance(batch_invariant, bool):
         raise ValueError("engine.batch_invariant must be a boolean")
-    if repeat and not batch_invariant:
-        raise ValueError("repeat requires batch_invariant=true; prepare a new repeat case with the current script")
+    if repeat and batch_invariant:
+        raise ValueError("repeat requires batch_invariant=false; prepare a new repeat case with the current script")
     if full_weight_audit_dir is not None and mode != "rollout":
         raise ValueError("--full-weight-audit-dir is only supported for rollout (audit-only)")
     for key, expected in {"temperature": 0, "top_p": 1, "top_k": -1, "n": 1,
@@ -152,9 +152,9 @@ def build_launch(root, case, project, mode, port=28889, served_model="qwen3.8", 
     if "batch_invariant" in engine:
         env["VLLM_BATCH_INVARIANT"] = "0"
     if repeat:
-        # Standalone serving has no shared GenRM process. Force this before
-        # native imports too, then verify native initialization in each worker.
-        env["VLLM_BATCH_INVARIANT"] = "1"
+        # The repeat experiment must not load incompatible batch-invariant
+        # kernels, even when a reused shell previously enabled them.
+        env["VLLM_BATCH_INVARIANT"] = "0"
         env["HUANYU_SERVE_REPEAT_DETERMINISM"] = "1"
     env["HUANYU_TEXT_AB_BATCH_INVARIANT"] = "1" if batch_invariant else "0"
     # Optional arithmetic switches must not leak different shell defaults into
@@ -339,11 +339,15 @@ def main(argv=None):
         plan = build_launch(root, case, project, args.mode, args.port, args.served_model, args.full_weight_audit_dir)
         print("[huanyu-text-ab] " + " ".join(shlex.quote(arg) for arg in plan["command"]), flush=True)
         notice = None
-        if case["engine"].get("batch_invariant"):
-            notice = ("[huanyu-determinism] requested rl_config.enable_batch_invariant=true "
+        if case["engine"].get("batch_invariant") or case.get("serve_repeat"):
+            batch_invariant = bool(case["engine"].get("batch_invariant"))
+            notice = ("[huanyu-determinism] requested rl_config.enable_batch_invariant="
+                      + str(batch_invariant).lower() + " VLLM_BATCH_INVARIANT="
+                      + plan["env"].get("VLLM_BATCH_INVARIANT", "0") + " "
                       "HCCL_DETERMINISTIC=" + plan["env"]["HCCL_DETERMINISTIC"] + " "
                       "ASCEND_LAUNCH_BLOCKING=1 NCCL_DETERMINISTIC=1 LCCL_DETERMINISTIC=1 "
-                      "block_size=128 BS=1 graph=eager repeat_worker_check="
+                      + ("block_size=128 " if batch_invariant else "")
+                      + "BS=1 graph=eager repeat_worker_check="
                       + str(bool(case.get("serve_repeat"))).lower())
             print(notice, flush=True)
         if args.dry_run:
