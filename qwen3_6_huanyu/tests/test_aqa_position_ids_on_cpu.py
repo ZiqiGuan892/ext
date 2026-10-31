@@ -1,4 +1,4 @@
-"""AQA position IDs remain aligned through the trainer's jagged batch boundary."""
+"""AQA/STEM positions remain aligned through the trainer's jagged batch boundary."""
 
 import importlib.util
 import os
@@ -13,6 +13,7 @@ import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 ENV = "HUANYU_AQA_AUDIO_TRAIN"
+STEM_ENV = "HUANYU_STEM_TEXT_TRAIN"
 BASE_MODULE = "verl.experimental.agent_loop.agent_loop"
 TQ_MODULE = "verl.trainer.ppo.v1.agent_loop_tq"
 
@@ -34,6 +35,8 @@ def worker_class():
 
 
 class AqaPositionIdsTests(unittest.TestCase):
+    mode_flag = ENV
+
     def setUp(self):
         self.base = worker_class()
         self.tq = worker_class()
@@ -63,7 +66,8 @@ class AqaPositionIdsTests(unittest.TestCase):
                     sys.modules[name] = original
 
         self.addCleanup(restore_mocked_modules)
-        self.env_patch = patch.dict(os.environ, {ENV: "1"})
+        flags = {ENV: "0", STEM_ENV: "0", self.mode_flag: "1"}
+        self.env_patch = patch.dict(os.environ, flags)
         self.env_patch.start()
         self.addCleanup(self.env_patch.stop)
         spec = importlib.util.spec_from_file_location(
@@ -97,7 +101,7 @@ class AqaPositionIdsTests(unittest.TestCase):
 
     def test_install_and_runtime_environment_gates_preserve_frozen_and_old_paths(self):
         base_original, tq_original = self.base._compute_position_ids, self.tq._compute_position_ids
-        with patch.dict(os.environ, {ENV: "0"}):
+        with patch.dict(os.environ, {self.mode_flag: "0"}):
             self.adapter.install_huanyu_aqa_position_ids()
         self.assertIs(self.base._compute_position_ids, base_original)
         self.assertIs(self.tq._compute_position_ids, tq_original)
@@ -105,7 +109,7 @@ class AqaPositionIdsTests(unittest.TestCase):
         ids, mask, positions = self.inputs()
         worker = self.tq(positions)
         for disabled in ("", "0"):
-            with self.subTest(flag=disabled), patch.dict(os.environ, {ENV: disabled}):
+            with self.subTest(flag=disabled), patch.dict(os.environ, {self.mode_flag: disabled}):
                 self.assertIs(worker._compute_position_ids(ids, mask, {}), positions)
         with patch.dict(os.environ, {}, clear=True):
             self.assertIs(worker._compute_position_ids(ids, mask, {}), positions)
@@ -210,13 +214,15 @@ class AqaPositionIdsTests(unittest.TestCase):
     def test_server_four_axis_jagged_metadata_reproduces_reported_split_error(self):
         # as_nested_tensor chooses its ragged dimension from the input; merely
         # changing _ragged_idx cannot move offsets from the axis to token lengths.
-        nested = torch.nested.as_nested_tensor(
-            [torch.arange(792).repeat(4, 1)], layout=torch.jagged
-        )
-        torch.testing.assert_close(nested.offsets(), torch.tensor([0, 4]))
-        nested._ragged_idx = 2
-        with self.assertRaisesRegex(RuntimeError, r"split_sizes=\[4\]"):
-            nested.unbind()
+        for length in (792, 3675):  # AQA and STEM server reports
+            with self.subTest(length=length):
+                nested = torch.nested.as_nested_tensor(
+                    [torch.arange(length).repeat(4, 1)], layout=torch.jagged
+                )
+                torch.testing.assert_close(nested.offsets(), torch.tensor([0, 4]))
+                nested._ragged_idx = 2
+                with self.assertRaisesRegex(RuntimeError, r"split_sizes=\[4\]"):
+                    nested.unbind()
 
     def test_restoration_expands_without_a_copy_and_preserves_int64_precision(self):
         ids = torch.arange(18).reshape(3, 6)
@@ -232,7 +238,7 @@ class AqaPositionIdsTests(unittest.TestCase):
     def test_restoration_is_gated_and_rejects_bad_batch_or_axis_shapes(self):
         ids = torch.arange(18).reshape(3, 6)
         positions = ids + 4096
-        with patch.dict(os.environ, {ENV: "0"}):
+        with patch.dict(os.environ, {self.mode_flag: "0"}):
             self.assertIs(self.adapter.restore_huanyu_aqa_positions(positions, ids), positions)
         self.assertIsNone(self.adapter.restore_huanyu_aqa_positions(None, ids))
         for invalid in (
@@ -296,6 +302,12 @@ class AqaPositionIdsTests(unittest.TestCase):
             self.assertTrue(torch.all(padded_positions[output_index, size:] == -1))
             self.assertTrue(torch.all(padded_tokens[output_index, size:] == -1))
         self.assertEqual(sum(len(row) for row in selected_positions.unbind()), 24)
+
+
+class StemPositionIdsTests(AqaPositionIdsTests):
+    """Apply the same transport/restore and vision guards with AQA disabled."""
+
+    mode_flag = STEM_ENV
 
 
 if __name__ == "__main__":

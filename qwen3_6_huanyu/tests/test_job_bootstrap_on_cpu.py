@@ -284,6 +284,29 @@ def node(ip, npu=16, alive=True):
 
 
 class ReadinessTests(unittest.TestCase):
+    def test_sixteen_nodes_all_required_even_when_total_capacity_is_sufficient(self):
+        ips = [f"10.0.0.{i}" for i in range(1, 17)]
+        nodes = [node(ip) for ip in ips]
+        self.assertTrue(bootstrap.cluster_ready(nodes, ips, ips[0], "all"))
+        nodes[-1] = node("10.0.0.99", 128)
+        self.assertFalse(bootstrap.cluster_ready(nodes, ips, ips[0], "all"))
+
+    def test_host_resolution_preserves_rank_order_for_128_and_256_cards(self):
+        for count in (2, 8, 16):
+            names = [f"node-{i}" for i in range(count)]
+            ips = [f"10.0.0.{i + 1}" for i in range(count)]
+            with self.subTest(count=count), patch.object(bootstrap.socket, "gethostbyname", side_effect=ips):
+                self.assertEqual(bootstrap.resolve_hosts(",".join(names), count), ips)
+
+    def test_host_resolution_rejects_missing_hosts_or_aliases(self):
+        with self.assertRaisesRegex(ValueError, "exactly 8"):
+            bootstrap.resolve_hosts("one,two", 8)
+        with self.assertRaisesRegex(ValueError, "exactly 2"):
+            bootstrap.resolve_hosts("one,")
+        with patch.object(bootstrap.socket, "gethostbyname", return_value="10.0.0.1"):
+            with self.assertRaisesRegex(ValueError, "distinct"):
+                bootstrap.resolve_hosts("one,alias")
+
     def test_other_cluster_nodes_cannot_replace_missing_expected_worker(self):
         nodes = [node("10.0.0.1"), node("10.0.0.3", 32)]
         self.assertFalse(bootstrap.cluster_ready(nodes, ["10.0.0.1", "10.0.0.2"], "10.0.0.1", "all"))

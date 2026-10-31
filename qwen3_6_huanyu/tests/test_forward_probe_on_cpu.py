@@ -2,12 +2,14 @@
 
 import copy
 import importlib.util
+import inspect
 import json
 from pathlib import Path
 import sys
 import tempfile
 from types import ModuleType, SimpleNamespace as NS
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -29,6 +31,8 @@ def load(name, path):
 
 probe = load(PKG + ".logits_probe", ROOT / "logits_probe.py")
 forward = load(PKG + ".forward_probe", ROOT / "forward_probe.py")
+embedding = sys.modules.get(PKG + ".prompt_embedding_probe") or load(
+    PKG + ".prompt_embedding_probe", ROOT / "prompt_embedding_probe.py")
 compare = load("huanyu_forward_compare_cpu", ROOT / "examples/compare_huanyu_forward.py")
 CASE, SAMPLE = "a" * 32, "row_000001"
 REQUEST = "huanyuab." + CASE + "." + SAMPLE
@@ -89,7 +93,8 @@ class LLM(torch.nn.Module):
         self.layers = torch.nn.ModuleList([Layer("linear_attention"), Layer("full_attention")])
         self.norm = Norm()
 
-    def forward(self, input_ids, positions, inputs_embeds=None):
+    def forward(self, input_ids, positions, intermediate_tensors=None, inputs_embeds=None):
+        self.received = (input_ids, positions, intermediate_tensors, inputs_embeds)
         hidden_states, residual = inputs_embeds, None
         for layer in self.layers:
             hidden_states, residual = layer(positions=positions, hidden_states=hidden_states, residual=residual)
@@ -174,6 +179,87 @@ class ForwardProbeTests(unittest.TestCase):
         self.assertEqual(r["summary"]["status"], "MATCH_CAPTURED_BOUNDARIES")
         self.assertEqual([s["phase"] for s in r["samples"][0]["steps"]], ["prefill", "decode"])
         self.assertFalse(list((self.root / "forward").rglob("*.npz")))
+
+    def test_embedding_forward_and_sampler_probes_compose_with_native_call_signature(self):
+        self.full_case(limit=2)
+        self.case.update(model_path="/fixture", embedding_check={"expected_tp_size": 1})
+        config = NS(model_config=NS(model="/fixture", enforce_eager=True, hf_config=NS(
+            audio_config=NS(model_type="huanyu_conformer_0_6b"))),
+            scheduler_config=NS(max_num_seqs=1, enable_chunked_prefill=False),
+            cache_config=NS(enable_prefix_caching=False), parallel_config=NS(tensor_parallel_size=1))
+        for style in ("native", "positional", "keyword", "direct"):
+            self.root = self.root / style
+            self.root.mkdir()
+            for side in ("serve", "rollout"):
+                native = Native()
+                llm = native.thinker.llm.model
+                expected_signature = inspect.signature(llm.forward)
+                # Install the actual embedding wrapper first, as the worker
+                # does. Stub environment discovery, not capture or forwarding.
+                state = {"root": self.root, "side": side, "case": self.case,
+                         "rows": {SAMPLE: {"wav_sha256": ["1" * 64]}}, "history": {},
+                         "tp_rank": 0, "tp_size": 1, "runtime_id": side, "max_steps": 2, "config": {}}
+                setattr(native, probe._MARKER, state)
+                with patch.object(embedding, "_enabled", return_value=True), \
+                        patch.object(embedding, "_load_case", return_value=(self.root, side, self.case, state["rows"])), \
+                        patch.object(embedding, "_tp_identity", return_value=(0, 1)), \
+                        patch.object(embedding, "install_runtime_probe", return_value=True):
+                    embedding.attach_model_probe(native, config)
+                # Before this fix inspect.signature drops input_ids here.
+                self.assertEqual(inspect.signature(llm.forward), expected_signature)
+                request = NS(prompt_token_ids=[8, 9], output_token_ids=[],
+                             mm_features=[NS(modality="audio", mm_position=NS(offset=0, length=1, is_embed=None))],
+                             sampling_params=NS(temperature=0, top_p=1, top_k=-1, n=1, seed=42, max_tokens=2,
+                                 min_tokens=0, ignore_eos=False, repetition_penalty=1, frequency_penalty=0,
+                                 presence_penalty=0, stop=[], stop_token_ids=[], all_stop_token_ids=[]))
+                runner = NS(model=native, sampler=GreedySampler(), execute_model=native.compute_logits,
+                            input_batch=NS(req_ids=[REQUEST], num_computed_tokens_cpu=[0]), requests={REQUEST: request})
+                signatures = [inspect.signature(method) for method in (
+                    native.compute_logits, runner.sampler.forward, runner.sampler.greedy_sample)]
+                probe._bind_model(runner)
+                probe._bind_sampler(runner, state)
+                self.assertEqual(inspect.signature(llm.forward), expected_signature)
+                self.assertEqual([inspect.signature(method) for method in (
+                    native.compute_logits, runner.sampler.forward, runner.sampler.greedy_sample)], signatures)
+                # Wrappers must preserve normal Python errors, not swallow
+                # genuinely duplicated arguments to work around inspection.
+                with self.assertRaisesRegex(TypeError, "multiple values.*inputs_embeds"):
+                    llm(None, None, None, object(), inputs_embeds=object())
+                for step in range(2):
+                    x = torch.arange(8.).reshape(2, 4) if step == 0 else torch.ones(1, 4)
+                    ids, positions = torch.zeros(x.shape[0], dtype=torch.long), torch.arange(x.shape[0])
+                    scheduler = NS(num_scheduled_tokens={REQUEST: x.shape[0]}, total_num_scheduled_tokens=x.shape[0])
+                    runner.input_batch.num_computed_tokens_cpu[0] = 0 if step == 0 else 2
+                    ctx = {"runner": runner, "state": state, "scheduler": scheduler}
+                    tokens = (probe._ACTIVE.set(ctx), embedding._ACTIVE.set(dict(ctx)))
+                    try:
+                        if style == "native":
+                            output = llm(ids, positions, None, inputs_embeds=x)
+                        elif style == "positional":
+                            output = llm(ids, positions, None, x)
+                        elif style == "keyword":
+                            output = llm(input_ids=ids, positions=positions, intermediate_tensors=None, inputs_embeds=x)
+                        else:
+                            output = llm.forward(ids, positions, None, inputs_embeds=x)
+                        self.assertIs(llm.received[0], ids)
+                        self.assertIs(llm.received[1], positions)
+                        self.assertIsNone(llm.received[2])
+                        self.assertIs(llm.received[3], x)
+                        torch.testing.assert_close(output, LLM()(ids, positions, None, x), rtol=0, atol=0)
+                        logits = native.compute_logits(output)
+                        result = runner.sampler(logits, NS(all_greedy=True, all_random=False, temperature=None,
+                                                          top_k=None, top_p=None))
+                        request.output_token_ids.extend(result.sampled_token_ids.reshape(-1).tolist())
+                    finally:
+                        embedding._ACTIVE.reset(tokens[1])
+                        probe._ACTIVE.reset(tokens[0])
+                self.assertEqual(llm.layers[0].linear_attn.calls, 2)
+                records = list((self.root / "embeddings" / side).glob("*.json"))
+                self.assertEqual(len(records), 1)
+                self.assertEqual(json.loads(records[0].read_text())["status"], "complete")
+            report = self.report()
+            self.assertEqual(report["summary"]["status"], "MATCH_CAPTURED_BOUNDARIES")
+            self.assertTrue(report["samples"][0]["full_generation_captured"])
 
     def test_first_difference_is_attention_output_not_outer_layer(self):
         self.both(delta=0.125)

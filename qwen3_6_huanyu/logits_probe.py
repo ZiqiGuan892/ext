@@ -23,6 +23,8 @@ import sys
 from types import MethodType
 import uuid
 
+from .prompt_embedding_probe import _wraps_bound_call
+
 
 FORMAT = "huanyu_logits_v1"
 _ACTIVE = ContextVar("huanyu_logits_forward", default=None)
@@ -313,7 +315,7 @@ def _bind_sampler(runner, state):
     print("[huanyu-determinism] actual side=%s tp_rank=%s %s" % (
         state["side"], state["tp_rank"], json.dumps(runtime["determinism"], sort_keys=True)), flush=True)
 
-    @wraps(greedy)
+    @_wraps_bound_call(greedy)
     def observe_greedy(self, logits):
         event = _SAMPLING.get()
         if event is None:
@@ -325,7 +327,7 @@ def _bind_sampler(runner, state):
         event["greedy_token_ids"] = result.detach().to("cpu", non_blocking=False).reshape(-1).tolist()
         return result
 
-    @wraps(forward)
+    @_wraps_bound_call(forward)
     def observe_forward(self, *args, **kwargs):
         context = _ACTIVE.get()
         if context is None:
@@ -423,7 +425,7 @@ def _bind_model(runner):
         forward_probe.bind(_native(runner), state)
         state["forward_manifest"]["compute_logits"] = {"forward": _source(original), "flags": {}}
 
-    @wraps(original)
+    @_wraps_bound_call(original)
     def compute(self, *args, **kwargs):
         if forward_probe is not None:
             bound = inspect.signature(original).bind(*args, **kwargs)

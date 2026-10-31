@@ -193,6 +193,18 @@ def sync_checkout(source, target, ray_running=False):
             shutil.rmtree(staging)
 
 
+def resolve_hosts(hosts, expected_nodes=2):
+    if not isinstance(expected_nodes, int) or expected_nodes < 1:
+        raise ValueError("expected_nodes must be a positive integer")
+    names = [name.strip() for name in hosts.split(",")]
+    if len(names) != expected_nodes or not all(names):
+        raise ValueError(f"VC_WORKER_HOSTS must contain exactly {expected_nodes} comma-separated hosts")
+    ips = [socket.gethostbyname(name) for name in names]
+    if len(set(ips)) != expected_nodes:
+        raise ValueError("Job hosts must resolve to distinct IPv4 addresses")
+    return ips
+
+
 def cluster_ready(nodes, expected_ips, local_ip, mode, npus=16):
     live = {node["NodeManagerAddress"]: node for node in nodes if node.get("Alive")}
     required = expected_ips if mode == "all" else [local_ip]
@@ -244,6 +256,7 @@ def main():
     sync.add_argument("--ray-running", action="store_true")
     hosts = sub.add_parser("resolve")
     hosts.add_argument("hosts")
+    hosts.add_argument("--expected-nodes", type=int, default=2)
     sub.add_parser("check-devices")
     for command in ("wait-head", "wait-cluster"):
         wait = sub.add_parser(command)
@@ -258,13 +271,7 @@ def main():
     if args.command == "sync":
         sync_checkout(args.source, args.target, args.ray_running)
     elif args.command == "resolve":
-        names = [name.strip() for name in args.hosts.split(",")]
-        if len(names) != 2 or not all(names):
-            raise ValueError("VC_WORKER_HOSTS must contain exactly two comma-separated hosts")
-        ips = [socket.gethostbyname(name) for name in names]
-        if len(set(ips)) != 2:
-            raise ValueError("The two job hosts must resolve to different IPv4 addresses")
-        print(",".join(ips))
+        print(",".join(resolve_hosts(args.hosts, args.expected_nodes)))
     elif args.command == "check-devices":
         import torch
         import torch_npu  # noqa: F401

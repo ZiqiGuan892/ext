@@ -43,7 +43,13 @@ echo "[huanyu] adapter=Qwen36HuanyuForTraining dataset=Qwen36HuanyuOmniRLHFDatas
 # Keep HF config.architectures intact. architecture below selects only the
 # verl training adapter; the RM retains its independent Qwen3.5 registration.
 # The inherited vLLM pipeline already dispatches audio_config to Huanyu.
-exec bash "${PROJECT_ROOT}/examples/qwen3_6_huanyu/run_qwen36_huanyu_32card.sh" \
+_HUANYU_BACKEND=run_qwen36_huanyu_32card.sh
+if [[ "${HUANYU_STEM_TEXT_TRAIN:-0}" == 1 && "${STEM_REWARD_MODE:-genrm}" == rule ]]; then
+    # The OmniMix wrapper unconditionally enables GenRM. Text-only rule runs
+    # go directly to the same training backend, retaining all Huanyu adapters.
+    _HUANYU_BACKEND=run_qwen36_huanyu_gspo_npu.sh
+fi
+exec bash "${PROJECT_ROOT}/examples/qwen3_6_huanyu/$_HUANYU_BACKEND" \
     "$@" \
     actor_rollout_ref.model.external_lib=verl_omni_ext.models.qwen3_6_huanyu \
     actor_rollout_ref.model.architecture=Qwen36HuanyuForTraining \

@@ -4,7 +4,6 @@ Uses the logits probe's request/prefix identity. Blocking CPU copies perturb
 timing; this is for localization, not performance or proof of determinism.
 """
 
-from functools import wraps
 import inspect
 import json
 import os
@@ -125,7 +124,7 @@ def bind(native, state):
 
     def wrap(name, original):
         signature = inspect.signature(original)
-        @wraps(original)
+        @lp._wraps_bound_call(original)
         def forward(self, *args, **kwargs):
             context = _context()
             if context is None:

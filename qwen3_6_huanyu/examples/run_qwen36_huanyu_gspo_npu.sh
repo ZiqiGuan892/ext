@@ -533,11 +533,22 @@ PPO_MICRO_BATCH_SIZE_PER_GPU=${PPO_MICRO_BATCH_SIZE_PER_GPU:-${_SEQS_PER_RANK}}
 _NUM_MICRO_BATCHES=$(( _SEQS_PER_RANK / PPO_MICRO_BATCH_SIZE_PER_GPU ))
 echo "Actor batching: ${_SEQS_PER_RANK} seq/rank / micro_bsz=${PPO_MICRO_BATCH_SIZE_PER_GPU}" \
      "=> ${_NUM_MICRO_BATCHES} micro-batch(es)"
-if [ "${_NUM_MICRO_BATCHES}" -gt 1 ]; then
+_HUANYU_SYNC_EACH=false
+for _arg in "$@"; do
+    _sync_arg="${_arg#++}"; _sync_arg="${_sync_arg#+}"
+    case "$_sync_arg" in
+        actor_rollout_ref.model.override_config.huanyu_sync_each_microbatch=*)
+            _HUANYU_SYNC_EACH="${_sync_arg#*=}" ;;
+    esac
+done
+if [[ "$_HUANYU_SYNC_EACH" == true ]]; then
+    echo '[huanyu-memory] requested sync_each_microbatch=true; check runtime enabled log for sharded gradient synchronization'
+fi
+if [ "${_NUM_MICRO_BATCHES}" -gt 1 ] && [[ "$_HUANYU_SYNC_EACH" != true ]]; then
     echo "WARNING: micro-batch 数 > 1，会触发未分片 fp32 梯度囤积（约 3.0 GiB/层 × 40 层）。" >&2
     echo "         除非你清楚自己在做什么，否则 OOM 几乎是必然的。" >&2
 fi
-if [ "${_SEQS_PER_RANK}" -gt 4 ]; then
+if [ "${_SEQS_PER_RANK}" -gt 4 ] && [[ "$_HUANYU_SYNC_EACH" != true ]]; then
     echo "WARNING: 每卡 ${_SEQS_PER_RANK} 条序列。这一版 verl 在 ${_WORLD_SIZE} 卡下**没有安全解**：" >&2
     echo "         micro_bsz 设小 -> 多 micro-batch -> 未分片梯度囤积 OOM；" >&2
     echo "         micro_bsz 设大 -> 单次前反传激活/logits 撑爆 -> 同样 OOM。" >&2

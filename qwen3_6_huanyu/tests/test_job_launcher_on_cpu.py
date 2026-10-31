@@ -90,7 +90,8 @@ class HuanyuJobLauncherTests(unittest.TestCase):
 operation = sys.argv[1]
 record("helper", sys.argv[1:])
 if operation == "resolve":
-    print("192.0.2.10,192.0.2.11")
+    count = int(sys.argv[sys.argv.index("--expected-nodes") + 1]) if "--expected-nodes" in sys.argv else 2
+    print(",".join("192.0.2.%d" % (10 + i) for i in range(count)))
 elif operation in ("wait-cluster", "wait-head"):
     if os.environ.get("HUANYU_TEST_FAIL_WAIT") == operation:
         print("fixture readiness failure", file=sys.stderr)
@@ -118,6 +119,10 @@ keys = (
     "MINICPMO_TUNE_VISION", "WANDB_MODE", "HUANYU_TEST_ENV_SOURCED",
     "NNODES", "NUM_NPUS", "REWARD_POOL_NPUS", "RM_ENABLE", "RAY_ADDRESS", "LD_PRELOAD",
     "PROJECT_ROOT", "MODEL_PATH", "RM_MODEL_PATH", "TRAIN_FILE", "VAL_FILE",
+    "HUANYU_STEM_TEXT_TRAIN", "HUANYU_CLUSTER_NODES", "RM_NNODES", "ROLLOUT_TP",
+    "STEM_CONTEXT_LENGTH", "STEM_PROMPT_LENGTH", "STEM_DATA_DIR",
+    "TRAIN_BATCH_SIZE", "PPO_MINI_BATCH_SIZE", "ROLLOUT_N", "ROLLOUT_MAX_NUM_SEQS",
+    "ACTOR_OFFLOAD_POLICY", "ROLLOUT_NUM_WORKERS", "HUANYU_CHECKPOINT_VALIDATION_MODE", "HUANYU_FULL_WEIGHT_AUDIT_DIR",
 )
 Path(os.environ["HUANYU_TEST_CAPTURE"]).write_text(
     json.dumps(dict(argv=sys.argv[1:], env={key: os.environ.get(key) for key in keys})),
@@ -131,6 +136,7 @@ Path(os.environ["HUANYU_TEST_CAPTURE"]).write_text(
             '"$HUANYU_TEST_TRAIN_CAPTURE" "$@"\n',
             encoding="utf-8",
         )
+        shutil.copyfile(self.examples / "run_huanyu.sh", self.examples / "run_huanyu_stem.sh")
         self.command_stub = self.project / "command_stub.py"
         self.command_stub.write_text(
             RECORDER + """
@@ -184,7 +190,7 @@ if command not in ("ray", "git", "pip", "flock", "env-source"):
         self.env = dict(os.environ)
         for key in list(self.env):
             if key.startswith((
-                "HUANYU_", "MINICPMO_", "VC_", "RAY_", "RM_", "Q36_", "DEBUG_",
+                "HUANYU_", "MINICPMO_", "VC_", "RAY_", "RM_", "Q36_", "DEBUG_", "STEM_",
             )) or key in {
                 "PYTHON", "PROJECT_ROOT", "EXPERIMENT_NAME", "WANDB_MODE",
                 "NNODES", "NUM_NPUS", "REWARD_POOL_NPUS", "TMPDIR", "LD_PRELOAD",
@@ -211,6 +217,13 @@ if command not in ("ray", "git", "pip", "flock", "env-source"):
             PYTHONDONTWRITEBYTECODE="1",
             PYTHONUTF8="1",
         )
+        if os.name == "nt":
+            # Git Bash prepends /mingw64/bin on startup, ahead of the injected
+            # Windows PATH. Restore stub priority in every child Bash so git
+            # config --global never reaches the user's real Git configuration.
+            bash_env = self.project / "fixture_bash_env.sh"
+            bash_env.write_text('export PATH="$HUANYU_TEST_BIN:$PATH"\n', encoding="utf-8")
+            self.env.update(BASH_ENV=shell_path(bash_env), HUANYU_TEST_BIN=shell_path(self.bin))
         # Preserve the Linux LD_PRELOAD list for assertions and Hydra values;
         # MSYS otherwise translates it for each native Python fixture call.
         exclusions = self.env.get("MSYS2_ENV_CONV_EXCL", "")
@@ -342,6 +355,71 @@ if command not in ("ray", "git", "pip", "flock", "env-source"):
         for kind in ("runtime", "ray"):
             for event in self.events(kind):
                 self.assert_precision_defaults(event)
+
+    def test_stem_head_uses_all_128_cards_and_restores_profile_after_site_env(self):
+        env_file = self.examples / "env_export_huanyu.sh"
+        with env_file.open("a", encoding="utf-8") as stream:
+            stream.write(
+                "export NNODES=1 NUM_NPUS=16 RM_ENABLE=1 RM_NNODES=1 ROLLOUT_TP=4\n"
+                "export STEM_CONTEXT_LENGTH=5k STEM_PROMPT_LENGTH=1024 STEM_DATA_DIR=/old/data\n"
+                "export TRAIN_BATCH_SIZE=4 PPO_MINI_BATCH_SIZE=4 ROLLOUT_N=4 ROLLOUT_MAX_NUM_SEQS=128\n"
+                "export ACTOR_OFFLOAD_POLICY=false HUANYU_STEM_TEXT_TRAIN=0\n"
+                "export ROLLOUT_NUM_WORKERS=4 HUANYU_CHECKPOINT_VALIDATION_MODE=disk HUANYU_FULL_WEIGHT_AUDIT_DIR=/stale/audit\n"
+            )
+        result = self.run_launcher({
+            "HUANYU_JOB_MODE": "stem", "HUANYU_CLUSTER_NODES": "8",
+            "VC_WORKER_NUM": "8", "VC_WORKER_HOSTS": ",".join(f"node-{i}" for i in range(8)),
+            "NNODES": "8", "RM_ENABLE": "0", "RM_NNODES": "0", "ROLLOUT_TP": "16",
+            "STEM_CONTEXT_LENGTH": "12k", "STEM_PROMPT_LENGTH": "2048",
+            "STEM_DATA_DIR": "/stem/data", "TRAIN_FILE": "/stale/aqa.parquet",
+            "TRAIN_BATCH_SIZE": "128", "PPO_MINI_BATCH_SIZE": "128", "ROLLOUT_N": "16",
+            "ROLLOUT_MAX_NUM_SEQS": "4", "ACTOR_OFFLOAD_POLICY": "true",
+            "ROLLOUT_NUM_WORKERS": "128", "HUANYU_CHECKPOINT_VALIDATION_MODE": "", "HUANYU_FULL_WEIGHT_AUDIT_DIR": "",
+        })
+        self.assert_success(result)
+        capture = json.loads(self.capture_file.read_text())
+        for name, value in {
+            "NNODES": "8", "NUM_NPUS": "16", "RM_ENABLE": "0", "RM_NNODES": "0",
+            "REWARD_POOL_NPUS": "0", "HUANYU_STEM_TEXT_TRAIN": "1", "HUANYU_CLUSTER_NODES": "8",
+            "HUANYU_USE_PRECOMPUTE": "0", "HUANYU_EMBED_CACHE_DIR": "", "HUANYU_AQA_AUDIO_TRAIN": "0",
+            "HUANYU_TRAIN_AUDIO_ENCODER": "false", "HUANYU_TRAIN_AUDIO_PROJECTOR": "false",
+            "STEM_CONTEXT_LENGTH": "12k", "STEM_PROMPT_LENGTH": "2048",
+            "TRAIN_BATCH_SIZE": "128", "PPO_MINI_BATCH_SIZE": "128", "ROLLOUT_N": "16",
+            "ROLLOUT_MAX_NUM_SEQS": "4", "ROLLOUT_TP": "16", "ACTOR_OFFLOAD_POLICY": "true",
+            "ROLLOUT_NUM_WORKERS": "128", "HUANYU_CHECKPOINT_VALIDATION_MODE": "", "HUANYU_FULL_WEIGHT_AUDIT_DIR": "",
+        }.items():
+            self.assertEqual(capture["env"][name], value, name)
+        self.assertTrue(capture["env"]["TRAIN_FILE"].endswith("/stem/data/train.parquet"))
+        actual = dict(arg.lstrip("+").split("=", 1) for arg in capture["argv"])
+        self.assertEqual(json.loads(actual["ray_kwargs.ray_init.runtime_env.env_vars.HUANYU_STEM_TEXT_TRAIN"]), "1")
+        wait = [event for event in self.events("helper") if event["args"][0] == "wait-cluster"][0]
+        self.assertEqual(wait["args"][wait["args"].index("--expected-ips") + 1].count(","), 7)
+        self.assertIn("all 8 nodes ready (128 NPU)", result.stdout)
+        self.assertEqual(len(self.events("train")), 1)
+
+    def test_stem_last_256_card_worker_joins_without_submitting_training(self):
+        result = self.run_launcher({
+            "HUANYU_JOB_MODE": "stem", "HUANYU_CLUSTER_NODES": "16", "NNODES": "16",
+            "VC_WORKER_NUM": "16", "VC_TASK_INDEX": "15", "RM_ENABLE": "0",
+            "VC_WORKER_HOSTS": ",".join(f"node-{i}" for i in range(16)),
+        })
+        self.assert_success(result)
+        self.assertFalse(self.events("train"))
+        ray = self.events("ray")
+        self.assertEqual(len(ray), 1)
+        self.assertIn("--node-ip-address=192.0.2.25", ray[0]["args"])
+        self.assertIn("--block", ray[0]["args"])
+
+    def test_stem_invalid_topology_rejected_before_setup(self):
+        base = {"HUANYU_JOB_MODE": "stem", "HUANYU_CLUSTER_NODES": "8", "NNODES": "8", "RM_ENABLE": "0",
+                "VC_WORKER_NUM": "8", "VC_WORKER_HOSTS": ",".join(f"node-{i}" for i in range(8))}
+        for extra in ({"NNODES": "7"}, {"RM_ENABLE": "1"}, {"VC_TASK_INDEX": "8"},
+                      {"VC_WORKER_NUM": "16"}, {"HUANYU_CLUSTER_NODES": "4"}, {"ROLLOUT_TP": "3"}):
+            with self.subTest(extra=extra):
+                result = self.run_launcher(dict(base, **extra))
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                for kind in ("helper", "pip", "env-source", "ray", "train"):
+                    self.assertFalse(self.events(kind), kind)
 
     def test_site_env_cannot_override_precision_defaults_or_explicit_opt_out(self):
         env_file = self.examples / "env_export_huanyu.sh"

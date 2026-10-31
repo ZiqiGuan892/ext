@@ -28,6 +28,31 @@ _MARKER = "_huanyu_embedding_probe_installed"
 _TAG = re.compile(r"^(?:chatcmpl-)?huanyuab\.([0-9a-f]{32})\.(row_[0-9]{6,})(?:-[0-9a-f]{8})?$")
 
 
+def _wraps_bound_call(original):
+    """Preserve a callable's public signature when wrapping with MethodType.
+
+    wraps(bound_method) alone makes inspect.signature remove a receiver twice:
+    once through __wrapped__, and again for the new bound MethodType. Give the
+    wrapper function exactly one explicit receiver, while retaining __wrapped__
+    for source attribution. This also handles a static sampler callable.
+    """
+    signature = inspect.signature(original)
+    receiver = "_huanyu_receiver"
+    while receiver in signature.parameters:
+        receiver = "_" + receiver
+    method_signature = signature.replace(parameters=[
+        inspect.Parameter(receiver, inspect.Parameter.POSITIONAL_ONLY),
+        *signature.parameters.values(),
+    ])
+
+    def decorate(wrapper):
+        wrapper = wraps(original)(wrapper)
+        wrapper.__signature__ = method_signature
+        return wrapper
+
+    return decorate
+
+
 def _get(obj, name, default=None):
     return obj.get(name, default) if isinstance(obj, Mapping) else getattr(obj, name, default)
 
@@ -406,7 +431,7 @@ def attach_model_probe(native, vllm_config):
     native._huanyu_embedding_probe_state = state
     original = llm.forward
 
-    @wraps(original)
+    @_wraps_bound_call(original)
     def forward(self, *args, **kwargs):
         _capture(native, self, args, kwargs, signature)
         return original(*args, **kwargs)

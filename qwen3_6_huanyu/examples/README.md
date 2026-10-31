@@ -1010,6 +1010,68 @@ python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/aqa_text_ab.py" compare --case-di
 
 本次本地验证：98 项相关 CPU 测试通过，覆盖请求身份传递、启动配置、真实 BF16 张量采集、全部 TP rank 比较，以及采集→NPZ→文字 A/B 汇总的串联测试。改动单个音频 embedding 元素会判为 FAIL；缺少一个 rank 会判为 INCOMPLETE。未运行真实 Huanyu/NPU 模型，100 条是否严格一致仍须以上述服务器运行结果为准。
 
+## 12. STEM 数学规则奖励：128 / 256 卡一键训练
+
+在每个节点执行 `run_huanyu_stem_job.sh`。每节点16卡，全部用于 Actor/rollout；数学奖励在 CPU 上计算，不启动 GenRM。默认 checkpoint 为 `/opt/huawei/dataset/model_gy/downloaded_models/2748`，STEM Parquet 目录为 `/opt/huawei/dataset/infra_data/data/rl_stem_data`。目录需包含 `train.parquet` 和 `val.parquet`（或 `validation.parquet`）。每行 `data_source` 必须是 `math_dapo`，`reward_model.ground_truth` 为字符串。
+
+| 设置 | 128卡 | 256卡 |
+| --- | --- | --- |
+| `TOTAL_NPUS` / 节点数 | 128 / 8 | 256 / 16 |
+| Actor FSDP2 分片规模（`fsdp_size=-1`） | 128 | 256 |
+| Actor 数据并行规模，SP=1 | 128 | 256 |
+| 训练 TP / SP | 1 / 1 | 1 / 1 |
+| rollout TP（默认，可改16） | 8 | 8 |
+| rollout 独立推理副本数 | 16 | 32 |
+| BS / PPO mini-batch / N | 128 / 128 / 16 | 128 / 128 / 16 |
+| 每步轨迹数 | 2048 | 2048 |
+| 每 rank 的 micro-batch 数（micro-batch=1） | 16 | 8 |
+| prompt / response 上限 / max_model_len | 2048 / 10240 / 12288 | 2048 / 10240 / 12288 |
+
+训练使用全卡 FSDP，不使用 rollout 的 TP 切分训练。单机16卡不要求 TP=16；`Actor卡数/TP` 是 rollout 副本数，不能填入训练 DP 或 `rollout.data_parallel_size`。默认推理 PP=1、引擎内部 DP=1，由外层启动多个 TP8 副本。改为 TP16 时，128/256卡分别有8/16个副本；单副本权重更省显存，但副本数减半，速度需实测。参考 [vLLM 并行说明](https://docs.vllm.ai/en/stable/serving/parallelism_scaling/)。
+
+默认关闭 Actor、rollout/ref logprob 的 dynamic batching；micro-batch=1，启用逐 micro-batch 梯度同步及梯度检查点。Actor FP32 主参数，参数/优化器 offload 开启；rollout BF16、full精度策略、eager、每引擎 `max_num_seqs=8`、显存预算0.5，权重同步 bucket=512MB。冻结 encoder/projector/vision，纯文本不走音频编码。默认允许 EOS，10K 是上限；不代表每条都生成10K。数学 `math_dapo` 规则使用当前安装的 verl 实现，启动前会用正确/错误 boxed 答案自检并打印源文件和实际分数；它不等于 GenRM，也不能假定支持任意数学表达式的符号等价。
+
+完整链路：
+
+```text
+每个节点 run_huanyu_stem_job.sh
+  → run_huanyu_32card_job.sh（共享实现，stem模式支持8/16节点）
+  → jemalloc → 按内容摘要备份/替换 vllm-omni → editable安装当前项目
+  → source env_export_huanyu.sh → 恢复本次参数 → 原生导入/NPU检查
+  → rank0启动Ray head；其余节点加入Ray并阻塞等待
+  → rank0等全部节点各16张NPU就绪，仅提交一次训练
+  → run_huanyu_stem.sh（规则奖励自检、准备本次STEM Parquet）
+  → run_huanyu.sh → run_qwen36_huanyu_gspo_npu.sh → main_omni
+```
+
+规则奖励路径直接进入训练后端，跳过会强制开启 GenRM 的 OmniMix 包装层。原来直接调用 `run_huanyu_stem.sh` 的5K、16+16、GenRM默认行为保持不变。
+
+在所有节点部署相同代码、模型与数据路径，`PROJECT_ROOT/runs` 必须是共享目录，其他节点需要读取主节点准备的 Parquet。作业平台通常注入 `VC_TASK_INDEX`、`VC_WORKER_HOSTS`、`VC_WORKER_NUM`；没有注入时，分别设置0..7或0..15的 rank，所有节点设置同一份完整逗号分隔主机列表，首个为 head。不要把所有节点 rank 都设成0。
+
+```bash
+export PROJECT_ROOT=/opt/huawei/dataset/infra_data/code/verl_omni_qwen36_gzq_new
+export MODEL_PATH=/opt/huawei/dataset/model_gy/downloaded_models/2748
+export HUANYU_VLLM_SOURCE=/opt/huawei/dataset/infra_data/code/vllm-omni-xy-qwen-vit
+
+# 每个节点运行；VC_* 由平台按上述要求提供。先完成2个完整训练step。
+TOTAL_NPUS=128 TOTAL_TRAINING_STEPS=2 \
+bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/run_huanyu_stem_job.sh"
+
+# 256卡时所有16个节点使用同一命令：
+TOTAL_NPUS=256 TOTAL_TRAINING_STEPS=2 \
+bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/run_huanyu_stem_job.sh"
+```
+
+去掉 `TOTAL_TRAINING_STEPS=2` 可按训练 epoch 继续；总步数、`TEST_FREQ`、`VAL_BEFORE_TRAIN`、`STEM_TRAIN_FILE`、`STEM_VAL_FILE`、`ROLLOUT_TP`、`ROLLOUT_MAX_NUM_SEQS`、`ROLLOUT_GPU_MEM_UTIL` 均可在命令前设置，所有节点保持一致。默认训练前不验证，`TEST_FREQ=10`。需要固定10K输出的压力测试可设置 `STEM_IGNORE_EOS=true`，并追加 `++actor_rollout_ref.rollout.engine_kwargs.q36_sampling.min_tokens=10240`；这会改变生成行为，仅用于压力测试。需要实际接近2K的prompt，不能以STEM短题干跑通代替满12K测试。
+
+集群日志位于 `runs/$EXPERIMENT_NAME/cluster/rank_<rank>.log`；主训练日志和 `rollout_dump` / `validation_dump` 位于启动打印的 `runs/huanyu_<时间戳>_<随机后缀>/`。空的 `genrm_dump` 目录来自共用输出脚本，不表示启动了 GenRM。搜索 `[huanyu-stem-job]`、`[huanyu-stem]`、`[huanyu-memory]` 检查最终卡池、batch、判分函数及逐批同步执行状态。新入口清除旧的 disk/full-weight/text-AB 诊断开关，避免诊断环境误入训练。
+
+OOM估计（以此前35.57B总参数、单卡约61.27GiB可见显存为假设，未经本集群实测）：FP32参数+梯度+Adam两状态按16字节/参数估计，理想全分片量在128/256卡为4.14/2.07GiB每卡；offload会改变实际驻留位置。BF16 rollout权重按TP8平均约8.28GiB每卡，TP16约4.14GiB，复制模块等额外计算。以上均不是峰值预测，不含激活、layer all-gather、通信、KV/GDN状态和临时张量。若词表248144，单条12288 token的BF16 logits一份就约5.68GiB，FP32版本约11.36GiB；FSDP增加卡数不会把这份单序列激活按卡数平分。
+
+因此128卡可作为保守配置的首次测试，256卡可降低参数/状态分片量、增加吞吐，但两者都不能仅凭总卡数保证不OOM。必须跑过实际长序列的生成、old-logprob、反向、首次optimizer step及权重同步；只启动模型成功不足以判断。若rollout OOM，先把 `ROLLOUT_MAX_NUM_SEQS=4`；若Actor单条12K反向仍OOM，单纯加DP卡或降低全局BS未必解决，需要针对激活/logits进一步处理。默认full精度reference实现和跨节点逐微批同步有性能代价，本脚本优先提供内存可控的起跑配置。
+
+本次启动链路验证共70项CPU测试通过：bootstrap22、共享job23、环境准备14、原STEM3、新多节点STEM8。覆盖最终Hydra配置、TP16覆盖、无GenRM、rank7/15只加入Ray、旧环境覆盖、规则奖励预检失败和旧诊断开关清空。使用命令桩，不是128/256卡NPU实测，不能由此宣称显存或HCCL性能已验证。
+
 ## 13. serve / rollout 的 prefill、decode logits 和最终采样参数检查
 
 在 embedding 和首次同步权重检查通过后，用 `--logits-check true` 新建一次 A/B 实验。两端仍使用同一 WAV、原始 system 信息和纯音频 user 输入，不额外提供问题文字。该实验只做正常首次权重同步后的验证，不做 optimizer 更新。
@@ -1129,6 +1191,15 @@ Torch 对已知不支持确定性的操作会按严格模式报错，不降级�
 比较器将 `skip_clone` 保留为内部复制行为诊断，将 `top_k=-1` 和 `0` 视为关闭top-k的等价表示；原值仍保存在记录和 `diagnostic_parameter_differences` / `requested_parameter_normalizations` 中。其他参数覆盖与真实logits差异仍会报出。空 `spec_token_ids` 列表长度不同也不能单独证明BS=2或启用了投机解码。
 
 原生 `Qwen3NextModel.forward` 含 `use_sequence_parallel`，decoder含 `use_attn_reduce_scatter_for_moe`、`layer_scale` 等分支；仅源码SHA一致不足以判断实际路径一致。新 `--forward-check true` 对真实调用进行观察，记录LLM、每层、input/post-attention norm、GDN/全注意力、MLP、可见router/experts、最终norm及compute_logits输入/输出的完整张量SHA256、shape、dtype。包含residual、positions和实际padding，不只取最后一个token。记录实际分支开关及可见实现的源码指纹；attention metadata保留作诊断，物理cache槽位不同不自动视为错误。
+
+2026-10-30 的 serve 报错 `forward_probe.py: signature.bind` / `multiple values for argument 'inputs_embeds'`
+源于探针组合的签名元数据错误：embedding 探针用 `wraps(bound_method)` 后再次绑定 `MethodType`，
+使 `inspect.signature` 多移除一次接收者，丢掉 `input_ids`。原生调用
+`llm(input_ids, positions, intermediate_tensors, inputs_embeds=inputs_embeds)` 本身合法。
+修复为所有实例探针包装器显式保留一份接收者签名，再绑定实例；原参数按原样传给原方法。
+CPU 回归同时启用 embedding、forward、logits 和真实测试采样器，覆盖原生混合传参、全位置、全关键字及直接 `.forward()` 调用，
+验证 prefill/decode、完整采集、签名与输出；该错误不需要关闭确定性设置或模块探针来规避。
+更新代码后须重启 serve；旧进程不会自动加载修复。失败实验保留原目录，新一轮使用新的 case 目录，避免混入不完整记录。
 
 沿用上面的完整A/B流程，在**新目录**准备case时增加以下参数（两端依旧BS=1、TP=4，batch invariance关闭）：
 

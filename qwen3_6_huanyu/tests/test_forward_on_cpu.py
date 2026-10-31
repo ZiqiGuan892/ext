@@ -115,6 +115,21 @@ class ForwardTests(unittest.TestCase):
         torch.testing.assert_close(actual, expected)
         self.assertFalse(calls)
 
+    def test_stem_transport_positions_are_restored_before_text_only_hf_forward(self):
+        model, calls = self.make_model([])
+        ids = torch.tensor([[9, 10, 11], [12, 13, 14]])
+        positions = torch.arange(3).expand(2, -1) + 4096
+        with patch.dict(os.environ, {"HUANYU_AQA_AUDIO_TRAIN": "0", "HUANYU_STEM_TEXT_TRAIN": "1"}):
+            output = model(ids, position_ids=positions)
+        torch.testing.assert_close(
+            model.kwargs_seen["position_ids"], positions.unsqueeze(0).expand(4, -1, -1)
+        )
+        self.assertEqual(model.kwargs_seen["position_ids"].dtype, torch.long)
+        self.assertFalse(calls)
+        output.sum().backward()
+        for token in ids.flatten():
+            torch.testing.assert_close(model.embedding.weight.grad[token], torch.ones(4))
+
     def test_alignment_and_missing_features_fail_instead_of_zero_filling(self):
         model, _ = self.make_model([torch.ones(1, 4)])
         ids = torch.tensor([[2, 4, 4, 3]])

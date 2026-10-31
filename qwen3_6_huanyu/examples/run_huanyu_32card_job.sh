@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Run on BOTH nodes. VC_TASK_INDEX=0 starts training; 1 only joins Ray.
+# Run on EVERY node. VC_TASK_INDEX=0 starts training; others only join Ray.
+# Legacy modes use two nodes; STEM supports 8/16 nodes through its job wrapper.
 # Deploy to ${PROJECT_ROOT}/examples/qwen3_6_huanyu/ with the Huanyu package.
 # Defaults: frozen Huanyu, 35B sampleall, precomputed q128 cache, actor16 + RM16.
 # HUANYU_JOB_MODE=aqa_unfreeze selects online AQA training via its own entry.
@@ -33,6 +34,14 @@ if [[ "${HUANYU_JOB_MODE:-frozen_cache}" == aqa_unfreeze ]]; then
     if [[ "${VAL_FILE:-}" == /opt/huawei/dataset/infra_data/data/validation.parquet ]]; then unset VAL_FILE; fi
     export TRAIN_FILE="${HUANYU_AQA_TRAIN_FILE:-${TRAIN_FILE:-/opt/huawei/dataset/infra_data/data/aqa_dataset/train.parquet}}"
     export VAL_FILE="${HUANYU_AQA_VAL_FILE:-${VAL_FILE:-/opt/huawei/dataset/infra_data/data/aqa_dataset/validation.parquet}}"
+elif [[ "${HUANYU_JOB_MODE:-}" == stem ]]; then
+    # The STEM launcher owns data selection even if the shell retains AQA paths.
+    export STEM_DATA_DIR="${STEM_DATA_DIR:-/opt/huawei/dataset/infra_data/data/rl_stem_data}"
+    export TRAIN_FILE="${STEM_TRAIN_FILE:-$STEM_DATA_DIR/train.parquet}"
+    export VAL_FILE="${STEM_VAL_FILE:-$STEM_DATA_DIR/val.parquet}"
+    if [[ -z "${STEM_VAL_FILE:-}" && ! -f "$VAL_FILE" && -f "$STEM_DATA_DIR/validation.parquet" ]]; then
+        export VAL_FILE="$STEM_DATA_DIR/validation.parquet"
+    fi
 fi
 # Resolve deployment paths once. Site environment files may still contain old
 # defaults; neither they nor downstream wrappers should replace caller paths.
@@ -65,6 +74,16 @@ _INTERVAL="${RAY_CLUSTER_POLL_INTERVAL:-5}"
 _PORT="${RAY_PORT:-6925}"
 _DASHBOARD_PORT="${RAY_DASHBOARD_PORT:-8960}"
 _JOB_MODE="${HUANYU_JOB_MODE:-frozen_cache}"
+_CLUSTER_NODES="${HUANYU_CLUSTER_NODES:-2}"
+if [[ "$_JOB_MODE" == stem ]]; then
+    [[ "$_CLUSTER_NODES" == 8 || "$_CLUSTER_NODES" == 16 ]] || {
+        echo 'FATAL: STEM jobs require HUANYU_CLUSTER_NODES=8 or 16 (16 NPUs per node)' >&2; exit 2;
+    }
+else
+    [[ "$_CLUSTER_NODES" == 2 ]] || {
+        echo 'FATAL: frozen_cache and aqa_unfreeze jobs require HUANYU_CLUSTER_NODES=2' >&2; exit 2;
+    }
+fi
 # Defaults for direct invocation; a profile such as the 16K wrapper supplies
 # these first. Snapshot before sourcing the site env so it cannot replace the
 # caller's pool sizes. Physical Ray capacity remains 16 NPUs on each node.
@@ -75,6 +94,7 @@ declare -A _HUANYU_POOL_CONFIG=(
     [RM_SPLIT_NODES]="${RM_SPLIT_NODES:-1}"
 )
 for _key in NUM_NPUS NNODES ROLLOUT_TP RM_TP RM_N_GPUS_PER_NODE RM_NNODES; do
+    if [[ "$_JOB_MODE" == stem && "$_key" == RM_NNODES && "${_HUANYU_POOL_CONFIG[$_key]}" == 0 ]]; then continue; fi
     if [[ ! "${_HUANYU_POOL_CONFIG[$_key]}" =~ ^[1-9][0-9]?$ ]]; then
         echo "FATAL: $_key must be a positive integer (without leading zeroes)" >&2
         exit 2
@@ -85,6 +105,13 @@ _ACTOR_NODES=${_HUANYU_POOL_CONFIG[NNODES]}
 _RM_PER_NODE=${_HUANYU_POOL_CONFIG[RM_N_GPUS_PER_NODE]}
 _RM_NODES=${_HUANYU_POOL_CONFIG[RM_NNODES]}
 if (( ! _PREPARE_ONLY )); then
+if [[ "$_JOB_MODE" == stem ]]; then
+    if (( _ACTOR_PER_NODE != 16 || _ACTOR_NODES != _CLUSTER_NODES ||
+          _ACTOR_PER_NODE % ${_HUANYU_POOL_CONFIG[ROLLOUT_TP]} != 0 )) || [[ "${RM_ENABLE:-0}" != 0 ]]; then
+        echo 'FATAL: STEM requires all physical nodes for Actor, NUM_NPUS=16, node-local TP dividing 16, and RM_ENABLE=0' >&2
+        exit 2
+    fi
+else
 if (( _ACTOR_PER_NODE > 16 || _RM_PER_NODE > 16 || _ACTOR_NODES > 2 || _RM_NODES > 2 ||
       _ACTOR_PER_NODE * _ACTOR_NODES + _RM_PER_NODE * _RM_NODES != 32 ||
       _ACTOR_PER_NODE % ${_HUANYU_POOL_CONFIG[ROLLOUT_TP]} != 0 ||
@@ -111,17 +138,19 @@ if [[ "$_JOB_MODE" == aqa_unfreeze ]] &&
     echo 'FATAL: AQA jobs require actor16 + RM16' >&2
     exit 2
 fi
+fi  # STEM uses every node for Actor and no GenRM resource pool.
 fi  # Pool packing is checked when launching the job, not during standalone setup.
 case "$_JOB_MODE" in
     frozen_cache) _TRAIN_ENTRY=run_huanyu.sh ;;
     aqa_unfreeze) _TRAIN_ENTRY=run_huanyu_aqa_audio_train.sh ;;
-    *) echo 'FATAL: HUANYU_JOB_MODE must be frozen_cache or aqa_unfreeze; configure AQA precision/length/sync through environment and training arguments' >&2; exit 2 ;;
+    stem) _TRAIN_ENTRY=run_huanyu_stem.sh ;;
+    *) echo 'FATAL: HUANYU_JOB_MODE must be frozen_cache, aqa_unfreeze or stem' >&2; exit 2 ;;
 esac
 # Keep the component choices through site environment setup and into existing
 # Ray workers. The frozen-cache entry always freezes both audio components.
 _AUDIO_MODE_FILE="${_HUANYU_EXAMPLE_DIR}/audio_train_mode.sh"
 [[ -f "$_AUDIO_MODE_FILE" ]] || { echo "FATAL: missing $_AUDIO_MODE_FILE" >&2; exit 1; }
-if [[ "$_JOB_MODE" == frozen_cache ]]; then
+if [[ "$_JOB_MODE" == frozen_cache || "$_JOB_MODE" == stem ]]; then
     export HUANYU_FREEZE_AUDIO=true
     export HUANYU_TRAIN_AUDIO_ENCODER=false HUANYU_TRAIN_AUDIO_PROJECTOR=false
 fi
@@ -139,13 +168,15 @@ if (( ! _PREPARE_ONLY )); then _REQUIRED_COMMANDS+=(ray timeout); fi
 for _command in "${_REQUIRED_COMMANDS[@]}"; do
     command -v "$_command" >/dev/null || { echo "FATAL: missing command $_command" >&2; exit 1; }
 done
-if (( ! _PREPARE_ONLY )) && [[ "$_RANK" != 0 && "$_RANK" != 1 ]]; then
-    echo 'FATAL: set VC_TASK_INDEX=0 on head and VC_TASK_INDEX=1 on worker; no implicit rank 0' >&2
-    exit 2
-fi
-if (( ! _PREPARE_ONLY )) && [[ -n "${VC_WORKER_NUM:-}" && "$VC_WORKER_NUM" != 2 ]]; then
-    echo 'FATAL: this launcher expects two nodes, each with 16 NPUs' >&2
-    exit 2
+if (( ! _PREPARE_ONLY )); then
+    if [[ ! "$_RANK" =~ ^(0|[1-9][0-9]?)$ ]] || (( _RANK >= _CLUSTER_NODES )); then
+        echo "FATAL: set VC_TASK_INDEX=0..$((_CLUSTER_NODES - 1)); rank 0 is head; no implicit rank 0" >&2
+        exit 2
+    fi
+    if [[ -n "${VC_WORKER_NUM:-}" && "$VC_WORKER_NUM" != "$_CLUSTER_NODES" ]]; then
+        echo "FATAL: this launcher expects $_CLUSTER_NODES nodes, each with 16 NPUs" >&2
+        exit 2
+    fi
 fi
 for _key in _WAIT _INTERVAL _PORT _DASHBOARD_PORT; do
     if [[ ! "${!_key}" =~ ^[1-9][0-9]*$ ]]; then
@@ -208,7 +239,7 @@ huanyu_preload_allocator
 }
 echo "[huanyu-job] allocator before Python/env setup: LD_PRELOAD=$LD_PRELOAD"
 if (( ! _PREPARE_ONLY )); then
-    _IPS="$("$_PYTHON" -B "$_HELPER" resolve "${VC_WORKER_HOSTS:-}")"
+    _IPS="$("$_PYTHON" -B "$_HELPER" resolve "${VC_WORKER_HOSTS:-}" --expected-nodes "$_CLUSTER_NODES")"
     IFS=, read -r -a _NODE_IPS <<< "$_IPS"
     _MASTER_IP="${_NODE_IPS[0]}"
     _NODE_IP="${_NODE_IPS[$_RANK]}"
@@ -229,7 +260,7 @@ done
 # Older site env files must not change preflight
 # lengths/batches or sampling defaults before that command is composed.
 declare -A _HUANYU_PROFILE_CONFIG=()
-if [[ "${HUANYU_JOB_PROFILE:-}" == whisper_aligned || "$_JOB_MODE" == aqa_unfreeze ]]; then
+if [[ "${HUANYU_JOB_PROFILE:-}" == whisper_aligned || "$_JOB_MODE" == aqa_unfreeze || "$_JOB_MODE" == stem ]]; then
     for _key in TRAIN_BATCH_SIZE PPO_MINI_BATCH_SIZE PPO_MICRO_BATCH_SIZE_PER_GPU \
         ROLLOUT_N ACTOR_MODEL_DTYPE REF_MODEL_DTYPE ACTOR_OFFLOAD_POLICY \
         ACTOR_FORWARD_PREFETCH ACTIVATION_OFFLOAD FILTER_OVERLONG \
@@ -239,8 +270,17 @@ if [[ "${HUANYU_JOB_PROFILE:-}" == whisper_aligned || "$_JOB_MODE" == aqa_unfree
         ROLLOUT_FREQUENCY_PENALTY ROLLOUT_PRESENCE_PENALTY ROLLOUT_LOGPROBS_MODE \
         ROLLOUT_GPU_MEM_UTIL HUANYU_GRAPH_MODE EXPERIMENT_NAME TOTAL_TRAINING_STEPS \
         DEFAULT_LOCAL_DIR TENSORBOARD_DIR ROLLOUT_DATA_DIR VALIDATION_DATA_DIR \
-        TEST_FREQ VAL_BEFORE_TRAIN; do
+        TEST_FREQ VAL_BEFORE_TRAIN ROLLOUT_MAX_NUM_SEQS ROLLOUT_NUM_WORKERS HUANYU_RUN_DIR HUANYU_RUN_BASE \
+        HUANYU_STEM_TEXT_TRAIN HUANYU_CHECKPOINT_VALIDATION_MODE \
+        HUANYU_FULL_WEIGHT_AUDIT_DIR HUANYU_FULL_WEIGHT_AUDIT_RUN_ID HUANYU_WEIGHT_SYNC_AUDIT_DIR \
+        HUANYU_AUDIO_PROBE_DIR HUANYU_TEXT_AB_DIR HUANYU_EMBEDDING_AB_DIR HUANYU_EMBEDDING_AB_SIDE; do
         if [[ -v "$_key" ]]; then _HUANYU_PROFILE_CONFIG["$_key"]="${!_key}"; fi
+    done
+fi
+if [[ "$_JOB_MODE" == stem ]]; then
+    # Preserve every explicit STEM setting through older site env files.
+    for _key in ${!STEM_@}; do
+        _HUANYU_PROFILE_CONFIG["$_key"]="${!_key}"
     done
 fi
 if [[ "$_JOB_MODE" == aqa_unfreeze ]]; then
@@ -312,11 +352,12 @@ huanyu_preload_allocator
 echo "[huanyu-job] allocator for native check/Ray: LD_PRELOAD=$LD_PRELOAD"
 export RAY_PORT="$_PORT" RAY_DASHBOARD_PORT="$_DASHBOARD_PORT"
 if (( ! _PREPARE_ONLY )); then export RAY_ADDRESS="$_MASTER_IP:$_PORT"; fi
-export HUANYU_JOB_MODE="$_JOB_MODE"
+export HUANYU_JOB_MODE="$_JOB_MODE" HUANYU_CLUSTER_NODES="$_CLUSTER_NODES"
 export RAY_USAGE_STATS_ENABLED=0 PYTHONUNBUFFERED=1 HYDRA_FULL_ERROR=1
 export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
 export HUANYU_VLLM_OMNI_ROOT="$_VLLM_TARGET"
 export MINICPMO_USE_PRECOMPUTE=0 MINICPMO_TUNE_VISION=0
+export HUANYU_STEM_TEXT_TRAIN=0
 for _key in "${!_HUANYU_AUDIO_CONFIG[@]}"; do
     export "$_key=${_HUANYU_AUDIO_CONFIG[$_key]}"
 done
@@ -339,13 +380,22 @@ case "$_JOB_MODE" in
         export HUANYU_AQA_AUDIO_TRAIN=1
         export Q36_BACKWARD_PREFETCH=off
         ;;
+    stem)
+        export HUANYU_USE_PRECOMPUTE=0 HUANYU_EMBED_CACHE_DIR=""
+        export HUANYU_AQA_AUDIO_TRAIN=0 HUANYU_STEM_TEXT_TRAIN=1
+        export Q36_BACKWARD_PREFETCH=off
+        ;;
 esac
 export DEBUG_MODE=0 DEBUG_SAMPLES=0
 for _key in "${!_HUANYU_POOL_CONFIG[@]}"; do
     export "$_key=${_HUANYU_POOL_CONFIG[$_key]}"
 done
-export REWARD_POOL_NPUS=$((RM_N_GPUS_PER_NODE * RM_NNODES))
-export NPUS_PER_NODE=16 RM_ENABLE=1
+export NPUS_PER_NODE=16
+if [[ "$_JOB_MODE" == stem ]]; then
+    export RM_ENABLE=0 RM_NNODES=0 REWARD_POOL_NPUS=0
+else
+    export REWARD_POOL_NPUS=$((RM_N_GPUS_PER_NODE * RM_NNODES)) RM_ENABLE=1
+fi
 export NUM_GPUS_ACTOR_ROLLOUT_REWARD=16
 export WANDB_MODE="${WANDB_MODE:-offline}"
 for _key in "${!_HUANYU_PRECISION_CONFIG[@]}"; do
@@ -358,7 +408,7 @@ echo "[huanyu-job] precision before Ray: train_GDN=${MINICPMO_HUANYU_GDN_FP32_TR
 echo "[huanyu-job] inference hooks: ${VLLM_OMNI_EXTERNAL_MODULES}"
 echo "[huanyu-job] mode=$_JOB_MODE freeze_audio=$HUANYU_FREEZE_AUDIO precompute=$HUANYU_USE_PRECOMPUTE train_entry=$_TRAIN_ENTRY"
 echo "[huanyu-job] train_audio_encoder=$HUANYU_TRAIN_AUDIO_ENCODER train_audio_projector=$HUANYU_TRAIN_AUDIO_PROJECTOR"
-echo "[huanyu-job] physical=16x2 actor=${NUM_NPUS}x${NNODES} rollout_TP=$ROLLOUT_TP RM=${RM_N_GPUS_PER_NODE}x${RM_NNODES} RM_TP=$RM_TP requested=$((NUM_NPUS * NNODES + REWARD_POOL_NPUS))"
+echo "[huanyu-job] physical=16x${_CLUSTER_NODES} actor=${NUM_NPUS}x${NNODES} rollout_TP=$ROLLOUT_TP RM=${RM_N_GPUS_PER_NODE}x${RM_NNODES} RM_TP=$RM_TP requested=$((NUM_NPUS * NNODES + REWARD_POOL_NPUS))"
 "$_PYTHON" -B "${_HUANYU_EXAMPLE_DIR}/check_native_runtime.py" \
     --check --expected-root "$_VLLM_TARGET"
 echo '[huanyu-job] native import check exited successfully'
@@ -401,12 +451,12 @@ if (( _RANK == 0 )); then
     _RUNTIME_ARGS=()
     for _key in HUANYU_USE_PRECOMPUTE HUANYU_EMBED_CACHE_DIR HUANYU_FREEZE_AUDIO \
         HUANYU_TRAIN_AUDIO_ENCODER HUANYU_TRAIN_AUDIO_PROJECTOR \
-        HUANYU_AQA_AUDIO_TRAIN MINICPMO_USE_PRECOMPUTE MINICPMO_TUNE_AUDIO \
+        HUANYU_AQA_AUDIO_TRAIN HUANYU_STEM_TEXT_TRAIN MINICPMO_USE_PRECOMPUTE MINICPMO_TUNE_AUDIO \
         MINICPMO_TUNE_VISION WANDB_MODE LD_PRELOAD; do
         _value="$("$_PYTHON" -c 'import json, os, sys; print(json.dumps(os.environ[sys.argv[1]]))' "$_key")"
         _RUNTIME_ARGS+=("++ray_kwargs.ray_init.runtime_env.env_vars.${_key}=${_value}")
     done
-    echo "[huanyu-job] both nodes ready (16 + 16 NPU); head starting $_JOB_MODE Huanyu training"
+    echo "[huanyu-job] all $_CLUSTER_NODES nodes ready ($((_CLUSTER_NODES * 16)) NPU); head starting $_JOB_MODE Huanyu training"
     bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/$_TRAIN_ENTRY" \
         "${_TRAIN_ARGS[@]}" \
         "++actor_rollout_ref.model.override_config.huanyu_freeze_audio=${HUANYU_FREEZE_AUDIO}" \
