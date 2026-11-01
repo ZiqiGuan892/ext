@@ -28,6 +28,16 @@ class StemMultinodeJobTests(unittest.TestCase):
         for name in ("run_huanyu_stem_job.sh", "run_huanyu_stem.sh", "run_huanyu.sh"):
             shutil.copyfile(EXAMPLES / name, self.fixture.examples / name)
         self.fixture.entry = self.fixture.examples / "run_huanyu_stem_job.sh"
+        # Include the real backend capacity preflight as well as the real STEM
+        # status check. Otherwise a hidden downstream ray status could survive.
+        backend = (EXAMPLES / "run_qwen36_huanyu_gspo_npu.sh").read_text(encoding="utf-8")
+        capacity = backend[backend.index("# Ray 侧资源账本校验"):backend.index("# ---- 数据文件防护 ----")]
+        fixture_backend = self.fixture.examples / "run_qwen36_huanyu_gspo_npu.sh"
+        fixture_backend.write_text(
+            fixture_backend.read_text(encoding="utf-8").replace(
+                "_CHAT_TEMPLATE_ARGS=()", capacity + "\n_CHAT_TEMPLATE_ARGS=()", 1,
+            ), encoding="utf-8", newline="\n",
+        )
         # The site dependency is absent on the CPU host. Keep the real rule
         # preflight and exercise its dispatch contract with a tiny stand-in.
         reward = self.fixture.project / "verl/utils/reward_score"
@@ -133,15 +143,31 @@ class StemMultinodeJobTests(unittest.TestCase):
         self.assertEqual(capture["env"]["HUANYU_USE_PRECOMPUTE"], "0")
 
     def test_128_cards_rule_reward_and_final_batch_lengths(self):
-        capture, actual = self.launch()
+        capture, actual = self.launch({"HUANYU_TEST_FAIL_WAIT": "wait-cluster"})
         self.assert_scaled(capture, actual, 128)
         self.assertEqual(len(self.fixture.events("train")), 1)
         starts = [event for event in self.fixture.events("ray") if "start" in event["args"]]
         self.assertEqual(len(starts), 1)
         self.assertIn("--head", starts[0]["args"])
-        wait = next(event for event in self.fixture.events("helper") if event["args"][0] == "wait-cluster")
-        ips = wait["args"][wait["args"].index("--expected-ips") + 1]
+        self.assertFalse(any(event["args"][0] == "wait-cluster" for event in self.fixture.events("helper")))
+        self.assertFalse(any("status" in event["args"] for event in self.fixture.events("ray")))
+        self.assertEqual(capture["env"]["HUANYU_RAY_READINESS_CHECK"], "0")
+
+    def test_readiness_opt_in_checks_expected_nodes_and_downstream_status(self):
+        capture, actual = self.launch({"HUANYU_RAY_READINESS_CHECK": "1"})
+        self.assert_scaled(capture, actual, 128)
+        waits = [e for e in self.fixture.events("helper") if e["args"][0] == "wait-cluster"]
+        self.assertEqual(len(waits), 1)
+        ips = waits[0]["args"][waits[0]["args"].index("--expected-ips") + 1]
         self.assertEqual(len(ips.split(",")), 8)
+        self.assertEqual(len([e for e in self.fixture.events("ray") if "status" in e["args"]]), 2)
+
+    def test_readiness_opt_in_failure_stops_training(self):
+        result = self.fixture.run_launcher({"HUANYU_RAY_READINESS_CHECK": "1",
+                                            "HUANYU_TEST_FAIL_WAIT": "wait-cluster"})
+        self.assertEqual(result.returncode, 19, result.stdout + result.stderr)
+        self.assertFalse(self.fixture.events("train"))
+        self.assertFalse(any("status" in e["args"] for e in self.fixture.events("ray")))
 
     def test_platform_sixteen_local_processes_only_start_one_node_job(self):
         def launch_rank(rank):
@@ -195,9 +221,7 @@ class StemMultinodeJobTests(unittest.TestCase):
                 self.assert_scaled(capture, actual, total, ignore_eos="true")
                 for kind in ("helper", "pip", "git", "flock", "env-source"):
                     self.assertFalse(self.fixture.events(kind), kind)
-                rays = self.fixture.events("ray")
-                self.assertEqual(len(rays), 1)
-                self.assertEqual(rays[0]["args"], ["status", "--address=192.0.2.10:6925"])
+                self.assertFalse(self.fixture.events("ray"))
                 self.assertEqual(len(self.fixture.events("train")), 1)
                 self.assertEqual(json.loads(actual[_aqa.ENV_PREFIX + "LD_PRELOAD"]),
                                  _job.shell_path(self.fixture.jemalloc))
@@ -229,10 +253,13 @@ class StemMultinodeJobTests(unittest.TestCase):
                 "export STEM_CONTEXT_LENGTH=5k STEM_CONTEXT_SLACK=128 STEM_REWARD_MODE=genrm\n"
                 "export STEM_DYNAMIC_BSZ=true STEM_SYNC_EACH_MICROBATCH=false ROLLOUT_MAX_NUM_SEQS=32\n"
                 "export STEM_IGNORE_EOS=true\n"
+                "export HUANYU_RAY_READINESS_CHECK=1\n"
                 "export HUANYU_USE_PRECOMPUTE=1 HUANYU_STEM_TEXT_TRAIN=0\n"
             )
         capture, actual = self.launch()
         self.assert_scaled(capture, actual, 128)
+        self.assertEqual(capture["env"]["HUANYU_RAY_READINESS_CHECK"], "0")
+        self.assertFalse(any("status" in e["args"] for e in self.fixture.events("ray")))
 
     def test_last_rank_in_each_cluster_only_joins_ray(self):
         for total in (128, 256):

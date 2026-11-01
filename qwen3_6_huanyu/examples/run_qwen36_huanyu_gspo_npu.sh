@@ -400,7 +400,9 @@ echo "Cluster: NUM_NPUS=${NUM_NPUS} (detected ${_DETECTED_NPUS}) NNODES=${NNODES
 
 # Ray 侧资源账本校验：脚本可能连的是已存在的集群，
 # 若集群是按 16 卡起的，光改 NUM_NPUS 没用。
-if command -v ray >/dev/null 2>&1; then
+if [ "${HUANYU_RAY_READINESS_CHECK:-1}" = 0 ]; then
+    echo '[huanyu-train] Ray capacity precheck skipped (HUANYU_RAY_READINESS_CHECK=0)'
+elif command -v ray >/dev/null 2>&1; then
     _ray_npu=$(ray status 2>/dev/null | grep -oE '[0-9]+\.[0-9]+/[0-9]+\.[0-9]+ NPU' | head -n1 | sed 's#.*/##; s# NPU##' || true)
     if [ -n "${_ray_npu:-}" ]; then
         _ray_npu_int=$(printf '%.0f' "${_ray_npu}")

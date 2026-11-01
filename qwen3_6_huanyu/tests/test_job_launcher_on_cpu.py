@@ -124,6 +124,7 @@ keys = (
     "NNODES", "NUM_NPUS", "REWARD_POOL_NPUS", "RM_ENABLE", "RAY_ADDRESS", "LD_PRELOAD",
     "PROJECT_ROOT", "MODEL_PATH", "RM_MODEL_PATH", "TRAIN_FILE", "VAL_FILE",
     "HUANYU_STEM_TEXT_TRAIN", "HUANYU_CLUSTER_NODES", "RM_NNODES", "ROLLOUT_TP",
+    "HUANYU_RAY_READINESS_CHECK",
     "STEM_CONTEXT_LENGTH", "STEM_PROMPT_LENGTH", "STEM_DATA_DIR",
     "TRAIN_BATCH_SIZE", "PPO_MINI_BATCH_SIZE", "ROLLOUT_N", "ROLLOUT_MAX_NUM_SEQS",
     "ACTOR_OFFLOAD_POLICY", "ROLLOUT_NUM_WORKERS", "HUANYU_CHECKPOINT_VALIDATION_MODE", "HUANYU_FULL_WEIGHT_AUDIT_DIR",
@@ -460,9 +461,9 @@ if command not in ("ray", "git", "pip", "flock", "env-source"):
         self.assertTrue(capture["env"]["TRAIN_FILE"].endswith("/stem/data/train.parquet"))
         actual = dict(arg.lstrip("+").split("=", 1) for arg in capture["argv"])
         self.assertEqual(json.loads(actual["ray_kwargs.ray_init.runtime_env.env_vars.HUANYU_STEM_TEXT_TRAIN"]), "1")
-        wait = [event for event in self.events("helper") if event["args"][0] == "wait-cluster"][0]
-        self.assertEqual(wait["args"][wait["args"].index("--expected-ips") + 1].count(","), 7)
-        self.assertIn("all 8 nodes ready (128 NPU)", result.stdout)
+        self.assertFalse(any(event["args"][0] == "wait-cluster" for event in self.events("helper")))
+        self.assertEqual(capture["env"]["HUANYU_RAY_READINESS_CHECK"], "0")
+        self.assertIn("expected capacity=128 NPU, not prechecked", result.stdout)
         self.assertEqual(len(self.events("train")), 1)
 
     def test_stem_last_256_card_worker_joins_without_submitting_training(self):
@@ -699,6 +700,23 @@ if command not in ("ray", "git", "pip", "flock", "env-source"):
         self.assertFalse(self.capture_file.exists())
         self.assertFalse(any("stop" in event["args"] for event in self.events("ray")))
 
+    def test_readiness_opt_out_survives_site_env_and_skips_probe(self):
+        with (self.examples / "env_export_huanyu.sh").open("a", encoding="utf-8") as stream:
+            stream.write("export HUANYU_RAY_READINESS_CHECK=1\n")
+        result = self.run_launcher({"HUANYU_RAY_READINESS_CHECK": "0",
+                                    "HUANYU_TEST_FAIL_WAIT": "wait-cluster"})
+        self.assert_success(result)
+        self.assertFalse(any(event["args"][0] == "wait-cluster" for event in self.events("helper")))
+        self.assertIn("membership/resources not verified", result.stdout)
+        self.assertNotIn("nodes registered", result.stdout)
+        self.assertEqual(len(self.events("train")), 1)
+
+    def test_invalid_readiness_flag_fails_before_setup(self):
+        result = self.run_launcher({"HUANYU_RAY_READINESS_CHECK": "yes"})
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("HUANYU_RAY_READINESS_CHECK", result.stderr)
+        self.assertFalse(self.events_file.exists())
+
     def test_invalid_ports_fail_before_preparing_code_or_ray(self):
         for updates in (
             {"RAY_PORT": "abc"},
@@ -800,6 +818,18 @@ if command not in ("ray", "git", "pip", "flock", "env-source"):
         waits = [event for event in self.events("helper") if event["args"][0] == "wait-cluster"]
         self.assertEqual(len(waits), 1)
         self.assertEqual(waits[0]["args"][-2:], ["--mode", "local"])
+        for kind in ("ray", "pip", "git", "train"):
+            self.assertFalse(self.events(kind), kind)
+
+    def test_existing_worker_opt_out_does_not_claim_verified_membership(self):
+        result = self.run_launcher({
+            "VC_TASK_INDEX": "1", "HUANYU_TEST_RAY_LIVE": "once",
+            "HUANYU_RAY_READINESS_CHECK": "0", "HUANYU_TEST_FAIL_WAIT": "wait-cluster",
+        })
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("cluster membership unchecked", result.stdout)
+        self.assertIn("worker raylet exited", result.stdout)
+        self.assertFalse(any(event["args"][0] == "wait-cluster" for event in self.events("helper")))
         for kind in ("ray", "pip", "git", "train"):
             self.assertFalse(self.events(kind), kind)
 

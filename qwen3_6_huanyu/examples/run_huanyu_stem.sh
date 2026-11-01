@@ -64,11 +64,20 @@ for _file in "$_STEM_TRAIN" "$_STEM_VAL"; do
 done
 export RAY_ADDRESS="${RAY_ADDRESS:-auto}"
 [[ "$RAY_ADDRESS" != local ]] || { echo 'FATAL: use the existing Ray cluster (auto or head_ip:port)' >&2; exit 2; }
-_STEM_RAY_TIMEOUT="${HUANYU_RAY_STATUS_TIMEOUT:-30}"
-[[ "$_STEM_RAY_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || { echo 'FATAL: HUANYU_RAY_STATUS_TIMEOUT must be positive' >&2; exit 2; }
+_STEM_RAY_CHECK="${HUANYU_RAY_READINESS_CHECK:-1}"
+case "$_STEM_RAY_CHECK" in
+    0|1) ;;
+    *) echo 'FATAL: HUANYU_RAY_READINESS_CHECK must be 0 or 1' >&2; exit 2 ;;
+esac
 source "$_STEM_EXAMPLES/run_output.sh"
-if ! timeout --foreground "${_STEM_RAY_TIMEOUT}s" ray status --address="$RAY_ADDRESS"; then
-    echo 'FATAL: existing Ray is not reachable; prepare both 16-NPU nodes first' >&2; exit 1
+if [[ "$_STEM_RAY_CHECK" == 1 ]]; then
+    _STEM_RAY_TIMEOUT="${HUANYU_RAY_STATUS_TIMEOUT:-30}"
+    [[ "$_STEM_RAY_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || { echo 'FATAL: HUANYU_RAY_STATUS_TIMEOUT must be positive' >&2; exit 2; }
+    if ! timeout --foreground "${_STEM_RAY_TIMEOUT}s" ray status --address="$RAY_ADDRESS"; then
+        echo 'FATAL: existing Ray is not reachable; prepare the requested Ray nodes first' >&2; exit 1
+    fi
+else
+    echo '[huanyu-stem] Ray status precheck skipped (HUANYU_RAY_READINESS_CHECK=0); trainer will connect to Ray'
 fi
 
 # GenRM reads the question from extra_info, not prompt. Keep original columns

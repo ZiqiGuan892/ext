@@ -3,7 +3,8 @@
 # TOTAL_NPUS=128 (8 nodes) or 256 (16 nodes); all devices serve Actor/rollout.
 # CPU math_dapo rule reward, no GenRM. Defaults: BS128, mini128, N16, 2K+10K.
 # Reuses the common job's vLLM-Omni backup/replacement, editable install, site
-# environment, native checks, Ray head/worker startup and readiness checks.
+# environment, native checks and Ray head/worker startup.
+# Extra Ray readiness probes default off; HUANYU_RAY_READINESS_CHECK=1 opts in.
 # Required: VC_TASK_INDEX=0..nodes-1, VC_WORKER_HOSTS=comma-separated host list.
 # If the platform launches one Bash per NPU, the common job elects LOCAL_RANK=0
 # on EACH node; other local ranks exit before setup/Ray and keep all NPUs free.
@@ -26,6 +27,11 @@ fi
 export PROJECT_ROOT="${PROJECT_ROOT:-/opt/huawei/dataset/infra_data/code/verl_omni_qwen36_gzq_new}"
 [[ "$PROJECT_ROOT" == /* ]] || { echo 'FATAL: PROJECT_ROOT must be absolute' >&2; exit 2; }
 _STEM_JOB_EXAMPLES="$PROJECT_ROOT/examples/qwen3_6_huanyu"
+export HUANYU_RAY_READINESS_CHECK="${HUANYU_RAY_READINESS_CHECK:-0}"
+case "$HUANYU_RAY_READINESS_CHECK" in
+    0|1) ;;
+    *) echo 'FATAL: HUANYU_RAY_READINESS_CHECK must be 0 or 1' >&2; exit 2 ;;
+esac
 for _file in run_huanyu_32card_job.sh run_huanyu_stem.sh run_huanyu.sh; do
     [[ -r "$_STEM_JOB_EXAMPLES/$_file" ]] || { echo "FATAL: missing $_STEM_JOB_EXAMPLES/$_file" >&2; exit 2; }
 done

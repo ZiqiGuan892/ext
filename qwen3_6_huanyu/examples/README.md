@@ -1039,12 +1039,23 @@ python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/aqa_text_ab.py" compare --case-di
   → jemalloc → 按内容摘要备份/替换 vllm-omni → editable安装当前项目
   → source env_export_huanyu.sh → 恢复本次参数 → 原生导入/NPU检查
   → rank0启动Ray head；其余节点加入Ray并阻塞等待
-  → rank0等全部节点各16张NPU就绪，仅提交一次训练
+  → rank0直接提交一次训练（默认不运行额外Ray就绪探针）
   → run_huanyu_stem.sh（规则奖励自检、准备本次STEM Parquet）
   → run_huanyu.sh → run_qwen36_huanyu_gspo_npu.sh → main_omni
 ```
 
 规则奖励路径直接进入训练后端，跳过会强制开启 GenRM 的 OmniMix 包装层。原来直接调用 `run_huanyu_stem.sh` 的5K、16+16、GenRM默认行为保持不变。
+
+STEM job 默认 `HUANYU_RAY_READINESS_CHECK=0`，跳过共享 job 的 `wait-cluster`、STEM 入口的 `ray status`，以及最终训练后端的 Ray 资源账本预检查。站点 env 文件不能把本次选择重新打开；`--train-only` 同样默认关闭。日志会明确打印 `Ray readiness probe disabled`、`Ray status precheck skipped`、`Ray capacity precheck skipped`，不再把未检查的集群报告为“全部节点已就绪”。主节点仍正常创建 Ray head，从节点仍等待 head 的 TCP 端口可连接后执行 `ray start --address=... --block`；这个端口等待不调用 `ray.init()`，也不证明集群资源齐备。
+
+原 `wait-cluster` 会启动单独 Python driver，先 `ray.init(address=...)`，再每5秒读取 `ray.nodes()`，核对预期IP都为 `Alive` 且各登记至少16个NPU，外层 `timeout` 默认900秒。用户日志中的阻塞发生在这个 driver 的 raylet 注册阶段，尚未进入节点轮询；超时本身不能证明从节点没加入，也不能证明训练一定无法连接。该检查即使通过，也只表示节点/资源登记符合要求，不保证模型内存、通信或训练可用。
+
+若确实需要这项预检查，可在所有节点显式设置 `HUANYU_RAY_READINESS_CHECK=1`；此时恢复上述检查。冻结缓存/AQA job 仍保留原来的默认检查行为。关闭检查后，训练程序仍需自行连接 Ray、申请128/256卡资源；若其他节点尚未加入或底层 raylet 仍有问题，训练仍可能等待或报错，不能把跳过检查当成已修复 Ray 注册问题。
+
+```bash
+TOTAL_NPUS=128 HUANYU_RAY_READINESS_CHECK=0 \
+bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/run_huanyu_stem_job.sh"
+```
 
 在所有节点部署相同代码、模型与数据路径，`PROJECT_ROOT/runs` 必须是共享目录，其他节点需要读取主节点准备的 Parquet。作业平台通常注入 `VC_TASK_INDEX`、`VC_WORKER_HOSTS`、`VC_WORKER_NUM`；没有注入时，分别设置0..7或0..15的 rank，所有节点设置同一份完整逗号分隔主机列表，首个为 head。不要把所有节点 rank 都设成0。
 
@@ -1105,7 +1116,7 @@ TOTAL_TRAINING_STEPS=2 \
 bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/run_huanyu_stem_job.sh" --train-only
 ```
 
-`--train-only` 保留上表的 BS128/mini128/N16、12K、TP8、数学规则奖励、冻结 encoder/projector、offload 和精度配置；`STEM_IGNORE_EOS=true`、`ROLLOUT_TP=16` 等仍可通过环境变量修改。它要求 `VC_TASK_INDEX=0`，跳过共享 job 的目录替换、安装、source站点环境、Ray启动和 `wait-cluster`，直接调用现有 STEM 训练入口；后者保留只读的 `ray status` 检查，训练本身仍需正常连接 Ray。去掉 `TOTAL_TRAINING_STEPS=2` 可按原训练周期继续。不要用不带 `--train-only` 的 job 命令替代这一步，否则会进入一键集群启动流程。
+`--train-only` 保留上表的 BS128/mini128/N16、12K、TP8、数学规则奖励、冻结 encoder/projector、offload 和精度配置；`STEM_IGNORE_EOS=true`、`ROLLOUT_TP=16` 等仍可通过环境变量修改。它要求 `VC_TASK_INDEX=0`，跳过共享 job 的目录替换、安装、source站点环境、Ray启动和 `wait-cluster`，直接调用现有 STEM 训练入口；下游 `ray status` 预检查默认也关闭，可通过 `HUANYU_RAY_READINESS_CHECK=1` 开启，训练本身仍需正常连接 Ray。去掉 `TOTAL_TRAINING_STEPS=2` 可按原训练周期继续。不要用不带 `--train-only` 的 job 命令替代这一步，否则会进入一键集群启动流程。
 
 ```bash
 export PROJECT_ROOT=/opt/huawei/dataset/infra_data/code/verl_omni_qwen36_gzq_new

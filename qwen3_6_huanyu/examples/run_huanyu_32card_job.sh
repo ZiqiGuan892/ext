@@ -113,6 +113,13 @@ _INTERVAL="${RAY_CLUSTER_POLL_INTERVAL:-5}"
 _PORT="${RAY_PORT:-6925}"
 _DASHBOARD_PORT="${RAY_DASHBOARD_PORT:-8960}"
 _JOB_MODE="${HUANYU_JOB_MODE:-frozen_cache}"
+_READINESS_DEFAULT=1
+if [[ "$_JOB_MODE" == stem ]]; then _READINESS_DEFAULT=0; fi
+_RAY_READINESS_CHECK="${HUANYU_RAY_READINESS_CHECK:-$_READINESS_DEFAULT}"
+case "$_RAY_READINESS_CHECK" in
+    0|1) ;;
+    *) echo 'FATAL: HUANYU_RAY_READINESS_CHECK must be 0 or 1' >&2; exit 2 ;;
+esac
 _CLUSTER_NODES="${HUANYU_CLUSTER_NODES:-2}"
 if [[ "$_JOB_MODE" == stem ]]; then
     [[ "$_CLUSTER_NODES" == 8 || "$_CLUSTER_NODES" == 16 ]] || {
@@ -390,6 +397,7 @@ cd "$PROJECT_ROOT"
 huanyu_preload_allocator
 echo "[huanyu-job] allocator for native check/Ray: LD_PRELOAD=$LD_PRELOAD"
 export RAY_PORT="$_PORT" RAY_DASHBOARD_PORT="$_DASHBOARD_PORT"
+export HUANYU_RAY_READINESS_CHECK="$_RAY_READINESS_CHECK"
 if (( ! _PREPARE_ONLY )); then export RAY_ADDRESS="$_MASTER_IP:$_PORT"; fi
 export HUANYU_JOB_MODE="$_JOB_MODE" HUANYU_CLUSTER_NODES="$_CLUSTER_NODES"
 export RAY_USAGE_STATS_ENABLED=0 PYTHONUNBUFFERED=1 HYDRA_FULL_ERROR=1
@@ -466,6 +474,10 @@ if (( _PREPARE_ONLY )); then
 fi
 
 wait_for_cluster() {
+    if [[ "$_RAY_READINESS_CHECK" == 0 ]]; then
+        echo "[huanyu-job] Ray readiness probe disabled (HUANYU_RAY_READINESS_CHECK=0 mode=$1); no extra ray.init, membership/resources not verified"
+        return 0
+    fi
     local status=0
     timeout --foreground "${_WAIT}s" "$_PYTHON" -B "$_HELPER" wait-cluster \
         --address "$RAY_ADDRESS" --expected-ips "$_IPS" --local-ip "$_NODE_IP" \
@@ -495,7 +507,11 @@ if (( _RANK == 0 )); then
         _value="$("$_PYTHON" -c 'import json, os, sys; print(json.dumps(os.environ[sys.argv[1]]))' "$_key")"
         _RUNTIME_ARGS+=("++ray_kwargs.ray_init.runtime_env.env_vars.${_key}=${_value}")
     done
-    echo "[huanyu-job] all $_CLUSTER_NODES nodes ready ($((_CLUSTER_NODES * 16)) NPU); head starting $_JOB_MODE Huanyu training"
+    if [[ "$_RAY_READINESS_CHECK" == 1 ]]; then
+        echo "[huanyu-job] all $_CLUSTER_NODES nodes registered ($((_CLUSTER_NODES * 16)) NPU); head starting $_JOB_MODE Huanyu training"
+    else
+        echo "[huanyu-job] head submitting $_JOB_MODE training to $RAY_ADDRESS; expected capacity=$((_CLUSTER_NODES * 16)) NPU, not prechecked"
+    fi
     bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/$_TRAIN_ENTRY" \
         "${_TRAIN_ARGS[@]}" \
         "++actor_rollout_ref.model.override_config.huanyu_freeze_audio=${HUANYU_FREEZE_AUDIO}" \
@@ -507,7 +523,11 @@ else
         --address "$RAY_ADDRESS" --timeout "$_WAIT" --interval "$_INTERVAL"
     if (( _LIVE_RAY )); then
         wait_for_cluster local
-        echo '[huanyu-job] worker already belongs to the selected cluster; waiting, no training on this node'
+        if [[ "$_RAY_READINESS_CHECK" == 1 ]]; then
+            echo '[huanyu-job] worker registered in the selected cluster; waiting, no training on this node'
+        else
+            echo '[huanyu-job] keeping existing worker raylet; cluster membership unchecked, no training on this node'
+        fi
         while pgrep -x raylet >/dev/null; do sleep 30; done
         echo 'FATAL: worker raylet exited' >&2
         exit 1
