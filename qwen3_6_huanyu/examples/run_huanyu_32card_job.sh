@@ -13,6 +13,45 @@
 # Never stops an existing Ray cluster or deletes an old checkout.
 set -euo pipefail
 
+# Some schedulers wrap this node-level entry in torchrun/torch.distributed.launch
+# with one Bash process per NPU. Elect local rank 0 BEFORE Python, setup, logs or
+# flock; peers exit successfully so the outer launcher does not kill the owner.
+# VC_TASK_INDEX remains the node rank: global RANK=0 would exclude other nodes.
+_HUANYU_LOCAL_RANK="${LOCAL_RANK-}"
+_HUANYU_HAS_LOCAL_RANK=0
+if [[ -v LOCAL_RANK ]]; then _HUANYU_HAS_LOCAL_RANK=1; fi
+_HUANYU_NODE_ARGS=()
+while (( $# )); do
+    case "$1" in
+        --local-rank=*|--local_rank=*) _HUANYU_ARG_RANK="${1#*=}"; shift ;;
+        --local-rank|--local_rank)
+            (( $# >= 2 )) || { echo 'FATAL: missing local rank argument value' >&2; exit 2; }
+            _HUANYU_ARG_RANK="$2"; shift 2 ;;
+        *) _HUANYU_NODE_ARGS+=("$1"); shift; continue ;;
+    esac
+    if (( _HUANYU_HAS_LOCAL_RANK )) && [[ "$_HUANYU_LOCAL_RANK" != "$_HUANYU_ARG_RANK" ]]; then
+        echo 'FATAL: conflicting local rank values in LOCAL_RANK / launcher arguments' >&2
+        exit 2
+    fi
+    _HUANYU_LOCAL_RANK="$_HUANYU_ARG_RANK"
+    _HUANYU_HAS_LOCAL_RANK=1
+done
+set -- "${_HUANYU_NODE_ARGS[@]}"
+if (( _HUANYU_HAS_LOCAL_RANK )); then
+    [[ "$_HUANYU_LOCAL_RANK" =~ ^(0|[1-9][0-9]*)$ ]] || {
+        echo 'FATAL: local rank must be a non-negative integer without leading zeroes' >&2; exit 2;
+    }
+    if [[ "$_HUANYU_LOCAL_RANK" != 0 ]]; then
+        echo "[huanyu-job] local_rank=$_HUANYU_LOCAL_RANK node_rank=${VC_TASK_INDEX:-unknown} skipping duplicate node launcher; local_rank=0 owns setup/Ray"
+        exit 0
+    fi
+    echo "[huanyu-job] local_rank=0 node_rank=${VC_TASK_INDEX:-unknown} selected node launcher pid=$$"
+    # Ray/verl creates its own distributed workers. The outer launcher's ranks
+    # must not make setup probes or the Ray driver look like a DDP worker.
+    unset LOCAL_RANK RANK WORLD_SIZE LOCAL_WORLD_SIZE GROUP_RANK GROUP_WORLD_SIZE ROLE_RANK ROLE_WORLD_SIZE
+    for _key in ${!TORCHELASTIC_@}; do unset "$_key"; done
+fi
+
 _PREPARE_ONLY="${HUANYU_PREPARE_ONLY:-0}"
 case "$_PREPARE_ONLY" in
     0) ;;

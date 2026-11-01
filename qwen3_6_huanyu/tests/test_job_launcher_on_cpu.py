@@ -56,6 +56,10 @@ def record(kind, args, **extra):
     )
     item = dict(kind=kind, args=args, preload=os.environ.get("LD_PRELOAD"),
                 precision={key: os.environ.get(key) for key in precision_names}, **extra)
+    item["launcher_env"] = {key: os.environ[key] for key in (
+        "LOCAL_RANK", "RANK", "WORLD_SIZE", "LOCAL_WORLD_SIZE", "GROUP_RANK",
+        "GROUP_WORLD_SIZE", "ROLE_RANK", "ROLE_WORLD_SIZE", "TORCHELASTIC_RUN_ID",
+    ) if key in os.environ}
     with Path(os.environ["HUANYU_TEST_EVENTS"]).open("a", encoding="utf-8") as stream:
         stream.write(json.dumps(item) + "\\n")
 """
@@ -142,6 +146,8 @@ Path(os.environ["HUANYU_TEST_CAPTURE"]).write_text(
             RECORDER + """
 command = sys.argv[1]
 record(command, sys.argv[2:])
+if command == "flock" and os.environ.get("HUANYU_TEST_LOCK_BUSY") == "1":
+    raise SystemExit(1)
 if command == "pgrep":
     if os.environ.get("HUANYU_TEST_RAY_LIVE") == "once":
         events = Path(os.environ["HUANYU_TEST_EVENTS"]).read_text().splitlines()
@@ -195,7 +201,11 @@ if command not in ("ray", "git", "pip", "flock", "env-source"):
                 "PYTHON", "PROJECT_ROOT", "EXPERIMENT_NAME", "WANDB_MODE",
                 "NNODES", "NUM_NPUS", "REWARD_POOL_NPUS", "TMPDIR", "LD_PRELOAD",
                 "MODEL_PATH", "TRAIN_FILE", "VAL_FILE",
+                "LOCAL_RANK", "RANK", "WORLD_SIZE", "LOCAL_WORLD_SIZE", "GROUP_RANK",
+                "GROUP_WORLD_SIZE", "ROLE_RANK", "ROLE_WORLD_SIZE",
             }:
+                self.env.pop(key)
+            elif key.startswith("TORCHELASTIC_"):
                 self.env.pop(key)
         self.env.update(
             PATH=str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
@@ -294,6 +304,64 @@ if command not in ("ray", "git", "pip", "flock", "env-source"):
 
     def assert_success(self, result):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_nonzero_local_ranks_skip_before_lock_and_all_setup(self):
+        for rank in (1, 15):
+            with self.subTest(rank=rank):
+                result = self.run_launcher({
+                    "LOCAL_RANK": str(rank), "RANK": str(16 + rank),
+                    "LOCAL_WORLD_SIZE": "16", "WORLD_SIZE": "128",
+                    "HUANYU_TEST_LOCK_BUSY": "1",
+                })
+                self.assert_success(result)
+                self.assertIn("skipping duplicate node launcher", result.stdout)
+                self.assertFalse(self.events_file.exists())
+
+    def test_legacy_launch_local_rank_argument_forms_skip_before_setup(self):
+        for args in (("--local-rank=3",), ("--local_rank=3",),
+                     ("--local-rank", "3"), ("--local_rank", "3")):
+            with self.subTest(args=args):
+                result = self.run_launcher(arguments=args)
+                self.assert_success(result)
+                self.assertFalse(self.events_file.exists())
+
+    def test_local_rank_zero_preserves_hydra_args_and_clears_outer_rank_env(self):
+        result = self.run_launcher({
+            "LOCAL_RANK": "0", "RANK": "0", "WORLD_SIZE": "128",
+            "LOCAL_WORLD_SIZE": "16", "GROUP_RANK": "0", "GROUP_WORLD_SIZE": "8",
+            "ROLE_RANK": "0", "ROLE_WORLD_SIZE": "128", "TORCHELASTIC_RUN_ID": "outer-launch",
+        }, arguments=("--local-rank", "0", "trainer.total_training_steps=2",
+                      "--local_rank=0", "++test.text=value with spaces"))
+        self.assert_success(result)
+        self.assertEqual(len(self.events("train")), 1)
+        argv = json.loads(self.capture_file.read_text())["argv"]
+        self.assertIn("trainer.total_training_steps=2", argv)
+        self.assertIn("++test.text=value with spaces", argv)
+        self.assertFalse(any(x.startswith("--local") or x == "0" for x in argv))
+        for kind in ("helper", "pip", "runtime", "ray", "train"):
+            for event in self.events(kind):
+                self.assertEqual(event["launcher_env"], {}, (kind, event))
+
+    def test_invalid_or_conflicting_local_rank_stops_before_setup(self):
+        for updates, args in (
+            ({"LOCAL_RANK": "-1"}, ()), ({"LOCAL_RANK": "bad"}, ()),
+            ({"LOCAL_RANK": ""}, ()), ({}, ("--local-rank=",)),
+            ({}, ("--local_rank",)), ({}, ("--local-rank", "trainer.x=2")),
+            ({"LOCAL_RANK": "0"}, ("--local-rank=1",)),
+            ({}, ("--local-rank=0", "--local_rank=1")),
+        ):
+            with self.subTest(updates=updates, args=args):
+                result = self.run_launcher(updates, arguments=args)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn("local rank", result.stderr)
+                self.assertFalse(self.events_file.exists())
+
+    def test_independent_job_still_fails_when_node_lock_is_busy(self):
+        result = self.run_launcher({"HUANYU_TEST_LOCK_BUSY": "1"})
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("another Huanyu job launcher", result.stdout + result.stderr)
+        for kind in ("pip", "ray", "train"):
+            self.assertFalse(self.events(kind))
 
     def assert_precision_defaults(self, event):
         for key in (

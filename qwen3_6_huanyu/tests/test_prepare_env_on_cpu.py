@@ -107,6 +107,66 @@ exit "$prepare_status"
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assert_no_ray_or_training()
 
+    def use_stem_entry(self):
+        for name in ("prepare_huanyu_stem_env.sh", "run_huanyu_stem_job.sh"):
+            shutil.copyfile(EXAMPLES / name, self.fixture.examples / name)
+        self.fixture.env["HUANYU_TEST_PREPARE_ENTRY"] = job_fixture.shell_path(
+            self.fixture.examples / "prepare_huanyu_stem_env.sh"
+        )
+
+    def test_stem_source_prepares_128_cards_without_node_metadata_or_ray(self):
+        self.use_stem_entry()
+        self.fixture.bin.joinpath("ray").unlink()
+        self.append_site_env(
+            "export HUANYU_TEST_SITE_VALUE=stem-source-worked\n"
+            "export NNODES=1 RM_ENABLE=1 ROLLOUT_TP=4\n"
+            "export STEM_REWARD_MODE=genrm STEM_CONTEXT_LENGTH=5k STEM_IGNORE_EOS=true\n"
+        )
+        result = self.run_prepare({"TOTAL_NPUS": "128"})
+        self.assert_success(result)
+        env = self.prepared()["env"]
+        for key, value in {
+            "HUANYU_TEST_SITE_VALUE": "stem-source-worked", "TOTAL_NPUS": "128",
+            "HUANYU_JOB_MODE": "stem", "STEM_SCALED_JOB": "1", "NNODES": "8",
+            "STEM_REWARD_MODE": "rule", "STEM_CONTEXT_LENGTH": "12k", "STEM_IGNORE_EOS": "false",
+            "ROLLOUT_TP": "8", "TRAIN_BATCH_SIZE": "128", "PPO_MINI_BATCH_SIZE": "128",
+            "ROLLOUT_N": "16", "HUANYU_FREEZE_AUDIO": "true", "RM_ENABLE": "0",
+            "HUANYU_STEM_TEXT_TRAIN": "1", "HUANYU_SKIP_EDITABLE_INSTALL": "1",
+        }.items():
+            self.assertEqual(env[key], value, key)
+        self.assertEqual([e["args"][0] for e in self.fixture.events("helper")], ["sync", "check-devices"])
+        self.assertEqual(env["HUANYU_TEST_OPTIONS_BEFORE"], env["HUANYU_TEST_OPTIONS_AFTER"])
+
+    def test_stem_bash_activation_replays_256_card_and_eos_settings(self):
+        self.use_stem_entry()
+        exclusions = self.fixture.env.get("MSYS2_ENV_CONV_EXCL", "") + ";PATH"
+        result = self.run_prepare({"TOTAL_NPUS": "256", "STEM_IGNORE_EOS": "true",
+                                   "MSYS2_ENV_CONV_EXCL": exclusions}, sourced=False)
+        self.assert_success(result)
+        self.assertIn("source ", result.stdout)
+        replay = dict(self.fixture.env, MSYS2_ENV_CONV_EXCL="*",
+                      TEST_ACTIVATION=job_fixture.shell_path(self.activation_files()[0]))
+        for key in ("TOTAL_NPUS", "STEM_IGNORE_EOS", "STEM_SCALED_JOB", "NNODES"):
+            replay.pop(key, None)
+        result = subprocess.run(
+            [job_fixture.find_bash(), "--noprofile", "--norc", "-c",
+             'source "$TEST_ACTIVATION" && "$HUANYU_TEST_PYTHON" "$HUANYU_TEST_PREPARE_CAPTURE_SCRIPT"'],
+            env=replay, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30,
+        )
+        self.assert_success(result)
+        env = self.prepared()["env"]
+        for key, value in {"TOTAL_NPUS": "256", "NNODES": "16", "STEM_SCALED_JOB": "1",
+                           "STEM_IGNORE_EOS": "true", "STEM_REWARD_MODE": "rule"}.items():
+            self.assertEqual(env[key], value, key)
+
+    def test_stem_failed_preparation_does_not_activate_partial_profile(self):
+        self.use_stem_entry()
+        result = self.run_prepare({"HUANYU_TEST_RUNTIME_EXIT": "19"})
+        self.assertEqual(result.returncode, 19, result.stdout + result.stderr)
+        self.assert_no_ray_or_training()
+        self.assertFalse(self.activation_files())
+        self.assertNotIn("STEM_SCALED_JOB", self.prepared()["env"])
+
     def test_source_prepares_and_exports_without_node_metadata_or_ray_cli(self):
         self.fixture.bin.joinpath("ray").unlink()
         self.append_site_env("set -ex\nexport HUANYU_TEST_SITE_VALUE='source worked'\n")

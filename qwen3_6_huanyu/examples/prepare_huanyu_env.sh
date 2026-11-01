@@ -3,14 +3,20 @@
 # in an isolated shell so env_export's set -ex cannot alter the caller's shell.
 # source applies the resulting environment; bash prints an activation command.
 huanyu_prepare_environment() {
+    local mode="${HUANYU_JOB_MODE:-frozen_cache}" setup_entry=run_huanyu_32card_job.sh
+    if [[ "${1:-}" == --stem ]]; then mode=stem; shift; fi
     local project="${PROJECT_ROOT:-/opt/huawei/dataset/infra_data/verl_omni_qwen36_gzq_new}"
+    if [[ "$mode" == stem ]]; then
+        setup_entry=run_huanyu_stem_job.sh
+        project="${PROJECT_ROOT:-/opt/huawei/dataset/infra_data/code/verl_omni_qwen36_gzq_new}"
+    fi
     local examples log_root run_dir snapshot activation status
     [[ "$project" == /* && -d "$project" ]] || {
         echo '[huanyu-env] FATAL: PROJECT_ROOT must be an existing absolute directory' >&2
         return 2
     }
     examples="$project/examples/qwen3_6_huanyu"
-    for activation in run_huanyu_32card_job.sh prepared_env.py; do
+    for activation in run_huanyu_32card_job.sh "$setup_entry" prepared_env.py; do
         [[ -r "$examples/$activation" ]] || {
             echo "[huanyu-env] FATAL: missing $examples/$activation" >&2
             return 2
@@ -27,13 +33,13 @@ huanyu_prepare_environment() {
     activation="$run_dir/activate.sh"
     # Standard library only; no Torch/plugin imports before allocator setup.
     python3 -S "$examples/prepared_env.py" snapshot "$snapshot" || return $?
-    echo "[huanyu-env] preparing mode=${HUANYU_JOB_MODE:-frozen_cache} log=$run_dir/prepare.log"
+    echo "[huanyu-env] preparing mode=$mode log=$run_dir/prepare.log"
     # A fresh bash retains strict error handling even when this sourced function
     # is called in an if/|| expression. No Ray/engine processes are launched.
-    if PROJECT_ROOT="$project" HUANYU_PREPARE_ONLY=1 \
+    if PROJECT_ROOT="$project" HUANYU_JOB_MODE="$mode" HUANYU_PREPARE_ONLY=1 \
         HUANYU_PREPARE_SNAPSHOT="$snapshot" HUANYU_PREPARE_LOG_DIR="$run_dir" \
         HUANYU_PREPARED_ENV_FILE="$activation" \
-        bash "$examples/run_huanyu_32card_job.sh" "$@" \
+        bash "$examples/$setup_entry" "$@" \
         > >(tee -a "$run_dir/prepare.log") 2>&1; then
         [[ -s "$activation" ]] || {
             echo '[huanyu-env] FATAL: setup returned without an activation file' >&2

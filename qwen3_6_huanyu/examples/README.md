@@ -1048,6 +1048,65 @@ python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/aqa_text_ab.py" compare --case-di
 
 在所有节点部署相同代码、模型与数据路径，`PROJECT_ROOT/runs` 必须是共享目录，其他节点需要读取主节点准备的 Parquet。作业平台通常注入 `VC_TASK_INDEX`、`VC_WORKER_HOSTS`、`VC_WORKER_NUM`；没有注入时，分别设置0..7或0..15的 rank，所有节点设置同一份完整逗号分隔主机列表，首个为 head。不要把所有节点 rank 都设成0。
 
+该入口是节点级启动器，优先配置平台为**每节点执行一次 Bash**；Ray/verl 后续自行启动16卡训练进程。如果平台通过 `torchrun` / `torch.distributed.launch` 在每节点重复启动16份脚本，共享 job 会识别 `LOCAL_RANK`，以及 `--local-rank` / `--local_rank` 的等号或分开传值形式：每节点仅本地 rank 0 准备环境、获取锁和启动 Ray，其他本地 rank 在这些操作前正常退出（exit 0）。节点编号仍由 `VC_TASK_INDEX` 决定，不能用全局 `RANK=0` 代替。外层分布式 rank 环境不会传给环境准备进程和 Ray driver；设备可见性不做修改，仍检查每节点可见16张卡。
+
+同次作业内的重复进程会打印 `[huanyu-job] local_rank=... skipping duplicate node launcher`；选中的进程打印 `local_rank=0 ... selected node launcher`。独立作业之间仍保留 `flock` 互斥：如果本地 rank 0 仍报 `another Huanyu job launcher`，检查确实占用锁的旧作业后再通过平台停止该作业。不要在每个本地 rank 里执行 `pkill -f`，也不要删除锁文件绕过互斥；这会杀掉同一次作业的进程或导致两个启动器同时替换代码、启动 Ray。`SIGTERM` / `ChildFailedError` 可能只是外层 launcher 在某个本地 rank 失败后清理其余进程的结果。
+
+重复启动修复通过53项CPU测试（共享启动器28、STEM多节点11、环境准备14），覆盖16份本地入口仅一次安装/Ray启动/训练提交、末节点本地rank0继续加入Ray、旧版local-rank参数形式、参数冲突及独立作业锁冲突。外部安装、Ray和设备操作使用命令桩；尚未进行128/256卡集群实测。
+
+也可以拆为“各节点准备环境 → 手动启动 Ray → 主节点提交训练”。这是排查 Ray 启动/注册阻塞时的独立入口；不会把已有的 raylet 注册问题自动修好。以下步骤在普通 Bash 终端执行，不要用每卡一个进程的 torchrun 包装。
+
+每个节点先准备环境，所有节点使用相同的模型、数据和 TOTAL_NPUS：
+
+```bash
+export PROJECT_ROOT=/opt/huawei/dataset/infra_data/code/verl_omni_qwen36_gzq_new
+export MODEL_PATH=/opt/huawei/dataset/model_gy/downloaded_models/2748
+export HUANYU_VLLM_SOURCE=/opt/huawei/dataset/infra_data/code/vllm-omni-xy-qwen-vit
+export HUANYU_ENV_FILE="$PROJECT_ROOT/examples/qwen3_6_huanyu/env_export_huanyu.sh"
+export STEM_DATA_DIR=/opt/huawei/dataset/infra_data/data/rl_stem_data
+export TOTAL_NPUS=128   # 256卡时，每节点都改成256
+export STEM_IGNORE_EOS=false
+source "$PROJECT_ROOT/examples/qwen3_6_huanyu/prepare_huanyu_stem_env.sh"
+```
+
+确认出现 `[huanyu-env] environment activated` 后再继续。此入口按内容摘要备份/替换 `/vllm-workspace/vllm-omni`，必要时 editable 安装当前项目，在隔离子 shell 中 source `HUANYU_ENV_FILE`，执行原生导入和16卡可见性检查，然后将成功准备的环境应用到当前 shell。它不解析主机、不调用 `ray start/status/init`、不等待集群、不训练；准备本身不需要 `VC_TASK_INDEX`。已有 Ray 时保留原有保护：源码不同会拒绝替换，源码相同跳过安装；由用户决定旧作业的停止时间。使用自定义 `export_export.sh` 时，把 `HUANYU_ENV_FILE` 指向它即可。
+
+若用 `bash prepare_huanyu_stem_env.sh`，子进程无法修改父 shell，必须执行其打印的 `source .../activate.sh`。新终端也需 source **该节点**本次生成的激活文件；日志与激活文件位于 `$PROJECT_ROOT/runs/environment/prepare_<时间戳>_<随机后缀>/`。
+
+随后在已激活环境的各节点手动确定地址（`VC_TASK_INDEX`、`VC_WORKER_HOSTS` 由平台提供；128卡应有8个主机，256卡应有16个）：
+
+```bash
+HUANYU_IPS="$(python3 -B "$PROJECT_ROOT/examples/qwen3_6_huanyu/job_bootstrap.py" \
+  resolve "${VC_WORKER_HOSTS:?请设置所有节点的主机列表}" --expected-nodes "$NNODES")"
+IFS=, read -r -a HUANYU_NODE_IPS <<< "$HUANYU_IPS"
+export HEAD_IP="${HUANYU_NODE_IPS[0]}"
+export NODE_IP="${HUANYU_NODE_IPS[${VC_TASK_INDEX:?请设置本节点编号}]}"
+export RAY_ADDRESS="$HEAD_IP:6925"
+```
+
+先在 `VC_TASK_INDEX=0` 的主节点执行：
+
+```bash
+ray start --head --node-ip-address="$NODE_IP" --port=6925 \
+  --dashboard-host=0.0.0.0 --dashboard-port=8960 --resources='{"NPU":16}'
+```
+
+再在每个 `VC_TASK_INDEX>0` 的从节点执行，保持该终端/节点存活：
+
+```bash
+ray start --address="$RAY_ADDRESS" --node-ip-address="$NODE_IP" \
+  --resources='{"NPU":16}' --block
+```
+
+主节点确认 `ray status --address="$RAY_ADDRESS"` 显示预期的8/16个节点、总计128/256张NPU后，只在主节点执行：
+
+```bash
+TOTAL_TRAINING_STEPS=2 \
+bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/run_huanyu_stem_job.sh" --train-only
+```
+
+`--train-only` 保留上表的 BS128/mini128/N16、12K、TP8、数学规则奖励、冻结 encoder/projector、offload 和精度配置；`STEM_IGNORE_EOS=true`、`ROLLOUT_TP=16` 等仍可通过环境变量修改。它要求 `VC_TASK_INDEX=0`，跳过共享 job 的目录替换、安装、source站点环境、Ray启动和 `wait-cluster`，直接调用现有 STEM 训练入口；后者保留只读的 `ray status` 检查，训练本身仍需正常连接 Ray。去掉 `TOTAL_TRAINING_STEPS=2` 可按原训练周期继续。不要用不带 `--train-only` 的 job 命令替代这一步，否则会进入一键集群启动流程。
+
 ```bash
 export PROJECT_ROOT=/opt/huawei/dataset/infra_data/code/verl_omni_qwen36_gzq_new
 export MODEL_PATH=/opt/huawei/dataset/model_gy/downloaded_models/2748
@@ -1062,7 +1121,16 @@ TOTAL_NPUS=256 TOTAL_TRAINING_STEPS=2 \
 bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/run_huanyu_stem_job.sh"
 ```
 
-去掉 `TOTAL_TRAINING_STEPS=2` 可按训练 epoch 继续；总步数、`TEST_FREQ`、`VAL_BEFORE_TRAIN`、`STEM_TRAIN_FILE`、`STEM_VAL_FILE`、`ROLLOUT_TP`、`ROLLOUT_MAX_NUM_SEQS`、`ROLLOUT_GPU_MEM_UTIL` 均可在命令前设置，所有节点保持一致。默认训练前不验证，`TEST_FREQ=10`。需要固定10K输出的压力测试可设置 `STEM_IGNORE_EOS=true`，并追加 `++actor_rollout_ref.rollout.engine_kwargs.q36_sampling.min_tokens=10240`；这会改变生成行为，仅用于压力测试。需要实际接近2K的prompt，不能以STEM短题干跑通代替满12K测试。
+去掉 `TOTAL_TRAINING_STEPS=2` 可按训练 epoch 继续；总步数、`TEST_FREQ`、`VAL_BEFORE_TRAIN`、`STEM_TRAIN_FILE`、`STEM_VAL_FILE`、`ROLLOUT_TP`、`ROLLOUT_MAX_NUM_SEQS`、`ROLLOUT_GPU_MEM_UTIL` 均可在命令前设置，所有节点保持一致。默认训练前不验证，`TEST_FREQ=10`。
+
+`run_huanyu_stem_job.sh` 显式提供 `STEM_IGNORE_EOS` 启动配置，只接受 `true` / `false`，默认 `false`（遇到EOS可结束）。设为 `true` 即忽略EOS，实际传给训练框架的键是 `actor_rollout_ref.rollout.ignore_eos=true`，不是 `ignore_eos_token`。该值在加载站点环境前确定并保留，启动日志会打印 `ignore_eos=true/false`；所有节点使用同一值：
+
+```bash
+TOTAL_NPUS=128 STEM_IGNORE_EOS=true TOTAL_TRAINING_STEPS=2 \
+bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/run_huanyu_stem_job.sh"
+```
+
+忽略EOS不等于关闭全部停止条件，也不自动设置 `min_tokens`。需要固定10K输出的压力测试可再追加 `++actor_rollout_ref.rollout.engine_kwargs.q36_sampling.min_tokens=10240`；这会改变生成行为，仅用于压力测试。需要实际接近2K的prompt，不能以STEM短题干跑通代替满12K测试。
 
 集群日志位于 `runs/$EXPERIMENT_NAME/cluster/rank_<rank>.log`；主训练日志和 `rollout_dump` / `validation_dump` 位于启动打印的 `runs/huanyu_<时间戳>_<随机后缀>/`。空的 `genrm_dump` 目录来自共用输出脚本，不表示启动了 GenRM。搜索 `[huanyu-stem-job]`、`[huanyu-stem]`、`[huanyu-memory]` 检查最终卡池、batch、判分函数及逐批同步执行状态。新入口清除旧的 disk/full-weight/text-AB 诊断开关，避免诊断环境误入训练。
 

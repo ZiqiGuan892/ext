@@ -5,13 +5,24 @@
 # Reuses the common job's vLLM-Omni backup/replacement, editable install, site
 # environment, native checks, Ray head/worker startup and readiness checks.
 # Required: VC_TASK_INDEX=0..nodes-1, VC_WORKER_HOSTS=comma-separated host list.
+# If the platform launches one Bash per NPU, the common job elects LOCAL_RANK=0
+# on EACH node; other local ranks exit before setup/Ray and keep all NPUs free.
 # Identical PROJECT_ROOT/checkpoint/data paths must be mounted on every node;
 # PROJECT_ROOT/runs must be shared (prepared Parquet lives under the run dir).
 # Optional: ROLLOUT_TP=16; default TP8. TP is for inference, training uses FSDP.
-# 10K is an output LIMIT, not a forced length. For a full-length stress test:
+# STEM_IGNORE_EOS=false (default) allows EOS; true ignores EOS during rollout.
+# 10K is an output LIMIT; ignoring EOS does not disable other stop conditions.
+# Example for a length stress test:
 # TOTAL_TRAINING_STEPS=2 STEM_IGNORE_EOS=true bash .../run_huanyu_stem_job.sh
+# --train-only: on VC_TASK_INDEX=0 after prepare_huanyu_stem_env.sh and manual
+# Ray startup. Keeps this profile but skips ALL common job setup/Ray startup.
 set -euo pipefail
 
+_STEM_TRAIN_ONLY=0
+if [[ "${1:-}" == --train-only ]]; then _STEM_TRAIN_ONLY=1; shift; fi
+if (( _STEM_TRAIN_ONLY )) && [[ "${HUANYU_PREPARE_ONLY:-0}" == 1 ]]; then
+    echo 'FATAL: --train-only cannot be used during environment preparation' >&2; exit 2
+fi
 export PROJECT_ROOT="${PROJECT_ROOT:-/opt/huawei/dataset/infra_data/code/verl_omni_qwen36_gzq_new}"
 [[ "$PROJECT_ROOT" == /* ]] || { echo 'FATAL: PROJECT_ROOT must be absolute' >&2; exit 2; }
 _STEM_JOB_EXAMPLES="$PROJECT_ROOT/examples/qwen3_6_huanyu"
@@ -23,11 +34,18 @@ if [[ -z "${TOTAL_NPUS:-}" ]]; then
 fi
 case "$TOTAL_NPUS" in 128|256) ;; *) echo 'FATAL: TOTAL_NPUS must be 128 or 256' >&2; exit 2 ;; esac
 export TOTAL_NPUS HUANYU_CLUSTER_NODES=$((TOTAL_NPUS / 16))
-[[ "${VC_TASK_INDEX:-}" =~ ^(0|[1-9][0-9]?)$ ]] && (( VC_TASK_INDEX < HUANYU_CLUSTER_NODES )) || {
-    echo "FATAL: VC_TASK_INDEX must be 0..$((HUANYU_CLUSTER_NODES - 1))" >&2; exit 2;
-}
-if [[ -n "${VC_WORKER_NUM:-}" && "$VC_WORKER_NUM" != "$HUANYU_CLUSTER_NODES" ]]; then
-    echo 'FATAL: VC_WORKER_NUM disagrees with TOTAL_NPUS/16' >&2; exit 2
+if [[ "${HUANYU_PREPARE_ONLY:-0}" != 1 ]]; then
+    [[ "${VC_TASK_INDEX:-}" =~ ^(0|[1-9][0-9]?)$ ]] && (( VC_TASK_INDEX < HUANYU_CLUSTER_NODES )) || {
+        echo "FATAL: VC_TASK_INDEX must be 0..$((HUANYU_CLUSTER_NODES - 1))" >&2; exit 2;
+    }
+    if [[ -n "${VC_WORKER_NUM:-}" && "$VC_WORKER_NUM" != "$HUANYU_CLUSTER_NODES" ]]; then
+        echo 'FATAL: VC_WORKER_NUM disagrees with TOTAL_NPUS/16' >&2; exit 2
+    fi
+fi
+if (( _STEM_TRAIN_ONLY )); then
+    [[ "$VC_TASK_INDEX" == 0 && "${LOCAL_RANK:-0}" == 0 ]] || {
+        echo 'FATAL: --train-only must run once on VC_TASK_INDEX=0, without per-device launchers' >&2; exit 2;
+    }
 fi
 export HUANYU_JOB_MODE=stem STEM_SCALED_JOB=1 STEM_REWARD_MODE=rule
 export NUM_NPUS=16 NNODES="$HUANYU_CLUSTER_NODES" NPUS_PER_NODE=16
@@ -50,6 +68,13 @@ if [[ -z "${STEM_VAL_FILE:-}" && ! -f "$VAL_FILE" && -f "$STEM_DATA_DIR/validati
     export VAL_FILE="$STEM_DATA_DIR/validation.parquet"
 fi
 export STEM_CONTEXT_LENGTH="${STEM_CONTEXT_LENGTH:-12k}" STEM_PROMPT_LENGTH="${STEM_PROMPT_LENGTH:-2048}"
+# Maps to actor_rollout_ref.rollout.ignore_eos in run_huanyu_stem.sh.
+# Set the default before job setup so site env files cannot change it.
+export STEM_IGNORE_EOS="${STEM_IGNORE_EOS:-false}"
+case "$STEM_IGNORE_EOS" in
+    true|false) ;;
+    *) echo 'FATAL: STEM_IGNORE_EOS must be true or false' >&2; exit 2 ;;
+esac
 export STEM_CONTEXT_SLACK=0 STEM_DYNAMIC_BSZ=false STEM_SYNC_EACH_MICROBATCH=true
 export PPO_MICRO_BATCH_SIZE_PER_GPU=1 ACTOR_MODEL_DTYPE=fp32 REF_MODEL_DTYPE=bfloat16
 export ACTOR_FORWARD_PREFETCH=false ACTIVATION_OFFLOAD=false
@@ -75,9 +100,20 @@ done
 echo "[huanyu-stem-job] physical=${NNODES}x16=$TOTAL_NPUS actor=$TOTAL_NPUS GenRM=0 reward=math_dapo"
 echo "[huanyu-stem-job] training FSDP=$TOTAL_NPUS SP=1 TP=1; rollout TP=$ROLLOUT_TP replicas=$((TOTAL_NPUS / ROLLOUT_TP)) max_num_seqs=$ROLLOUT_MAX_NUM_SEQS"
 echo "[huanyu-stem-job] BS=$TRAIN_BATCH_SIZE mini=$PPO_MINI_BATCH_SIZE N=$ROLLOUT_N trajectories=$((TRAIN_BATCH_SIZE * ROLLOUT_N)) microbatch=1 sync_each=true"
-echo "[huanyu-stem-job] context=$STEM_CONTEXT_LENGTH prompt=$STEM_PROMPT_LENGTH EOS_allowed=$([[ "${STEM_IGNORE_EOS:-false}" == true ]] && echo false || echo true)"
+echo "[huanyu-stem-job] context=$STEM_CONTEXT_LENGTH prompt=$STEM_PROMPT_LENGTH ignore_eos=$STEM_IGNORE_EOS EOS_allowed=$([[ "$STEM_IGNORE_EOS" == true ]] && echo false || echo true)"
 
-exec bash "$_STEM_JOB_EXAMPLES/run_huanyu_32card_job.sh" \
+_STEM_ENTRY=run_huanyu_32card_job.sh
+if (( _STEM_TRAIN_ONLY )); then
+    _STEM_ENTRY=run_huanyu_stem.sh
+    cd "$PROJECT_ROOT"
+    export HUANYU_SKIP_EDITABLE_INSTALL=1
+    # The common job normally supplies this; keep it for manually started Ray
+    # too, since Ray may strip the preload from newly created worker processes.
+    _value="$(python3 -c 'import json, os; print(json.dumps(os.environ.get("LD_PRELOAD", "")))')"
+    _STEM_JOB_ARGS+=("++ray_kwargs.ray_init.runtime_env.env_vars.LD_PRELOAD=$_value")
+    echo "[huanyu-stem-job] train-only head=$VC_TASK_INDEX Ray=${RAY_ADDRESS:-auto}; setup and Ray startup skipped"
+fi
+exec bash "$_STEM_JOB_EXAMPLES/$_STEM_ENTRY" \
     actor_rollout_ref.actor.fsdp_config.param_offload=true \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=true \
     actor_rollout_ref.actor.fsdp_config.offload_policy=true \

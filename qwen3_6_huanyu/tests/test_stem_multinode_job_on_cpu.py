@@ -1,6 +1,7 @@
 """Run scaled STEM job composition with command stubs and real Parquet input."""
 
 import importlib.util
+from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
 import shutil
@@ -84,7 +85,7 @@ class StemMultinodeJobTests(unittest.TestCase):
         capture = self.case.launch(updates, arguments)
         return capture, _aqa.effective_arguments(capture)
 
-    def assert_scaled(self, capture, actual, total, tp=8):
+    def assert_scaled(self, capture, actual, total, tp=8, ignore_eos="false"):
         expected = {
             "trainer.n_gpus_per_node": "16", "trainer.nnodes": str(total // 16),
             "data.train_batch_size": "128", "actor_rollout_ref.actor.ppo_mini_batch_size": "128",
@@ -128,7 +129,7 @@ class StemMultinodeJobTests(unittest.TestCase):
         self.assertEqual(capture["env"]["HUANYU_STEM_TEXT_TRAIN"], "1")
         self.assertEqual(json.loads(actual[_aqa.ENV_PREFIX + "HUANYU_STEM_TEXT_TRAIN"]), "1")
         self.assertEqual(json.loads(actual[_aqa.ENV_PREFIX + "MINICPMO_HUANYU_ROLLOUT_TP"]), str(tp))
-        self.assertEqual(actual["actor_rollout_ref.rollout.ignore_eos"].lower(), "false")
+        self.assertEqual(actual["actor_rollout_ref.rollout.ignore_eos"].lower(), ignore_eos)
         self.assertEqual(capture["env"]["HUANYU_USE_PRECOMPUTE"], "0")
 
     def test_128_cards_rule_reward_and_final_batch_lengths(self):
@@ -142,6 +143,29 @@ class StemMultinodeJobTests(unittest.TestCase):
         ips = wait["args"][wait["args"].index("--expected-ips") + 1]
         self.assertEqual(len(ips.split(",")), 8)
 
+    def test_platform_sixteen_local_processes_only_start_one_node_job(self):
+        def launch_rank(rank):
+            return self.fixture.run_launcher({
+                "LOCAL_RANK": str(rank), "RANK": str(rank),
+                "LOCAL_WORLD_SIZE": "16", "WORLD_SIZE": "128",
+                # A non-owner must skip even if the node lock is already held.
+                "HUANYU_TEST_LOCK_BUSY": "1" if rank else "0",
+            }, arguments=("--local-rank", str(rank)))
+
+        # Nonzero ranks arrive first: none may steal ownership from local rank 0.
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            results = list(pool.map(launch_rank, range(15, -1, -1)))
+        for result in results:
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(sum("skipping duplicate node launcher" in r.stdout for r in results), 15)
+        self.assertEqual(len(self.fixture.events("flock")), 1)
+        self.assertEqual(len(self.fixture.events("pip")), 1)
+        starts = [event for event in self.fixture.events("ray") if "start" in event["args"]]
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(len(self.fixture.events("train")), 1)
+        capture = json.loads(self.fixture.capture_file.read_text())
+        self.assert_scaled(capture, _aqa.effective_arguments(capture), 128)
+
     def test_256_cards_doubles_actor_nodes_without_increasing_per_gpu_batch(self):
         self.configure_cluster(256)
         capture, actual = self.launch()
@@ -151,6 +175,52 @@ class StemMultinodeJobTests(unittest.TestCase):
         capture, actual = self.launch({"ROLLOUT_TP": "16"})
         self.assert_scaled(capture, actual, 128, tp=16)
 
+    def test_manual_training_preserves_profile_without_setup_or_ray_start(self):
+        # Emulate a shell that has already sourced activate.sh. Export the
+        # single fixture preload in Bash, bypassing the shared fixture's
+        # workaround for initially malformed/mixed Windows LD_PRELOAD lists.
+        self.fixture.entry = self.fixture.examples / "activated_train.sh"
+        self.fixture.entry.write_text(
+            '#!/usr/bin/env bash\nexport LD_PRELOAD="$HUANYU_TEST_MANUAL_PRELOAD"\n'
+            'exec bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/run_huanyu_stem_job.sh" "$@"\n',
+            encoding="utf-8", newline="\n",
+        )
+        for total in (128, 256):
+            with self.subTest(total=total):
+                self.configure_cluster(total)
+                capture, actual = self.launch({
+                    "RAY_ADDRESS": "192.0.2.10:6925", "STEM_IGNORE_EOS": "true",
+                    "HUANYU_TEST_MANUAL_PRELOAD": _job.shell_path(self.fixture.jemalloc),
+                }, arguments=("--train-only", "trainer.total_training_steps=2"))
+                self.assert_scaled(capture, actual, total, ignore_eos="true")
+                for kind in ("helper", "pip", "git", "flock", "env-source"):
+                    self.assertFalse(self.fixture.events(kind), kind)
+                rays = self.fixture.events("ray")
+                self.assertEqual(len(rays), 1)
+                self.assertEqual(rays[0]["args"], ["status", "--address=192.0.2.10:6925"])
+                self.assertEqual(len(self.fixture.events("train")), 1)
+                self.assertEqual(json.loads(actual[_aqa.ENV_PREFIX + "LD_PRELOAD"]),
+                                 _job.shell_path(self.fixture.jemalloc))
+                self.fixture.events_file.write_text("", encoding="utf-8")
+
+    def test_manual_training_rejects_worker_node_before_any_commands(self):
+        result = self.fixture.run_launcher({"VC_TASK_INDEX": "1"}, arguments=("--train-only",))
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("must run once on VC_TASK_INDEX=0", result.stderr)
+        self.assertFalse(self.fixture.events_file.exists())
+
+    def test_ignore_eos_config_reaches_rollout_despite_site_and_hydra_overrides(self):
+        for enabled in ("true", "false"):
+            with self.subTest(ignore_eos=enabled):
+                opposite = "false" if enabled == "true" else "true"
+                with (self.fixture.examples / "env_export_huanyu.sh").open("a", encoding="utf-8") as stream:
+                    stream.write("export STEM_IGNORE_EOS=" + opposite + "\n")
+                capture, actual = self.launch(
+                    {"STEM_IGNORE_EOS": enabled},
+                    ("actor_rollout_ref.rollout.ignore_eos=" + opposite,),
+                )
+                self.assert_scaled(capture, actual, 128, ignore_eos=enabled)
+
     def test_site_environment_cannot_restore_aqa_pools_batches_or_genrm(self):
         with (self.fixture.examples / "env_export_huanyu.sh").open("a", encoding="utf-8") as stream:
             stream.write(
@@ -158,6 +228,7 @@ class StemMultinodeJobTests(unittest.TestCase):
                 "export ROLLOUT_TP=4 TRAIN_BATCH_SIZE=4 PPO_MINI_BATCH_SIZE=4 ROLLOUT_N=4\n"
                 "export STEM_CONTEXT_LENGTH=5k STEM_CONTEXT_SLACK=128 STEM_REWARD_MODE=genrm\n"
                 "export STEM_DYNAMIC_BSZ=true STEM_SYNC_EACH_MICROBATCH=false ROLLOUT_MAX_NUM_SEQS=32\n"
+                "export STEM_IGNORE_EOS=true\n"
                 "export HUANYU_USE_PRECOMPUTE=1 HUANYU_STEM_TEXT_TRAIN=0\n"
             )
         capture, actual = self.launch()
@@ -168,7 +239,10 @@ class StemMultinodeJobTests(unittest.TestCase):
             with self.subTest(total=total):
                 self.configure_cluster(total)
                 rank = total // 16 - 1
-                result = self.fixture.run_launcher({"VC_TASK_INDEX": str(rank)})
+                result = self.fixture.run_launcher({
+                    "VC_TASK_INDEX": str(rank), "LOCAL_RANK": "0",
+                    "RANK": str(rank * 16), "WORLD_SIZE": str(total), "LOCAL_WORLD_SIZE": "16",
+                })
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertFalse(self.fixture.events("train"))
                 rays = self.fixture.events("ray")
@@ -191,6 +265,13 @@ class StemMultinodeJobTests(unittest.TestCase):
                     self.assertFalse(self.fixture.events(kind), kind)
                 if self.fixture.events_file.exists():
                     self.fixture.events_file.write_text("", encoding="utf-8")
+
+    def test_invalid_ignore_eos_stops_before_install_or_ray(self):
+        result = self.fixture.run_launcher({"STEM_IGNORE_EOS": "yes"})
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("STEM_IGNORE_EOS must be true or false", result.stderr)
+        for kind in ("pip", "ray", "train"):
+            self.assertFalse(self.fixture.events(kind), kind)
 
     def test_broken_rule_scorer_does_not_start_training(self):
         scorer = self.fixture.project / "verl/utils/reward_score/math_dapo.py"
