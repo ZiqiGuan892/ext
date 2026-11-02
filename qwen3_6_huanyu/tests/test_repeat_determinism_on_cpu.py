@@ -92,6 +92,24 @@ class RepeatDeterminismTests(unittest.TestCase):
                 _, error = self.exercise(env_override={name: "1" if name == "VLLM_BATCH_INVARIANT" else "0"})
                 self.assertIn(name + " must be", error)
 
+    def test_off_mode_verifies_all_disabled_flags(self):
+        off = {check._MODE: "off", "HCCL_DETERMINISTIC": "false",
+               "ASCEND_LAUNCH_BLOCKING": "0", "NCCL_DETERMINISTIC": "0", "LCCL_DETERMINISTIC": "0"}
+        output, error = self.exercise(env_override=off)
+        self.assertIsNone(error)
+        record = json.loads(output[output.index("{"):])
+        self.assertEqual(record["mode"], "off")
+        self.assertEqual(record["environment"]["LCCL_DETERMINISTIC"], "0")
+        self.assertFalse(record["torch_deterministic_algorithms"])
+        for key in ("HCCL_DETERMINISTIC", "ASCEND_LAUNCH_BLOCKING", "NCCL_DETERMINISTIC", "LCCL_DETERMINISTIC"):
+            with self.subTest(overridden=key):
+                output, error = self.exercise(env_override={**off, key: ENV[key]})
+                self.assertIn(key + " must be", error)
+                self.assertNotIn("SETTINGS_VERIFIED", output)
+        output, error = self.exercise(env_override=off, torch_enabled=True)
+        self.assertIn("torch deterministic algorithms must be disabled", error)
+        self.assertNotIn("SETTINGS_VERIFIED", output)
+
     def test_original_startup_error_is_not_hidden_or_claimed_verified(self):
         output, error = self.exercise(original_error=True)
         self.assertEqual(error, "native device failed")

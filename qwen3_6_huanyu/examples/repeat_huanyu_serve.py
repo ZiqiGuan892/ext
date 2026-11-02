@@ -27,6 +27,9 @@ def sibling(name):
 def prepare(args):
     if getattr(args, "batch_invariant", "false") != "false":
         raise ValueError("repeat requires --batch-invariant false because the native batch-invariant path is incompatible")
+    determinism = getattr(args, "determinism", "on")
+    if determinism not in ("on", "off"):
+        raise ValueError("determinism must be on or off")
     import pyarrow as pa
     import pyarrow.parquet as pq
 
@@ -65,7 +68,7 @@ def prepare(args):
     case["serve_repeat"] = dict(source_case=str(source), source_case_id=original["case_id"],
                                 source_case_sha256=ab.sha256(source / "case.json"),
                                 samples=args.samples, repetitions=args.repeats, order="round_robin",
-                                concurrency=1, baseline_repetition=1)
+                                concurrency=1, baseline_repetition=1, determinism=determinism)
     # Validate engine/sampling controls before creating any output directory.
     sibling("launch_huanyu_aqa_text_ab").build_launch(root, case, Path("/unused"), "serve")
     client = ab.sibling("request_aqa_validation_wav")
@@ -98,14 +101,16 @@ def prepare(args):
     case.update(subset_parquet=str(subset), subset_parquet_sha256=ab.sha256(subset),
                 manifest_sha256=ab.sha256(manifest))
     ab.write_json(root / "case.json", case)
-    print("[huanyu-repeat] case={} samples={} repeats={} requests={} BS=1 logits_check={}".format(
-        root, args.samples, args.repeats, len(rows), logits_check))
+    print("[huanyu-repeat] case={} samples={} repeats={} requests={} BS=1 logits_check={} determinism={}".format(
+        root, args.samples, args.repeats, len(rows), logits_check, determinism))
     return 0
 
 
 def load_case(directory):
     root, case, rows = sibling("aqa_text_ab").load_case(directory)
     spec = case.get("serve_repeat") or {}
+    if spec.get("determinism", "on") not in ("on", "off"):
+        raise ValueError("serve_repeat.determinism must be on or off")
     if spec.get("concurrency") != 1 or spec.get("order") != "round_robin" or spec.get("baseline_repetition") != 1:
         raise ValueError("not a serial serve repeat case")
     expected = [(sample, i) for i in range(1, spec["repetitions"] + 1) for sample in spec["samples"]]
@@ -122,6 +127,58 @@ def load_case(directory):
     if logits_check and case["logits_check"]["max_steps"] != case["sampling"]["max_tokens"]:
         raise ValueError("logits mode requires capture through the full generation")
     return root, case, rows
+
+
+def control(args):
+    """Clone an existing repeat without resampling or changing its requests."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    ab = sibling("aqa_text_ab")
+    source, original, rows = load_case(args.case_dir)
+    if args.determinism not in ("on", "off"):
+        raise ValueError("determinism must be on or off")
+    if original["engine"].get("batch_invariant") is not False:
+        raise ValueError("control requires a source repeat with batch_invariant=false")
+    if ab.sha256(original["subset_parquet"]) != original["subset_parquet_sha256"]:
+        raise ValueError("source subset Parquet changed")
+    table = pq.read_table(original["subset_parquet"])
+    records = table.to_pylist()
+    if len(records) != len(rows):
+        raise ValueError("source manifest and subset counts disagree")
+    checked_wavs = set()
+    for row, record in zip(rows, records):
+        saved = record["extra_info"]["huanyu_text_ab"]
+        if any(saved.get(k) != row[k] for k in ab.IDENTITY_KEYS + ("prompt_sha256",)):
+            raise ValueError("source manifest and subset disagree: " + row["sample_id"])
+        for path, digest in zip(row["wav_paths"], row["wav_sha256"]):
+            if (path, digest) not in checked_wavs:
+                if ab.sha256(path) != digest:
+                    raise ValueError("source WAV changed: " + path)
+                checked_wavs.add((path, digest))
+    root = Path(args.output_dir).expanduser().resolve()
+    case = copy.deepcopy(original)
+    case["case_id"] = uuid.uuid4().hex
+    case["serve_repeat"].update(determinism=args.determinism, control_of={
+        "directory": str(source), "case_id": original["case_id"],
+        "case_sha256": ab.sha256(source / "case.json"),
+        "determinism": original["serve_repeat"].get("determinism", "on"),
+    })
+    sibling("launch_huanyu_aqa_text_ab").build_launch(root, case, Path("/unused"), "serve")
+    for row, record in zip(rows, records):
+        row["case_id"] = case["case_id"]
+        record["extra_info"]["huanyu_text_ab"]["case_id"] = case["case_id"]
+    root.mkdir(parents=True, exist_ok=False)
+    subset = root / "validation.parquet"
+    pq.write_table(pa.Table.from_pylist(records, schema=table.schema), subset)
+    manifest = root / "manifest.jsonl"
+    manifest.write_text("".join(json.dumps(r, ensure_ascii=False, allow_nan=False) + "\n" for r in rows), encoding="utf-8")
+    case.update(subset_parquet=str(subset), subset_parquet_sha256=ab.sha256(subset),
+                manifest_sha256=ab.sha256(manifest))
+    ab.write_json(root / "case.json", case)
+    print("[huanyu-repeat] control={} source={} determinism={} requests={} BS=1".format(
+        root, source, args.determinism, len(rows)))
+    return 0
 
 
 def request(args):
@@ -214,9 +271,13 @@ def compare(args):
                         required = {"ASCEND_LAUNCH_BLOCKING": "1", "NCCL_DETERMINISTIC": "1",
                                     "LCCL_DETERMINISTIC": "1", "VLLM_BATCH_INVARIANT":
                                     "1" if case["engine"].get("batch_invariant") else "0"}
+                        off = case["serve_repeat"].get("determinism", "on") == "off"
+                        if off:
+                            required.update(ASCEND_LAUNCH_BLOCKING="0", NCCL_DETERMINISTIC="0", LCCL_DETERMINISTIC="0")
                         diff = {k: dict(expected=v, actual=actual.get(k)) for k, v in required.items() if actual.get(k) != v}
-                        if actual.get("HCCL_DETERMINISTIC") not in ("true", "strict"):
-                            diff["HCCL_DETERMINISTIC"] = dict(expected="true or strict", actual=actual.get("HCCL_DETERMINISTIC"))
+                        hccl_values = ("false",) if off else ("true", "strict")
+                        if actual.get("HCCL_DETERMINISTIC") not in hccl_values:
+                            diff["HCCL_DETERMINISTIC"] = dict(expected=" or ".join(hccl_values), actual=actual.get("HCCL_DETERMINISTIC"))
                         if diff:
                             control_differences.append(dict(tp_rank=rank, differences=diff))
                 if len(set(observed_workers)) != 1:
@@ -295,6 +356,8 @@ def compare(args):
     statuses = [s["status"] for s in summaries]
     status = "INCOMPLETE" if errors or "INCOMPLETE" in statuses else "DIFFERENT" if "DIFFERENT" in statuses else "PASS"
     ab.write_json(target, dict(case_id=case["case_id"], status=status, expected_requests=len(rows), samples=summaries,
+                               determinism=case["serve_repeat"].get("determinism", "on"),
+                               control_of=case["serve_repeat"].get("control_of"),
                                errors=errors, scope="Same live serve engine; each sample compared with its first request. "
                                "Text equality is not correctness. After token divergence, logits have different prefixes."))
     print("[huanyu-repeat] {} report={}".format(status, target))
@@ -372,6 +435,8 @@ def compare_text(root, case, rows):
     statuses = [s["status"] for s in samples]
     status = "INCOMPLETE" if errors or "INCOMPLETE" in statuses else "DIFFERENT" if "DIFFERENT" in statuses else "PASS"
     ab.write_json(target, dict(case_id=case["case_id"], status=status, scope="text_only",
+                               determinism=case["serve_repeat"].get("determinism", "on"),
+                               control_of=case["serve_repeat"].get("control_of"),
                                expected_requests=len(rows), samples=samples, errors=errors,
                                logits_status="NOT_COLLECTED", embeddings_status="NOT_COLLECTED",
                                worker_identity_status="NOT_OBSERVED", final_sampling_status="NOT_OBSERVED",
@@ -391,11 +456,18 @@ def main(argv=None):
     prep.add_argument("--repeats", type=int, default=20)
     prep.add_argument("--batch-invariant", choices=("true", "false"), default="false",
                       help="Repeat requires false independently of the source case; true is rejected")
+    prep.add_argument("--determinism", choices=("on", "off"), default="on",
+                      help="on preserves the previous repeat default; off disables communication determinism and launch blocking")
     prep.add_argument("--logits-check", choices=("true", "false"), default="false",
                       help="Default false: compare only text; true enables logits diagnostics and input embeddings")
     prep.add_argument("--logits-top-k", type=int, default=100,
                       help="Default 100: store top-K logits/IDs and full-vocab hash; 0 stores full NPZ vectors")
     prep.set_defaults(func=prepare)
+    ctrl = commands.add_parser("control", help="Clone a previous repeat with the selected determinism mode")
+    ctrl.add_argument("--case-dir", required=True, help="Previous repeat directory, not the original A/B directory")
+    ctrl.add_argument("--output-dir", required=True, help="New output directory; previous results are preserved")
+    ctrl.add_argument("--determinism", choices=("on", "off"), required=True)
+    ctrl.set_defaults(func=control)
     send = commands.add_parser("request")
     send.add_argument("--case-dir", required=True)
     send.add_argument("--url", default="http://localhost:28889/v1/chat/completions")

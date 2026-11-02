@@ -67,6 +67,9 @@ def build_launch(root, case, project, mode, port=28889, served_model="qwen3.8", 
     """Return an argv/environment/deploy plan; never execute or import vLLM here."""
     sampling, engine = case["sampling"], case["engine"]
     repeat = bool(case.get("serve_repeat"))
+    repeat_mode = (case.get("serve_repeat") or {}).get("determinism", "on")
+    if repeat and repeat_mode not in ("on", "off"):
+        raise ValueError("serve_repeat.determinism must be on or off")
     if repeat and mode != "serve":
         raise ValueError("serve-repeat cases test one serving engine; rollout launch is not supported")
     batch_invariant = engine.get("batch_invariant", False)
@@ -113,7 +116,7 @@ def build_launch(root, case, project, mode, port=28889, served_model="qwen3.8", 
         "HUANYU_FULL_WEIGHT_AUDIT_DIR", "HUANYU_FULL_WEIGHT_AUDIT_RUN_ID",
         "HUANYU_AUDIO_PROBE_DIR", "HUANYU_AUDIO_PROBE_ARM_FILE", "HUANYU_AUDIO_PROBE_FEATURE_ID",
         "HUANYU_EMBEDDING_AB_DIR", "HUANYU_EMBEDDING_AB_SIDE",
-        "HUANYU_SERVE_REPEAT_DETERMINISM",
+        "HUANYU_SERVE_REPEAT_DETERMINISM", "HUANYU_SERVE_REPEAT_DETERMINISM_MODE",
     )
     env.update({key: "" for key in disabled})
     embedding_check = case.get("embedding_check", {}).get("enabled", False)
@@ -140,7 +143,7 @@ def build_launch(root, case, project, mode, port=28889, served_model="qwen3.8", 
     env.update(embedding_env)
     # A/B determinism is independent of batch invariance. Inheriting the shell
     # here made standalone serve deterministic while Ray workers kept defaults.
-    blocking = "0" if not repeat and ab_mode == "off" else "1"
+    blocking = "0" if (repeat_mode if repeat else ab_mode) == "off" else "1"
     env.update({
         "PROJECT_ROOT": str(project), "MODEL_PATH": checkpoint,
         "HUANYU_PRECISION_PROFILE": "full", "HUANYU_GRAPH_MODE": "0",
@@ -160,6 +163,10 @@ def build_launch(root, case, project, mode, port=28889, served_model="qwen3.8", 
         "HCCL_DETERMINISTIC": "true" if batch_invariant else "strict", "ASCEND_LAUNCH_BLOCKING": "1",
         "NCCL_DETERMINISTIC": "1", "LCCL_DETERMINISTIC": "1",
     }
+    if repeat and repeat_mode == "off":
+        # Preserve the separate repeat control experiment.
+        deterministic_env.update(HCCL_DETERMINISTIC="false", ASCEND_LAUNCH_BLOCKING="0",
+                                 NCCL_DETERMINISTIC="0", LCCL_DETERMINISTIC="0")
     if not repeat and ab_mode == "off":
         deterministic_env.update(HCCL_DETERMINISTIC="false", ASCEND_LAUNCH_BLOCKING="0",
                                  NCCL_DETERMINISTIC="0", LCCL_DETERMINISTIC="0")
@@ -177,6 +184,7 @@ def build_launch(root, case, project, mode, port=28889, served_model="qwen3.8", 
         # kernels, even when a reused shell previously enabled them.
         env["VLLM_BATCH_INVARIANT"] = "0"
         env["HUANYU_SERVE_REPEAT_DETERMINISM"] = "1"
+        env["HUANYU_SERVE_REPEAT_DETERMINISM_MODE"] = repeat_mode
     env["HUANYU_TEXT_AB_BATCH_INVARIANT"] = "1" if batch_invariant else "0"
     # Optional arithmetic switches must not leak different shell defaults into
     # the two runs. full sets the remaining reference switches to one itself.
@@ -375,6 +383,8 @@ def main(argv=None):
                       "LCCL_DETERMINISTIC=" + plan["env"]["LCCL_DETERMINISTIC"] + " "
                       + ("ab_mode=" + plan["env"]["HUANYU_TEXT_AB_DETERMINISM_MODE"] + " "
                          if not case.get("serve_repeat") else "")
+                      + ("repeat_mode=" + plan["env"]["HUANYU_SERVE_REPEAT_DETERMINISM_MODE"] + " "
+                         if case.get("serve_repeat") else "")
                       + ("block_size=128 " if batch_invariant else "")
                       + "BS=1 graph=eager ab_worker_check=" + plan["env"]["HUANYU_TEXT_AB_DETERMINISM"]
                       + " repeat_worker_check="
@@ -409,7 +419,7 @@ def main(argv=None):
                 "HUANYU_TRAIN_AUDIO_ENCODER", "HUANYU_TRAIN_AUDIO_PROJECTOR",
                 "HUANYU_FULL_WEIGHT_AUDIT_DIR", "HUANYU_FULL_WEIGHT_AUDIT_RUN_ID",
                 "HUANYU_EMBEDDING_AB_DIR", "HUANYU_EMBEDDING_AB_SIDE",
-                "HUANYU_SERVE_REPEAT_DETERMINISM",
+                "HUANYU_SERVE_REPEAT_DETERMINISM", "HUANYU_SERVE_REPEAT_DETERMINISM_MODE",
                 "HUANYU_TEXT_AB_DETERMINISM", "HUANYU_TEXT_AB_SIDE",
                 "HUANYU_TEXT_AB_DETERMINISM_MODE",
             )

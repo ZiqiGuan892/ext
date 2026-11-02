@@ -1657,3 +1657,43 @@ TP=4时应看到4个不同rank的 `SETTINGS_VERIFIED`，实际环境中的 `VLLM
 默认模式的 `PASS` 要求40次HTTP响应完整、请求内容符合冻结的case，且各音频的回复文字和单独reasoning字段完全相同、终止状态一致。`DIFFERENT`为输出或终止状态不同；`INCOMPLETE`为缺记录、失败请求、内容被修改等，不能得出一致结论。文本相同不等于回答正确，也不证明logits相同。纯文本比较使用标准库，不读取旧logits/embedding产物；请创建新REPEAT_ROOT，不要直接复用之前启用张量采集的case。
 
 以后需要数值排查时，可在准备新case时显式使用 `--logits-check true --logits-top-k 100`，启用top-100 logits、完整词表哈希与embedding探针，生成 `logits/serve/`、`embeddings/serve/`、`repeat_comparisons/`。该模式还检查每个TP rank、prefill/decode、实际采样设置和worker身份，报告首个分歧位置。仅显式 `--logits-top-k 0` 的全词表logits落盘可能占用数十至数百GiB；默认纯文本模式没有这项开销。本地CPU测试覆盖40次串行请求及两种比较模式；实际NPU结果需运行后读取报告。
+
+### 13.3 repeat 关闭确定性设置
+
+新建repeat时，在原 `prepare` 命令中追加 `--determinism off`，其余参数保持 `--repeats 20 --batch-invariant false --logits-check false`。默认仍为 `on`，旧case缺少该字段也按on启动。`f472b46` 等旧版本没有这个参数，须更新启动器和worker扩展后重启serve；只在shell中export关闭值会被旧启动器覆盖。
+
+已有repeat时，可从**上次 repeat 目录**创建独立对照，使用 `control --determinism off`，无需重新从原始 A/B case 抽样。它保留两条音频各20次的顺序、system prompt、WAV、采样参数、模型、TP=4、BS=1和探针配置，更改以下开关（另生成新的case/request ID和输出目录）：
+
+| 参数 | 原repeat默认 | off对照 |
+| --- | --- | --- |
+| `HCCL_DETERMINISTIC` | `strict` | `false` |
+| `ASCEND_LAUNCH_BLOCKING` | `1` | `0` |
+| `NCCL_DETERMINISTIC` | `1` | `0` |
+| `LCCL_DETERMINISTIC` | `1` | `0` |
+
+`VLLM_BATCH_INVARIANT=0`、RL配置和其余引擎设置不变。off模式还检查实际 `torch_deterministic_algorithms=false`，若原生初始化开启该选项则报错，不会静默修改。模式写入case、启动记录、worker日志和repeat_summary。关闭这些设置不等于随机采样，temperature仍为0，输出仍可能完全相同。
+
+更新代码后，先在原终端停止占用28889端口的旧serve，再在相同节点和卡上运行。准备对照不会复制或覆盖旧响应，也不会复制WAV；若原始文件被修改则报错。原repeat为纯文本模式时，对照仍不采集logits。
+
+```bash
+# 终端A：REPEAT_ROOT是刚才实际运行过的repeat目录，不能填原AB_ROOT。
+export PROJECT_ROOT=/opt/huawei/dataset/infra_data/code/verl_omni_qwen36_gzq_new
+: "${REPEAT_ROOT:?请设置刚才的repeat目录}"
+export CONTROL_ROOT="${REPEAT_ROOT%/}_detoff"
+python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/repeat_huanyu_serve.py" control \
+  --case-dir "$REPEAT_ROOT" --output-dir "$CONTROL_ROOT" --determinism off
+python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/launch_huanyu_aqa_text_ab.py" serve \
+  --case-dir "$CONTROL_ROOT" --port 28889 --served-model qwen3.8
+
+# 终端B：设置与终端A相同的PROJECT_ROOT、CONTROL_ROOT，等serve就绪后执行。
+python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/repeat_huanyu_serve.py" request \
+  --case-dir "$CONTROL_ROOT" --url http://localhost:28889/v1/chat/completions \
+  --model qwen3.8 --timeout-s 3600
+python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/repeat_huanyu_serve.py" compare \
+  --case-dir "$CONTROL_ROOT"
+grep -n 'actual scope=worker_init status=SETTINGS_VERIFIED' "$CONTROL_ROOT/serve_console.log"
+```
+
+应看到4个TP worker记录 `mode=off`（JSON字段）以及上述关闭值。`SETTINGS_VERIFIED` 表示实际设置符合off模式，不表示开启了确定性。worker仍逐项验证实际环境，若原生初始化将它们重新打开则停止启动；只修改外层shell环境不够。对照目录已存在时拒绝覆盖，重新实验请换一个新目录。
+
+对比两个目录的 `repeat_summary.json`：每条音频应有 `requests=20`、`complete_http_responses=20`。`distinct_text_variants=1`且 `matching_baseline_text_requests=20` 表示该组20次文字一致；大于1表示出现不同文字。原组一致而off组不一致，支持这组设置影响可重复性；两组都一致只说明本次重复实验没有观察到不稳定，不能证明serve与verl的输出相同，也不能定位单个开关的影响。正文一致但 `status=DIFFERENT` 时还需查看每次的终止状态。

@@ -314,6 +314,41 @@ class TextABLauncherTests(unittest.TestCase):
                     self.assertEqual(json.loads(hydra_options(plan)[
                         "ray_kwargs.ray_init.runtime_env.env_vars.HUANYU_SERVE_REPEAT_DETERMINISM"]), "")
 
+    def test_repeat_off_disables_all_controls_and_preserves_requests(self):
+        self.case["serve_repeat"] = {"concurrency": 1}
+        self.case["engine"]["batch_invariant"] = False
+        # A stale enabled shell cannot reactivate the control run.
+        with patch.dict(os.environ, {"HCCL_DETERMINISTIC": "strict", "ASCEND_LAUNCH_BLOCKING": "1",
+                                     "NCCL_DETERMINISTIC": "1", "LCCL_DETERMINISTIC": "1",
+                                     "VLLM_BATCH_INVARIANT": "1"}):
+            on = self.plan("serve")
+            self.case["serve_repeat"]["determinism"] = "off"
+            off = self.plan("serve")
+        changed = {k for k in on["env"] if on["env"][k] != off["env"][k]}
+        self.assertEqual(changed, {"HCCL_DETERMINISTIC", "ASCEND_LAUNCH_BLOCKING", "NCCL_DETERMINISTIC",
+                                   "LCCL_DETERMINISTIC", "HUANYU_SERVE_REPEAT_DETERMINISM_MODE"})
+        self.assertEqual(off["env"]["HCCL_DETERMINISTIC"], "false")
+        self.assertEqual(off["env"]["ASCEND_LAUNCH_BLOCKING"], "0")
+        self.assertEqual(off["env"]["NCCL_DETERMINISTIC"], "0")
+        self.assertEqual(off["env"]["LCCL_DETERMINISTIC"], "0")
+        self.assertEqual(off["env"]["VLLM_BATCH_INVARIANT"], "0")
+        self.assertEqual(off["env"]["HUANYU_SERVE_REPEAT_DETERMINISM"], "1")
+        for key in ("argv", "command", "deploy"):
+            self.assertEqual(on[key], off[key])
+        self.write_case()
+        with patch.object(LAUNCHER.subprocess, "call", return_value=0) as call:
+            status, _, error = self.invoke("serve")
+        self.assertEqual(status, 0, error)
+        self.assertEqual(call.call_args.kwargs["env"]["ASCEND_LAUNCH_BLOCKING"], "0")
+        log = (self.root / "serve_console.log").read_text(encoding="utf-8")
+        self.assertIn("repeat_mode=off", log)
+        self.assertIn("HCCL_DETERMINISTIC=false ASCEND_LAUNCH_BLOCKING=0 NCCL_DETERMINISTIC=0", log)
+        snapshot = json.loads((self.root / "serve.launch.json").read_text(encoding="utf-8"))
+        self.assertEqual(snapshot["selected_environment"]["HUANYU_SERVE_REPEAT_DETERMINISM_MODE"], "off")
+        self.case["serve_repeat"]["determinism"] = "invalid"
+        with self.assertRaisesRegex(ValueError, "must be on or off"):
+            self.plan("serve")
+
     def test_text_only_repeat_records_request_in_log_before_child_starts(self):
         self.case["serve_repeat"] = {"concurrency": 1}
         self.case["engine"]["batch_invariant"] = False

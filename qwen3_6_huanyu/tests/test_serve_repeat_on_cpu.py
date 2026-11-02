@@ -73,10 +73,10 @@ class ServeRepeatTests(unittest.TestCase):
             self.assertEqual(repeat.request(self.fixture.server(root=self.root)), 0)
         return calls
 
-    def captures(self, difference=None):
+    def captures(self, difference=None, environment=None):
         helper = probe_fixture.LogitsProbeTests()
         helper.root, helper.case, helper.rows = self.root, self.case, self.rows
-        actual = dict(environment=ENV, batch_invariant_registered=False, torch_deterministic_algorithms=False)
+        actual = dict(environment=environment or ENV, batch_invariant_registered=False, torch_deterministic_algorithms=False)
         for rank in range(4):
             first = self.rows[0]["sample_id"]
             first_id = "huanyuab.{}.{}".format(self.case["case_id"], first)
@@ -170,6 +170,90 @@ class ServeRepeatTests(unittest.TestCase):
         self.assertFalse(case["forward_check"]["enabled"])
         self.assertFalse(case["engine"]["batch_invariant"])
         self.assertEqual((self.fixture.case / "case.json").read_bytes(), source_before)
+
+    def test_control_preserves_all_forty_inputs_and_source_outputs(self):
+        import pyarrow.parquet as pq
+
+        self.prepare(count=20, logits=False)
+        on_calls = self.send()
+        on_root, on_case, on_rows = self.root, self.case, self.rows
+        original_bytes = {p: p.read_bytes() for p in on_root.rglob("*") if p.is_file()}
+        control_root = self.fixture.root / "repeat-off"
+        with redirect_stdout(io.StringIO()):
+            code = repeat.main(["control", "--case-dir", str(on_root), "--output-dir", str(control_root),
+                                "--determinism", "off"])
+        self.assertEqual(code, 0)
+        self.root, self.case, self.rows = repeat.load_case(control_root)
+        self.assertEqual(len(self.rows), 40)
+        self.assertNotEqual(self.case["case_id"], on_case["case_id"])
+        for key in on_case.keys() - {"case_id", "serve_repeat", "subset_parquet", "subset_parquet_sha256", "manifest_sha256"}:
+            self.assertEqual(self.case[key], on_case[key], key)
+        for key, value in on_case["serve_repeat"].items():
+            if key != "determinism":
+                self.assertEqual(self.case["serve_repeat"][key], value)
+        self.assertEqual(self.case["serve_repeat"]["determinism"], "off")
+        self.assertEqual(self.case["serve_repeat"]["control_of"]["case_id"], on_case["case_id"])
+        for old, new in zip(on_rows, self.rows):
+            self.assertEqual({**old, "case_id": self.case["case_id"]}, new)
+        old_records = pq.read_table(on_case["subset_parquet"]).to_pylist()
+        new_records = pq.read_table(self.case["subset_parquet"]).to_pylist()
+        for old, new in zip(old_records, new_records):
+            old["extra_info"]["huanyu_text_ab"]["case_id"] = self.case["case_id"]
+            self.assertEqual(old, new)
+        off_calls = self.send()
+        for old, new in zip(on_calls, off_calls):
+            self.assertNotEqual(old.pop("request_id"), new.pop("request_id"))
+            self.assertEqual(old, new)
+        report = self.compare("PASS")
+        self.assertEqual(report["determinism"], "off")
+        self.assertEqual(report["logits_status"], "NOT_COLLECTED")
+        self.assertEqual([s["matching_baseline_text_requests"] for s in report["samples"]], [20, 20])
+        self.assertEqual(original_bytes, {p: p.read_bytes() for p in on_root.rglob("*") if p.is_file()})
+        with self.assertRaises(FileExistsError):
+            repeat.control(NS(case_dir=on_root, output_dir=control_root, determinism="off"))
+
+    def test_prepare_off_cli_keeps_forty_serial_text_only_requests(self):
+        before = (self.fixture.case / "case.json").read_bytes()
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(repeat.main([
+                "prepare", "--source-case", str(self.fixture.case), "--output-dir", str(self.root),
+                "--samples", "row_000000", "row_000001", "--repeats", "20",
+                "--batch-invariant", "false", "--logits-check", "false", "--determinism", "off",
+            ]), 0)
+        self.root, self.case, self.rows = repeat.load_case(self.root)
+        self.assertEqual(self.case["serve_repeat"]["determinism"], "off")
+        self.assertEqual((self.fixture.case / "case.json").read_bytes(), before)
+        plan = repeat.sibling("launch_huanyu_aqa_text_ab").build_launch(self.root, self.case, ROOT, "serve")
+        for key, value in {**ENV, "HCCL_DETERMINISTIC": "false", "ASCEND_LAUNCH_BLOCKING": "0",
+                           "NCCL_DETERMINISTIC": "0", "LCCL_DETERMINISTIC": "0"}.items():
+            self.assertEqual(plan["env"][key], value)
+        self.assertEqual(len(self.send()), 40)
+        report = self.compare("PASS")
+        self.assertEqual(report["determinism"], "off")
+        self.assertEqual(report["scope"], "text_only")
+        self.assertEqual(report["expected_requests"], 40)
+        self.assertFalse((self.root / "logits").exists())
+        self.assertEqual([s["matching_baseline_text_requests"] for s in report["samples"]], [20, 20])
+
+    def test_control_rejects_modified_source_before_creating_directory(self):
+        self.prepare(logits=False)
+        target = self.fixture.root / "repeat-off"
+        Path(self.case["subset_parquet"]).write_bytes(b"changed")
+        with self.assertRaisesRegex(ValueError, "Parquet changed"):
+            repeat.control(NS(case_dir=self.root, output_dir=target, determinism="off"))
+        self.assertFalse(target.exists())
+
+    def test_off_control_also_accepts_opt_in_logits_captures(self):
+        self.prepare(logits=True)
+        target = self.fixture.root / "repeat-off"
+        with redirect_stdout(io.StringIO()):
+            repeat.control(NS(case_dir=self.root, output_dir=target, determinism="off"))
+        self.root, self.case, self.rows = repeat.load_case(target)
+        self.send()
+        self.captures(environment={**ENV, "HCCL_DETERMINISTIC": "false",
+                                   "ASCEND_LAUNCH_BLOCKING": "0", "NCCL_DETERMINISTIC": "0", "LCCL_DETERMINISTIC": "0"})
+        report = self.compare("PASS")
+        self.assertEqual(report["determinism"], "off")
 
     def test_source_determinism_never_controls_repeat(self):
         for enabled in (None, False, True):

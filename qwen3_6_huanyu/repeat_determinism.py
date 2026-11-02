@@ -1,9 +1,10 @@
 """Verify native repeat-worker initialization without recording any tensors.
 
 Only the standalone repeat launcher enables this check. Batch-invariant kernels
-must remain disabled, while communication and synchronous-execution settings
-are retained. Torch deterministic algorithms are observed, not required or
-enabled here. Verified settings do not prove bitwise reproducibility.
+must remain disabled. Off mode disables HCCL/LCCL/NCCL determinism and
+ASCEND_LAUNCH_BLOCKING. Torch deterministic algorithms are observed, never
+changed here; off mode rejects an enabled setting. Verified settings do not
+prove bitwise reproducibility or require repeated outputs to differ.
 """
 
 from functools import wraps
@@ -15,6 +16,7 @@ import sys
 
 
 _GATE = "HUANYU_SERVE_REPEAT_DETERMINISM"
+_MODE = "HUANYU_SERVE_REPEAT_DETERMINISM_MODE"
 _MARKER = "_huanyu_repeat_determinism_check"
 _WORKER = "vllm_omni.platforms.npu.worker.npu_ar_worker"
 _EXPECTED = {
@@ -26,18 +28,27 @@ _EXPECTED = {
 def verify_worker_determinism(worker):
     import torch
 
+    mode = os.environ.get(_MODE, "on")
+    if mode not in ("on", "off"):
+        raise RuntimeError("invalid repeat determinism mode: " + repr(mode))
+    expected = dict(_EXPECTED)
+    if mode == "off":
+        expected.update(HCCL_DETERMINISTIC="false", ASCEND_LAUNCH_BLOCKING="0",
+                        NCCL_DETERMINISTIC="0", LCCL_DETERMINISTIC="0")
     # Inspect only the already-imported module: importing it here could run
     # registration and change the very state being checked.
     module = sys.modules.get("vllm_ascend.batch_invariant")
     registered = (module._batch_invariant_LIB is not None
                   if module is not None and hasattr(module, "_batch_invariant_LIB") else None)
-    environment = {key: os.environ.get(key) for key in _EXPECTED}
+    environment = {key: os.environ.get(key) for key in expected}
     deterministic = torch.are_deterministic_algorithms_enabled()
-    errors = [key + " must be " + value for key, value in _EXPECTED.items() if environment[key] != value]
+    errors = [key + " must be " + value for key, value in expected.items() if environment[key] != value]
+    if mode == "off" and deterministic:
+        errors.append("torch deterministic algorithms must be disabled in off mode")
     if registered:
         errors.append("native Ascend batch-invariant kernels are still registered; restart with the option disabled")
     state = dict(host=socket.gethostname(), pid=os.getpid(), rank=getattr(worker, "rank", None),
-                 environment=environment, batch_invariance_requested=False, batch_invariant_registered=registered,
+                 mode=mode, environment=environment, batch_invariance_requested=False, batch_invariant_registered=registered,
                  torch_deterministic_algorithms=deterministic,
                  torch_deterministic_warn_only=torch.is_deterministic_algorithms_warn_only_enabled(),
                  errors=errors)
