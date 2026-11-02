@@ -1,6 +1,8 @@
 """Native-runtime boundary tests without importing an inference engine."""
 
 import importlib.util
+from contextlib import redirect_stdout
+import io
 import json
 from pathlib import Path
 import sys
@@ -141,6 +143,32 @@ class AudioRuntimeTests(unittest.TestCase):
         self.assertEqual(observed, [((1, 4, 16), [16]), ((1, 4, 12), [9])])
         separately = runtime.encode_huanyu_audio(self.module, features[1:2, :, :9], [9])
         torch.testing.assert_close(together[1], separately[0], rtol=0, atol=0)
+
+    def test_outer_train_restores_eval_for_every_audio_forward_without_training_frozen_parameters(self):
+        runtime.attach_huanyu_audio(self.module, self.model_cfg)
+        observed = []
+        for name in ("audio_encoder", "audio_projection"):
+            part = getattr(self.module.model, name)
+            self.assertFalse(part.training)
+            handle = part.register_forward_pre_hook(lambda part, args: observed.append((
+                any(child.training for child in part.modules()),
+                any(p.requires_grad for p in part.parameters()), torch.is_grad_enabled())))
+            self.addCleanup(handle.remove)
+        before = {key: value.clone() for key, value in self.module.named_parameters()}
+        out = io.StringIO()
+        with redirect_stdout(out):
+            for _ in range(2):
+                self.module.train()
+                self.assertTrue(self.module.model.audio_encoder.training)
+                chunks = runtime.encode_huanyu_audio(self.module, torch.ones(1, 4, 16), [16])
+                self.assertTrue(self.module.training)
+                self.assertFalse(chunks[0].requires_grad)
+        self.assertEqual(observed, [(False, False, False)] * 4)
+        self.assertEqual(out.getvalue().count("[huanyu-audio-eval]"), 2)
+        for name in ("audio_encoder", "audio_projection"):
+            self.assertIn(f"component={name} training=False any_child_training=False requires_grad=False", out.getvalue())
+        for key, value in self.module.named_parameters():
+            torch.testing.assert_close(value, before[key], rtol=0, atol=0)
 
     def test_meta_outer_construction_is_materialized(self):
         with torch.device("meta"):

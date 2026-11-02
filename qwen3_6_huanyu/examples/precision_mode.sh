@@ -102,7 +102,30 @@ huanyu_configure_precision_mode() {
     # site env file. Cache mode, TP and HCCL are resolved later by the launcher.
     HUANYU_PRECISION_KEYS=(HUANYU_PRECISION_PROFILE "${_on[@]}" "${_full[@]}" "${_off[@]}" \
         MINICPMO_FSDP2_PIN_MEMORY MINICPMO_MOE_TP_REFERENCE MINICPMO_ROW_TP_REFERENCE)
+    # Opt-in job policy is snapshotted across site setup and explicitly sent to
+    # fresh Ray workers even when their raylet was started with other defaults.
+    export HUANYU_JOB_DETERMINISM="${HUANYU_JOB_DETERMINISM:-0}"
+    case "$HUANYU_JOB_DETERMINISM" in
+        0|1) ;;
+        *) echo '[huanyu-precision] FATAL: HUANYU_JOB_DETERMINISM must be 0 or 1' >&2; return 2 ;;
+    esac
+    HUANYU_PRECISION_KEYS+=(HUANYU_JOB_DETERMINISM)
+    if [[ "$HUANYU_JOB_DETERMINISM" == 1 ]]; then
+        export HCCL_DETERMINISTIC=strict ASCEND_LAUNCH_BLOCKING=1 NCCL_DETERMINISTIC=1
+        export LCCL_DETERMINISTIC=1 VLLM_BATCH_INVARIANT=0
+        HUANYU_PRECISION_KEYS+=(ASCEND_LAUNCH_BLOCKING NCCL_DETERMINISTIC LCCL_DETERMINISTIC VLLM_BATCH_INVARIANT)
+    fi
     HUANYU_PRECISION_ARGS=()
+    if [[ "$HUANYU_JOB_DETERMINISM" == 1 ]]; then
+        # verl's full_determinism option also enables batch-invariant kernels.
+        # This job intentionally selects the independent worker policy instead.
+        HUANYU_PRECISION_ARGS+=(
+            'actor_rollout_ref.rollout.full_determinism=false'
+            '++reward.reward_model.rollout.full_determinism=false'
+            '++actor_rollout_ref.rollout.engine_kwargs.vllm_omni.additional_config.rl_config.enabled=true'
+            '++actor_rollout_ref.rollout.engine_kwargs.vllm_omni.additional_config.rl_config.enable_batch_invariant=false'
+        )
+    fi
     # Keep the outer actor engine kwargs consistent with stage-0 engine_extras:
     # native deploy merging must not restore the generic colocated extension.
     # This applies to the actor only; the reward model keeps its own extension.

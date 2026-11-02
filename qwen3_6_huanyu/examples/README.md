@@ -15,6 +15,7 @@
 | 冻结缓存训练，16K | `run_huanyu_32card_16k_job.sh` | 两节点 | prompt14336 + response2048，SDPA，默认16+16 |
 | 冻结缓存训练，对照 Whisper 启动参数 | `run_huanyu_32card_whisper_aligned_job.sh` | 两节点 | 保留 Huanyu 接口；Actor BF16、rollout TP2、RM TP4，5K |
 | AQA 在线训练，encoder/projector 可分别开关 | `run_huanyu_aqa_unfreeze_32card_job.sh` | 两节点 | 默认二者都训练，关闭缓存，16+16，5K |
+| AQA 冻结encoder/projector，开启确定性计算 | `run_huanyu_aqa_frozen_deterministic_32card_job.sh` | 两节点 | 固定两者冻结、在线编码；Actor16 + RM16，BS4/mini4/N4，5K，关闭batch invariance |
 | AQA 默认冻结encoder、训练projector，bs32 | `run_huanyu_aqa_projector_5k_bs32_job.sh` | 两节点 | 音频开关可配置；3072+2048，train/mini batch=32，n=4，Actor16 + RM16，关闭缓存 |
 | AQA 一键启动，自定义长度/同步 | `HUANYU_JOB_MODE=aqa_unfreeze bash run_huanyu_32card_job.sh` | 两节点 | 直接转入共用AQA入口，长度、精度和同步由参数配置 |
 | 已准备环境和 Ray，冻结/缓存训练 | `run_huanyu.sh` | 仅主节点 | 需提前配置冻结与缓存环境；复用通用训练链 |
@@ -115,6 +116,55 @@ run_huanyu_aqa_audio_train.sh
 AQA 入口限定音频数据，在线编码，关闭 embedding cache；两个音频组件都冻结也不会自动切换为缓存读取。它默认静态 batching，允许通过命令行开启 Actor、rollout/ref log-prob 的 dynamic batching；静态模式固定 micro-batch=1，并保留 FSDP2、sequence parallel=1、视觉塔冻结及 Huanyu 适配参数。
 
 `run_huanyu_aqa_projector_5k_bs32_job.sh` 从环境读取 `HUANYU_TRAIN_AUDIO_ENCODER` / `HUANYU_TRAIN_AUDIO_PROJECTOR`，未设置时分别默认 `false` / `true`（true为训练，false为冻结），两节点需设置相同值。固定train/mini batch=32、n=4及16+16卡池；默认full精度，prompt3072+response2048，engine预算5248。两节点设置各自 `VC_TASK_INDEX` 和相同 `VC_WORKER_HOSTS` 后执行该脚本。数据可用 `HUANYU_AQA_TRAIN_FILE` / `HUANYU_AQA_VAL_FILE` 覆盖；默认训练前验证，`VAL_BEFORE_TRAIN=false` 可跳过。日志搜索 `[huanyu-aqa-projector-job]` 查看入口配置，搜索 `[huanyu-audio-train]` 查看实际模型的开关，默认 `train_encoder=False train_projector=True`。
+
+#### AQA 冻结音频并开启确定性计算的32卡入口
+
+`run_huanyu_aqa_frozen_deterministic_32card_job.sh` 复用原 `run_huanyu_aqa_unfreeze_32card_job.sh`
+的环境准备、PYTHONPATH源码选择和Ray启动流程。它强制两个组件开关为false、
+`HUANYU_JOB_DETERMINISM=1`、full精度、eager执行，保留BS=4、mini batch=4、N=4、
+prompt3072+response2048、engine预算5248、Actor16+GenRM16、TP4。
+继续在线编码音频并训练LLM；默认训练前验证，保留validation_dump和rollout_dump。
+
+两节点部署同版Python包及examples后，各执行一次；平台提供各自的 `VC_TASK_INDEX`
+（主节点0、从节点1）与相同的 `VC_WORKER_HOSTS`：
+
+```bash
+export PROJECT_ROOT=/opt/huawei/dataset/infra_data/code/verl_omni_qwen36_gzq_new
+export MODEL_PATH=/opt/huawei/dataset/model_gy/downloaded_models/2748
+export RM_MODEL_PATH=/opt/huawei/dataset/model_gy/downloaded_models/Qwen3.5-35B-A3B
+export HUANYU_VLLM_SOURCE=/opt/huawei/dataset/infra_data/code/vllm-omni-xy-qwen-vit
+bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/run_huanyu_aqa_frozen_deterministic_32card_job.sh"
+```
+
+`precision_mode.sh` 在原生导入/Ray启动前设置并在site env后恢复
+`HCCL_DETERMINISTIC=strict`、`ASCEND_LAUNCH_BLOCKING=1`、`NCCL_DETERMINISTIC=1`、
+`LCCL_DETERMINISTIC=1`、`VLLM_BATCH_INVARIANT=0`，将其显式传入Ray runtime_env。
+Actor/ref模型配置和Huanyu rollout worker分别启用严格Torch确定性算法并记录实际状态。
+rollout在原生设备初始化前设置、初始化后复核，被覆盖时直接报错。
+独立GenRM接收相同通信环境，但保留原GenRM worker实现和采样设置。
+
+verl的 `rollout.full_determinism=true` 会额外设置 `VLLM_BATCH_INVARIANT=1`，所以该入口
+通过独立 `HUANYU_JOB_DETERMINISM` 策略启用确定性，并将Actor/GenRM的该配置设为false。
+日志中这个false不表示上述确定性策略关闭。Torch遇到不支持确定性的算子会报错，
+不会降级为warn-only；训练仍沿用原随机采样参数，不承诺重复回答文字一致。
+
+冻结状态已经核查：`attach_huanyu_audio()` 加载时调用 `requires_grad_(False)` 和 `eval()`；
+`configure_trainable_audio()` 再次设为不可训练及eval。外层 `model.train()` 会暂时递归
+改变音频子模块的training标记，但 `_encode_huanyu_audio_batch()` 每次音频计算前都调用
+`encoder.eval()` / `projector.eval()`，并在no_grad下执行。新日志记录首次实际前向状态；
+每次调用还检查所有子模块保持eval、参数不需要梯度。LLM整体保持训练模式。
+
+在本次 `console.log` 或汇总控制台日志中检查：
+
+```bash
+grep -nE 'huanyu-determinism.*(SETTINGS_VERIFIED|FAILED)|huanyu-audio-eval' /本次运行目录/console.log
+```
+
+确定性日志应有 `scope=actor_ref_model_config` 和 `scope=rollout_worker_init_rank_*`，
+`status=SETTINGS_VERIFIED`、`torch_deterministic_algorithms=true`、`warn_only=false`；
+音频日志应为两个component均 `training=False any_child_training=False requires_grad=False`。
+只看到配置日志不能代替实际forward记录。本地回归覆盖父模型train后反复音频前向、
+冻结权重不变、主从角色、旧site env覆盖、复用Ray和实际worker初始化状态；未做NPU实测。
 
 ### 3.4 单机16卡规则奖励
 

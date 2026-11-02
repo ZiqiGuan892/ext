@@ -46,6 +46,7 @@ def worker_modules(*, fail=None):
     reload = load_file(PACKAGE + ".weight_reload", ROOT / "weight_reload.py")
     modules = {BASE_MODULE: base, PACKAGE: package, reload.__name__: reload}
     for module_name, installer in (
+        ("job_determinism", "install_job_determinism_check"),
         ("ab_determinism", "install_ab_determinism_check"),
         ("repeat_determinism", "install_repeat_determinism_check"),
         ("processor_compat", "install_huanyu_processor_compat"),
@@ -67,6 +68,19 @@ def worker_modules(*, fail=None):
 
 
 class WorkerExtensionTests(unittest.TestCase):
+    def test_job_check_is_mandatory_without_ab_or_repeat_probes(self):
+        for fail in (None, "job_determinism"):
+            with self.subTest(fail=fail), patch.dict(os.environ, {
+                    "HUANYU_JOB_DETERMINISM": "1", "HUANYU_TEXT_AB_DETERMINISM": "0",
+                    "HUANYU_SERVE_REPEAT_DETERMINISM": "0", "HUANYU_EMBEDDING_AB_DIR": ""}), \
+                    worker_modules(fail=fail) as (_, events, _), redirect_stdout(io.StringIO()):
+                if fail:
+                    with self.assertRaisesRegex(RuntimeError, "job_determinism unavailable"):
+                        load_file(PACKAGE + ".worker_extension", ROOT / "worker_extension.py")
+                else:
+                    load_file(PACKAGE + ".worker_extension", ROOT / "worker_extension.py")
+                self.assertEqual(events[0], "job_determinism")
+
     def test_ab_check_is_mandatory_without_embedding_or_logits_probe(self):
         for fail in (None, "ab_determinism"):
             with self.subTest(fail=fail), patch.dict(os.environ, {

@@ -182,6 +182,8 @@ def _frozen_bf16_call(part, *args):
     parameters = dict(part.named_parameters())
     if any(value.requires_grad for value in parameters.values()):
         raise ValueError("Huanyu audio runtime currently supports frozen audio only")
+    if any(child.training for child in part.modules()):
+        raise RuntimeError("Frozen Huanyu audio and its descendants must be in eval mode before forward")
     if any(hasattr(value, "placements") for value in parameters.values()):
         raise RuntimeError("Huanyu audio parameters are still sharded; call from an unsharded FSDP forward")
     state = {name: value.to(dtype=torch.bfloat16) if value.is_floating_point() else value
@@ -238,6 +240,14 @@ def _encode_huanyu_audio_batch(module, features, lengths):
     device = next(encoder.parameters()).device
     encoder.eval()
     projector.eval()
+    if not getattr(model, "_huanyu_frozen_eval_reported", False):
+        # Report actual execution state after an outer model.train() may have
+        # recursively changed the flags; trainability is checked again on call.
+        for name, part in (("audio_encoder", encoder), ("audio_projection", projector)):
+            print(f"[huanyu-audio-eval] component={name} training={part.training} "
+                  f"any_child_training={any(child.training for child in part.modules())} "
+                  f"requires_grad={any(p.requires_grad for p in part.parameters())}", flush=True)
+        model._huanyu_frozen_eval_reported = True
     features = features.to(device=device, dtype=torch.bfloat16)
     lengths = lengths.to(device=device, dtype=torch.int64)
     with torch.no_grad():

@@ -43,7 +43,9 @@ class PrecisionModeTests(unittest.TestCase):
         self.addCleanup(self.fixture.doCleanups)
         keys = CORE + FULL + OPTIONAL + ("HUANYU_PRECISION_PROFILE", "MINICPMO_FSDP2_PIN_MEMORY",
                                    "MINICPMO_HUANYU_ROLLOUT_TP", "VLLM_OMNI_EXTERNAL_MODULES",
-                                   "HUANYU_USE_PRECOMPUTE", "HCCL_OP_EXPANSION_MODE", "HCCL_DETERMINISTIC", "ROLLOUT_TP")
+                                   "HUANYU_USE_PRECOMPUTE", "HCCL_OP_EXPANSION_MODE", "HCCL_DETERMINISTIC", "ROLLOUT_TP",
+                                   "HUANYU_JOB_DETERMINISM", "ASCEND_LAUNCH_BLOCKING", "NCCL_DETERMINISTIC",
+                                   "LCCL_DETERMINISTIC", "VLLM_BATCH_INVARIANT")
         self.fixture.capture_script.write_text(
             "import json, os, pathlib, sys\n"
             + "keys = " + repr(keys) + "\n"

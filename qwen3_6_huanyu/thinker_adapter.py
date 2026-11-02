@@ -97,6 +97,10 @@ class Qwen36HuanyuThinkerAdapter(OmniModelBase):
 
     @classmethod
     def configure_model(cls, module, model_config):
+        if os.environ.get("HUANYU_JOB_DETERMINISM") == "1":
+            from .job_determinism import configure_job_determinism
+
+            configure_job_determinism()
         from .audio_runtime import attach_huanyu_audio
         from .audio_training import (
             configure_trainable_audio,

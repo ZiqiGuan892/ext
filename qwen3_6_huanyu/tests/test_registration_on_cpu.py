@@ -173,6 +173,24 @@ class RegistrationTests(unittest.TestCase):
         self.assertEqual(self.model.config.architectures, [HF_ARCHITECTURE])
         self.assertEqual(self.model.config.hidden_size, 6)
 
+    def test_job_determinism_is_configured_before_audio_loading_and_errors_propagate(self):
+        policy = ModuleType(f"{PACKAGE}.job_determinism")
+
+        def configure():
+            self.attach.assert_not_called()
+            self.base_configure.assert_not_called()
+
+        policy.configure_job_determinism = Mock(side_effect=configure)
+        with patch.dict(os.environ, {"HUANYU_JOB_DETERMINISM": "1"}), \
+                patch.dict(sys.modules, {policy.__name__: policy}):
+            self.adapter.configure_model(self.model, self.config)
+            policy.configure_job_determinism.assert_called_once_with()
+            policy.configure_job_determinism.side_effect = RuntimeError("policy mismatch")
+            self.attach.reset_mock()
+            with self.assertRaisesRegex(RuntimeError, "policy mismatch"):
+                self.adapter.configure_model(self.model, self.config)
+            self.attach.assert_not_called()
+
     def test_whisper_checkpoint_is_rejected_before_loading(self):
         self.model.config.audio_config = {"model_type": "whisper", "d_model": 1024}
         with self.assertRaisesRegex(ValueError, "huanyu_conformer_0_6b"):
