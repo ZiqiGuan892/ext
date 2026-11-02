@@ -96,6 +96,7 @@ class StemMultinodeJobTests(unittest.TestCase):
         return capture, _aqa.effective_arguments(capture)
 
     def assert_scaled(self, capture, actual, total, tp=8, ignore_eos="false", train_bs=128, mini_bs=128, n=16):
+        fsdp_size = "16" if total == 32 else "-1"
         expected = {
             "trainer.n_gpus_per_node": "16", "trainer.nnodes": str(total // 16),
             "data.train_batch_size": str(train_bs), "actor_rollout_ref.actor.ppo_mini_batch_size": str(mini_bs),
@@ -112,8 +113,8 @@ class StemMultinodeJobTests(unittest.TestCase):
             "actor_rollout_ref.actor.fsdp_config.optimizer_offload": "true",
             "actor_rollout_ref.actor.fsdp_config.offload_policy": "true",
             "actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes": "512",
-            "actor_rollout_ref.actor.fsdp_config.fsdp_size": "-1",
-            "actor_rollout_ref.ref.fsdp_config.fsdp_size": "-1",
+            "actor_rollout_ref.actor.fsdp_config.fsdp_size": fsdp_size,
+            "actor_rollout_ref.ref.fsdp_config.fsdp_size": fsdp_size,
             "actor_rollout_ref.actor.ulysses_sequence_parallel_size": "1",
             "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu": "1",
             "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu": "1",
@@ -155,16 +156,19 @@ class StemMultinodeJobTests(unittest.TestCase):
         with (self.fixture.examples / "env_export_huanyu.sh").open("a", encoding="utf-8") as stream:
             stream.write("export NNODES=8 TRAIN_BATCH_SIZE=128 PPO_MINI_BATCH_SIZE=128 ROLLOUT_N=16\n")
         capture, actual = self.launch(
-            {"TRAIN_BATCH_SIZE": "16", "PPO_MINI_BATCH_SIZE": "8", "ROLLOUT_N": "4",
+            {"TRAIN_BATCH_SIZE": "16", "PPO_MINI_BATCH_SIZE": "8", "ROLLOUT_N": "4", "ROLLOUT_TP": "16",
              "RM_ENABLE": "1", "STEM_REWARD_MODE": "genrm"},
             ("data.train_batch_size=128", "actor_rollout_ref.actor.ppo_mini_batch_size=128",
+             "actor_rollout_ref.actor.fsdp_config.fsdp_size=32", "actor_rollout_ref.ref.fsdp_config.fsdp_size=-1",
+             "actor_rollout_ref.rollout.tensor_model_parallel_size=32",
              "actor_rollout_ref.rollout.n=16", "reward.reward_model.enable=true",
              "reward.reward_model.enable_resource_pool=true"),
         )
-        self.assert_scaled(capture, actual, 32, train_bs=16, mini_bs=8, n=4)
+        self.assert_scaled(capture, actual, 32, tp=16, train_bs=16, mini_bs=8, n=4)
         starts = [e for e in self.fixture.events("ray") if "start" in e["args"]]
         self.assertEqual(len(starts), 1)
         self.assertIn("--head", starts[0]["args"])
+        self.assertEqual(starts[0]["precision"]["MINICPMO_HUANYU_ROLLOUT_TP"], "16")
         self.assertEqual(len(self.fixture.events("train")), 1)
 
     def test_16_cards_start_only_head_with_custom_batches_and_no_rm(self):
@@ -331,6 +335,7 @@ class StemMultinodeJobTests(unittest.TestCase):
     def test_invalid_layout_stops_before_install_or_ray(self):
         for updates in (
             {"TOTAL_NPUS": "96"}, {"VC_TASK_INDEX": "8"},
+            {"TOTAL_NPUS": "32", "VC_WORKER_NUM": "2", "ROLLOUT_TP": "32"},
             {"ROLLOUT_TP": "3"}, {"VC_WORKER_NUM": "16"},
         ):
             with self.subTest(updates=updates):

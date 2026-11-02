@@ -27,7 +27,8 @@
 # 16 cards: one node; platform VC_TASK_INDEX=0, VC_WORKER_NUM=1.
 # TOTAL_NPUS=16 TRAIN_BATCH_SIZE=16 PPO_MINI_BATCH_SIZE=8 ROLLOUT_N=4 \
 #   bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/run_huanyu_stem_job.sh"
-# 32 cards: two nodes; platform VC_TASK_INDEX=0/1, VC_WORKER_NUM=2.
+# 32 cards: two nodes, Actor/Ref FSDP groups of 16, rollout TP8 by default.
+# The platform supplies VC_TASK_INDEX=0/1 and VC_WORKER_NUM=2.
 # TOTAL_NPUS=32 TRAIN_BATCH_SIZE=16 PPO_MINI_BATCH_SIZE=8 ROLLOUT_N=4 \
 #   bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/run_huanyu_stem_job.sh"
 # 128 cards: eight nodes; platform VC_TASK_INDEX=0..7, VC_WORKER_NUM=8.
@@ -128,9 +129,13 @@ export MINICPMO_TUNE_AUDIO=0 MINICPMO_TUNE_VISION=0
 export EXPERIMENT_NAME="${EXPERIMENT_NAME:-huanyu_stem_${TOTAL_NPUS}card_bs${TRAIN_BATCH_SIZE}_n${ROLLOUT_N}}"
 export VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-false}" TEST_FREQ="${TEST_FREQ:-10}"
 
+_STEM_JOB_ARGS=()
+if (( TOTAL_NPUS == 32 )); then
+    # The common launcher resolves precision and exports TP before starting Ray.
+    _STEM_JOB_ARGS+=("actor_rollout_ref.rollout.tensor_model_parallel_size=$ROLLOUT_TP")
+fi
 # An old diagnostic shell must not turn this training run into disk-only mode
 # or stop after a destructive weight audit. Also clear reused Ray worker envs.
-_STEM_JOB_ARGS=()
 for _key in HUANYU_CHECKPOINT_VALIDATION_MODE HUANYU_FULL_WEIGHT_AUDIT_DIR HUANYU_FULL_WEIGHT_AUDIT_RUN_ID \
     HUANYU_WEIGHT_SYNC_AUDIT_DIR HUANYU_AUDIO_PROBE_DIR HUANYU_TEXT_AB_DIR \
     HUANYU_EMBEDDING_AB_DIR HUANYU_EMBEDDING_AB_SIDE; do
@@ -138,7 +143,7 @@ for _key in HUANYU_CHECKPOINT_VALIDATION_MODE HUANYU_FULL_WEIGHT_AUDIT_DIR HUANY
     _STEM_JOB_ARGS+=("++ray_kwargs.ray_init.runtime_env.env_vars.$_key=\"\"")
 done
 echo "[huanyu-stem-job] physical=${NNODES}x16=$TOTAL_NPUS actor=$TOTAL_NPUS GenRM=0 reward=math_dapo"
-echo "[huanyu-stem-job] training FSDP=$TOTAL_NPUS SP=1 TP=1; rollout TP=$ROLLOUT_TP replicas=$((TOTAL_NPUS / ROLLOUT_TP)) max_num_seqs=$ROLLOUT_MAX_NUM_SEQS"
+echo "[huanyu-stem-job] training DP=$TOTAL_NPUS SP=1 TP=1; rollout TP=$ROLLOUT_TP replicas=$((TOTAL_NPUS / ROLLOUT_TP)) max_num_seqs=$ROLLOUT_MAX_NUM_SEQS"
 echo "[huanyu-stem-job] BS=$TRAIN_BATCH_SIZE mini=$PPO_MINI_BATCH_SIZE N=$ROLLOUT_N trajectories=$((TRAIN_BATCH_SIZE * ROLLOUT_N)) microbatch=1 sync_each=true"
 echo "[huanyu-stem-job] context=$STEM_CONTEXT_LENGTH prompt=$STEM_PROMPT_LENGTH ignore_eos=$STEM_IGNORE_EOS EOS_allowed=$([[ "$STEM_IGNORE_EOS" == true ]] && echo false || echo true)"
 

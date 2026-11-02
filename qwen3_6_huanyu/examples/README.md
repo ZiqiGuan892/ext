@@ -1094,7 +1094,7 @@ python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/aqa_text_ab.py" compare --case-di
 | 设置（使用默认batch参数） | 16卡 | 32卡 | 128卡 | 256卡 |
 | --- | --- | --- | --- | --- |
 | `TOTAL_NPUS` / 节点数 | 16 / 1 | 32 / 2 | 128 / 8 | 256 / 16 |
-| Actor FSDP2 分片规模（`fsdp_size=-1`） | 16 | 32 | 128 | 256 |
+| Actor / Ref 每个 FSDP2 分片组的卡数 | 16 | 16 | 128 | 256 |
 | Actor 数据并行规模，SP=1 | 16 | 32 | 128 | 256 |
 | 训练 TP / SP | 1 / 1 | 1 / 1 | 1 / 1 | 1 / 1 |
 | rollout TP（默认，可改4/16） | 8 | 8 | 8 | 8 |
@@ -1121,7 +1121,7 @@ bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/run_huanyu_stem_job.sh"
 未显式设置总卡数时，从 `VC_WORKER_NUM=1/2/8/16` 推导；无节点信息时仍默认128卡。
 支持启动配置不表示已验证对应硬件上的显存或训练速度。
 
-训练使用全卡 FSDP，不使用 rollout 的 TP 切分训练。单机16卡不要求 TP=16；`Actor卡数/TP` 是 rollout 副本数，不能填入训练 DP 或 `rollout.data_parallel_size`。默认推理 PP=1、引擎内部 DP=1，由外层启动多个 TP8 副本。改为 TP16 时，128/256卡分别有8/16个副本；单副本权重更省显存，但副本数减半，速度需实测。参考 [vLLM 并行说明](https://docs.vllm.ai/en/stable/serving/parallelism_scaling/)。
+32 卡训练时，Actor 和 Ref 均使用 `fsdp_size=16`，32 个 rank 组成两个 16 卡分片组。Actor 训练时仍需在两个副本间同步梯度。16、128 和 256 卡作业按各自的全部训练 rank 分片。rollout 默认 TP8，可设为 4、8 或 16。每个推理引擎的 PP 和 DP 均为 1，外层启动的推理副本数为 Actor 卡数除以 rollout TP。[vLLM 并行说明](https://docs.vllm.ai/en/stable/serving/parallelism_scaling/)
 
 默认关闭 Actor、rollout/ref logprob 的 dynamic batching；micro-batch=1，启用逐 micro-batch 梯度同步及梯度检查点。Actor FP32 主参数，参数/优化器 offload 开启；rollout BF16、full精度策略、eager、每引擎 `max_num_seqs=8`、显存预算0.5，权重同步 bucket=512MB。冻结 encoder/projector/vision，纯文本不走音频编码。默认允许 EOS，10K 是上限；不代表每条都生成10K。数学 `math_dapo` 规则使用当前安装的 verl 实现，启动前会用正确/错误 boxed 答案自检并打印源文件和实际分数；它不等于 GenRM，也不能假定支持任意数学表达式的符号等价。
 

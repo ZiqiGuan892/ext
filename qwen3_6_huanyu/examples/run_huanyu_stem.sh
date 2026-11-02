@@ -159,6 +159,12 @@ else
     export TRAIN_BATCH_SIZE=4 PPO_MINI_BATCH_SIZE=4 ROLLOUT_N=4 ROLLOUT_MAX_NUM_SEQS=4
     if [[ "$STEM_REWARD_MODE" == rule ]]; then export RM_ENABLE=0 REWARD_POOL_NPUS=0 RM_NNODES=0; fi
 fi
+_STEM_ACTOR_WORLD=$((NUM_NPUS * NNODES))
+_STEM_FSDP_SIZE=-1
+if (( _STEM_ACTOR_WORLD == 32 )); then
+    # Hybrid sharding: two replicas with 16 ranks per shard group.
+    _STEM_FSDP_SIZE=16
+fi
 export PPO_MICRO_BATCH_SIZE_PER_GPU=1
 _STEM_DYNAMIC="${STEM_DYNAMIC_BSZ:-true}"
 _STEM_SYNC="${STEM_SYNC_EACH_MICROBATCH:-false}"
@@ -193,7 +199,7 @@ for _key in HUANYU_FREEZE_AUDIO HUANYU_TRAIN_AUDIO_ENCODER HUANYU_TRAIN_AUDIO_PR
     _value="$(python3 -c 'import json, os, sys; print(json.dumps(os.environ[sys.argv[1]]))' "$_key")"
     _STEM_ENV_ARGS+=("++ray_kwargs.ray_init.runtime_env.env_vars.$_key=$_value")
 done
-echo "[huanyu-stem] actor=${NUM_NPUS}x${NNODES} actor_DP/FSDP=$((NUM_NPUS * NNODES)) train_TP=1 SP=1 rollout_TP=$ROLLOUT_TP replicas=$((NUM_NPUS * NNODES / ROLLOUT_TP)) reward=$STEM_REWARD_MODE RM_cards=$REWARD_POOL_NPUS"
+echo "[huanyu-stem] actor=${NUM_NPUS}x${NNODES} actor_DP=$_STEM_ACTOR_WORLD fsdp_size=$_STEM_FSDP_SIZE train_TP=1 SP=1 rollout_TP=$ROLLOUT_TP replicas=$((_STEM_ACTOR_WORLD / ROLLOUT_TP)) reward=$STEM_REWARD_MODE RM_cards=$REWARD_POOL_NPUS"
 echo "[huanyu-stem] BS=$TRAIN_BATCH_SIZE mini=$PPO_MINI_BATCH_SIZE N=$ROLLOUT_N trajectories=$((TRAIN_BATCH_SIZE * ROLLOUT_N)) microbatch=1 microbatches_per_rank=$((PPO_MINI_BATCH_SIZE * ROLLOUT_N / (NUM_NPUS * NNODES)))"
 echo "[huanyu-stem] prompt=$MAX_PROMPT_LENGTH response=$MAX_RESPONSE_LENGTH total=$_STEM_CONTEXT engine=$ROLLOUT_MAX_MODEL_LEN ignore_eos=$_STEM_IGNORE_EOS steps=$_STEM_STEPS"
 echo "[huanyu-stem] text_only=true encoder_train=false projector_train=false cache=off precision=full graph=0 reward=$STEM_REWARD_MODE"
@@ -242,7 +248,8 @@ exec bash "$_STEM_EXAMPLES/run_huanyu.sh" \
     actor_rollout_ref.model.override_config.attn_implementation=sdpa \
     actor_rollout_ref.model.enable_gradient_checkpointing=true \
     actor_rollout_ref.actor.freeze_vision_tower=true \
-    actor_rollout_ref.actor.fsdp_config.fsdp_size=-1 actor_rollout_ref.ref.fsdp_config.fsdp_size=-1 \
+    "actor_rollout_ref.actor.fsdp_config.fsdp_size=$_STEM_FSDP_SIZE" \
+    "actor_rollout_ref.ref.fsdp_config.fsdp_size=$_STEM_FSDP_SIZE" \
     actor_rollout_ref.actor.ulysses_sequence_parallel_size=1 actor_rollout_ref.ref.ulysses_sequence_parallel_size=1 \
     actor_rollout_ref.actor.fsdp_config.ulysses_sequence_parallel_size=1 \
     actor_rollout_ref.ref.fsdp_config.ulysses_sequence_parallel_size=1 \
