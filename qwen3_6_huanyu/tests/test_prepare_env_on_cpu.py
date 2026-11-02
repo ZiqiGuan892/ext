@@ -134,7 +134,7 @@ exit "$prepare_status"
             "HUANYU_STEM_TEXT_TRAIN": "1", "HUANYU_SKIP_EDITABLE_INSTALL": "1",
         }.items():
             self.assertEqual(env[key], value, key)
-        self.assertEqual([e["args"][0] for e in self.fixture.events("helper")], ["sync", "check-devices"])
+        self.assertEqual([e["args"][0] for e in self.fixture.events("helper")], ["check-devices"])
         self.assertEqual(env["HUANYU_TEST_OPTIONS_BEFORE"], env["HUANYU_TEST_OPTIONS_AFTER"])
 
     def test_stem_bash_activation_replays_256_card_and_eos_settings(self):
@@ -178,6 +178,8 @@ exit "$prepare_status"
         self.assertEqual(env["HUANYU_TEST_OPTIONS_BEFORE"], env["HUANYU_TEST_OPTIONS_AFTER"])
         self.assertEqual(Path(actual["cwd"]).resolve(), self.fixture.project.resolve())
         self.assertEqual(env["HUANYU_SKIP_EDITABLE_INSTALL"], "1")
+        for key in ("HUANYU_VLLM_SOURCE", "HUANYU_VLLM_OMNI_ROOT"):
+            self.assertEqual(Path(env[key]).resolve(), self.fixture.native_source.resolve())
         self.assertEqual(env["HUANYU_USE_PRECOMPUTE"], "1")
         self.assertEqual(env["HUANYU_TRAIN_AUDIO_ENCODER"], "false")
         self.assertEqual(env["HUANYU_TRAIN_AUDIO_PROJECTOR"], "false")
@@ -186,7 +188,7 @@ exit "$prepare_status"
         self.assertEqual(len(self.fixture.events("pip")), 1)
         self.assertEqual(len(self.fixture.events("runtime")), 1)
         operations = [event["args"][0] for event in self.fixture.events("helper")]
-        self.assertEqual(operations, ["sync", "check-devices"])
+        self.assertEqual(operations, ["check-devices"])
         self.assertEqual(len(self.activation_files()), 1)
         self.assertTrue(self.activation_files()[0].with_name("prepare.log").is_file())
 
@@ -264,9 +266,7 @@ exit "$prepare_status"
     def test_existing_ray_is_not_started_reinstalled_or_waited_on(self):
         result = self.run_prepare({"HUANYU_TEST_RAY_LIVE": "1"})
         self.assert_success(result)
-        sync = [event for event in self.fixture.events("helper") if event["args"][0] == "sync"]
-        self.assertEqual(len(sync), 1)
-        self.assertIn("--ray-running", sync[0]["args"])
+        self.assertFalse(any(event["args"][0] == "sync" for event in self.fixture.events("helper")))
         self.assertFalse(self.fixture.events("pip"))
         self.assertFalse(self.fixture.events("git"))
 

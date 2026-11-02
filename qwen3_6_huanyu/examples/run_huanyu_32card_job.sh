@@ -10,7 +10,8 @@
 # IPC reload, logical KV zeroing, isolated media and FSDP pin_memory=0.
 # Apply the same policy before Ray on BOTH nodes and explicitly in runtime_env
 # for training. full requires graph mode=0; explicit profile=custom permits A/B.
-# Never stops an existing Ray cluster or deletes an old checkout.
+# Uses the selected vLLM-Omni source directly; never copies/replaces checkouts.
+# Never stops an existing Ray cluster.
 set -euo pipefail
 
 # Some schedulers wrap this node-level entry in torchrun/torch.distributed.launch
@@ -105,8 +106,8 @@ _PYTHON=python3
 _HELPER="${_HUANYU_EXAMPLE_DIR}/job_bootstrap.py"
 _ENV_FILE="${HUANYU_ENV_FILE:-${_HUANYU_EXAMPLE_DIR}/env_export_huanyu.sh}"
 _PRECISION_FILE="${_HUANYU_EXAMPLE_DIR}/precision_mode.sh"
-_VLLM_SOURCE="${HUANYU_VLLM_SOURCE:-/opt/huawei/dataset/infra_data/code/vllm-omni-xy-qwen-vit}"
-_VLLM_TARGET=/vllm-workspace/vllm-omni
+_VLLM_SOURCE="${HUANYU_VLLM_SOURCE:-${HUANYU_VLLM_OMNI_ROOT:-/opt/huawei/dataset/infra_data/code/vllm-omni-xy-qwen-vit}}"
+_NATIVE_PATH_FILE="${_HUANYU_EXAMPLE_DIR}/native_source.sh"
 _RANK="${VC_TASK_INDEX:-}"
 _WAIT="${RAY_CLUSTER_WAIT_TIMEOUT:-900}"
 _INTERVAL="${RAY_CLUSTER_POLL_INTERVAL:-5}"
@@ -280,7 +281,7 @@ huanyu_preload_allocator() {
     done
 }
 huanyu_preload_allocator
-[[ -f "$_HELPER" && -f "$_ENV_FILE" && -f "$_PRECISION_FILE" ]] || {
+[[ -f "$_HELPER" && -f "$_ENV_FILE" && -f "$_PRECISION_FILE" && -f "$_NATIVE_PATH_FILE" ]] || {
     echo "FATAL: missing Huanyu package, env file or precision_mode.sh" >&2; exit 1;
 }
 echo "[huanyu-job] allocator before Python/env setup: LD_PRELOAD=$LD_PRELOAD"
@@ -360,17 +361,17 @@ flock -n 9 || { echo 'FATAL: another Huanyu job launcher is already running on t
 if (( _PREPARE_ONLY )); then
     echo "[huanyu-env] setup only mode=$_JOB_MODE log=$_LOG_DIR/prepare.log"
 else
-    echo "[huanyu-job] rank=$_RANK node=$_NODE_IP head=$_MASTER_IP:$_PORT log=$_LOG_DIR/rank_$_RANK.log"
+    echo "[huanyu-job] rank=$_RANK platform_ip=$_NODE_IP ray_node_ip=auto head=$_MASTER_IP:$_PORT log=$_LOG_DIR/rank_$_RANK.log"
 fi
 
 _LIVE_RAY=0
 if pgrep -x raylet >/dev/null; then _LIVE_RAY=1; fi
-_SYNC_ARGS=()
-if (( _LIVE_RAY )); then _SYNC_ARGS+=(--ray-running); fi
-echo "[huanyu-job] vLLM-Omni sync source=$_VLLM_SOURCE target=$_VLLM_TARGET"
-"$_PYTHON" -B "$_HELPER" sync "$_VLLM_SOURCE" "$_VLLM_TARGET" "${_SYNC_ARGS[@]}"
+export HUANYU_VLLM_SOURCE="$_VLLM_SOURCE"
+source "$_NATIVE_PATH_FILE" || exit $?
+_VLLM_SOURCE="$HUANYU_VLLM_SOURCE"
+echo "[huanyu-job] vLLM-Omni source=$_VLLM_SOURCE (PYTHONPATH; no checkout replacement)"
 if (( _LIVE_RAY )); then
-    echo '[huanyu-job] reusing local Ray; code matches, editable installation skipped'
+    echo '[huanyu-job] reusing local Ray; editable installation skipped; existing workers keep their loaded code'
 else
     # Install this project's plugin, not the shared verl / verl-omni repositories.
     [[ -f "$PROJECT_ROOT/pyproject.toml" || -f "$PROJECT_ROOT/setup.py" ]] || {
@@ -387,6 +388,10 @@ set +u
 source "$_ENV_FILE"
 set +x
 set -euo pipefail
+# A custom/older site env may reset these to /vllm-workspace/vllm-omni.
+# Restore the caller's source and its import priority before any runtime check.
+export HUANYU_VLLM_SOURCE="$_VLLM_SOURCE"
+source "$_NATIVE_PATH_FILE" || exit $?
 for _key in "${!_HUANYU_PATH_CONFIG[@]}"; do
     export "$_key=${_HUANYU_PATH_CONFIG[$_key]}"
 done
@@ -402,7 +407,6 @@ if (( ! _PREPARE_ONLY )); then export RAY_ADDRESS="$_MASTER_IP:$_PORT"; fi
 export HUANYU_JOB_MODE="$_JOB_MODE" HUANYU_CLUSTER_NODES="$_CLUSTER_NODES"
 export RAY_USAGE_STATS_ENABLED=0 PYTHONUNBUFFERED=1 HYDRA_FULL_ERROR=1
 export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
-export HUANYU_VLLM_OMNI_ROOT="$_VLLM_TARGET"
 export MINICPMO_USE_PRECOMPUTE=0 MINICPMO_TUNE_VISION=0
 export HUANYU_STEM_TEXT_TRAIN=0
 for _key in "${!_HUANYU_AUDIO_CONFIG[@]}"; do
@@ -457,7 +461,7 @@ echo "[huanyu-job] mode=$_JOB_MODE freeze_audio=$HUANYU_FREEZE_AUDIO precompute=
 echo "[huanyu-job] train_audio_encoder=$HUANYU_TRAIN_AUDIO_ENCODER train_audio_projector=$HUANYU_TRAIN_AUDIO_PROJECTOR"
 echo "[huanyu-job] physical=16x${_CLUSTER_NODES} actor=${NUM_NPUS}x${NNODES} rollout_TP=$ROLLOUT_TP RM=${RM_N_GPUS_PER_NODE}x${RM_NNODES} RM_TP=$RM_TP requested=$((NUM_NPUS * NNODES + REWARD_POOL_NPUS))"
 "$_PYTHON" -B "${_HUANYU_EXAMPLE_DIR}/check_native_runtime.py" \
-    --check --expected-root "$_VLLM_TARGET"
+    --check --expected-root "$_VLLM_SOURCE"
 echo '[huanyu-job] native import check exited successfully'
 "$_PYTHON" -B "$_HELPER" check-devices
 
@@ -490,7 +494,9 @@ wait_for_cluster() {
 
 if (( _RANK == 0 )); then
     if (( ! _LIVE_RAY )); then
-        ray start --head --node-ip-address="$_NODE_IP" --port="$RAY_PORT" \
+        # Match the working manual command: let Ray select its local address.
+        # A platform hostname's DNS address is not necessarily the Ray NIC.
+        ray start --head --port="$RAY_PORT" \
             --dashboard-host=0.0.0.0 --dashboard-port="$RAY_DASHBOARD_PORT" \
             --resources='{"NPU": 16}' 9>&-
     fi
@@ -528,13 +534,14 @@ else
         else
             echo '[huanyu-job] keeping existing worker raylet; cluster membership unchecked, no training on this node'
         fi
-        while pgrep -x raylet >/dev/null; do sleep 30; done
-        echo 'FATAL: worker raylet exited' >&2
-        exit 1
     else
         echo '[huanyu-job] joining as worker; no training on this node'
-        # Keep this shell alive so FD 9 holds the local launcher lock.
-        ray start --address="$RAY_ADDRESS" --node-ip-address="$_NODE_IP" \
-            --resources='{"NPU": 16}' --block 9>&-
+        ray start --address="$RAY_ADDRESS" --resources='{"NPU": 16}' 9>&-
     fi
+    # ray start returns after startup, just like the working manual command.
+    # Keep the node job and its lock alive without creating a Ray probe driver.
+    echo '[huanyu-job] worker launcher staying alive; monitoring local raylet only'
+    while pgrep -x raylet >/dev/null; do sleep 30; done
+    echo 'FATAL: worker raylet exited' >&2
+    exit 1
 fi

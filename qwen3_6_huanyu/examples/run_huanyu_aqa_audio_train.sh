@@ -232,7 +232,7 @@ echo "[huanyu-aqa] precision train_GDN=$MINICPMO_HUANYU_GDN_FP32_TRAINING rollou
 python3 -B "${_HUANYU_EXAMPLE_DIR}/check_aqa_audio_train.py" \
     --train "${TRAIN_FILE}" --validation "${VAL_FILE}" --train-batch-size "${TRAIN_BATCH_SIZE}"
 
-export HUANYU_VLLM_OMNI_ROOT=/vllm-workspace/vllm-omni
+source "${_HUANYU_EXAMPLE_DIR}/native_source.sh" || exit $?
 _huanyu_retained_path=""
 IFS=: read -r -a _huanyu_entries <<< "${PYTHONPATH:-}"
 for _huanyu_path in "${_huanyu_entries[@]}"; do
@@ -251,7 +251,7 @@ export PYTHONPATH="${HUANYU_VLLM_OMNI_ROOT}:${PROJECT_ROOT}${_huanyu_retained_pa
 python3 -B "${_HUANYU_EXAMPLE_DIR}/check_native_runtime.py" --check --expected-root "${HUANYU_VLLM_OMNI_ROOT}"
 
 _huanyu_ray_args=()
-for _huanyu_env_key in PYTHONPATH HUANYU_VLLM_OMNI_ROOT HUANYU_FREEZE_AUDIO \
+for _huanyu_env_key in PYTHONPATH HUANYU_VLLM_OMNI_ROOT HUANYU_VLLM_SOURCE HUANYU_FREEZE_AUDIO \
     HUANYU_TRAIN_AUDIO_ENCODER HUANYU_TRAIN_AUDIO_PROJECTOR \
     HUANYU_AQA_AUDIO_TRAIN HUANYU_USE_PRECOMPUTE HUANYU_EMBED_CACHE_DIR MINICPMO_USE_PRECOMPUTE \
     MINICPMO_TUNE_AUDIO MINICPMO_TUNE_VISION Q36_BACKWARD_PREFETCH GENRM_DUMP_DIR; do

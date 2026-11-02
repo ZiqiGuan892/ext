@@ -176,10 +176,14 @@ def build_launch(root, case, project, mode, port=28889, served_model="qwen3.8", 
         "MINICPMO_MOE_TP_REFERENCE", "MINICPMO_ROW_TP_REFERENCE",
     ):
         env[key] = "0"
+    # Both launch paths use the same source selector as environment preparation.
+    native = (env.get("HUANYU_VLLM_SOURCE") or env.get("HUANYU_VLLM_OMNI_ROOT")
+              or "/opt/huawei/dataset/infra_data/code/vllm-omni-xy-qwen-vit")
+    env["HUANYU_VLLM_SOURCE"] = env["HUANYU_VLLM_OMNI_ROOT"] = native
     deploy = None
     if mode == "serve":
-        native = "/vllm-workspace/vllm-omni"
         old_paths = (
+            "/vllm-workspace/vllm-omni",
             "/opt/huawei/dataset/ccb_data/code/hufenyu/vllm-omni-xy",
             "/opt/huawei/dataset/ccb/data/code/hufenyu/vllm-omni-xy",
             "/opt/huawei/dataset/hfy_guiyang/vllm-omni-xy-qwen-vit",
@@ -235,6 +239,7 @@ def build_launch(root, case, project, mode, port=28889, served_model="qwen3.8", 
             command.extend(["--block-size", "128"])
         env["HUANYU_TEXT_AB_SERVE_LOG"] = str(root / "serve_console.log")
         shell = ('set -euo pipefail\n'
+                 'source "$PROJECT_ROOT/examples/qwen3_6_huanyu/native_source.sh"\n'
                  'source "$PROJECT_ROOT/examples/qwen3_6_huanyu/graph_mode.sh"\n'
                  'source "$PROJECT_ROOT/examples/qwen3_6_huanyu/precision_mode.sh"\n'
                  'exec > >(tee -a "$HUANYU_TEXT_AB_SERVE_LOG") 2>&1\n'

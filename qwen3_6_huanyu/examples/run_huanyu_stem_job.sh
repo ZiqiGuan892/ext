@@ -2,7 +2,7 @@
 # Run this SAME entry on every 16-NPU node. Only VC_TASK_INDEX=0 submits training.
 # TOTAL_NPUS=128 (8 nodes) or 256 (16 nodes); all devices serve Actor/rollout.
 # CPU math_dapo rule reward, no GenRM. Defaults: BS128, mini128, N16, 2K+10K.
-# Reuses the common job's vLLM-Omni backup/replacement, editable install, site
+# Reuses the common job's vLLM-Omni source selection, editable install, site
 # environment, native checks and Ray head/worker startup.
 # Extra Ray readiness probes default off; HUANYU_RAY_READINESS_CHECK=1 opts in.
 # Required: VC_TASK_INDEX=0..nodes-1, VC_WORKER_HOSTS=comma-separated host list.

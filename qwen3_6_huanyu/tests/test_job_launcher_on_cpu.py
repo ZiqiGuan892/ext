@@ -60,6 +60,9 @@ def record(kind, args, **extra):
         "LOCAL_RANK", "RANK", "WORLD_SIZE", "LOCAL_WORLD_SIZE", "GROUP_RANK",
         "GROUP_WORLD_SIZE", "ROLE_RANK", "ROLE_WORLD_SIZE", "TORCHELASTIC_RUN_ID",
     ) if key in os.environ}
+    item["native_env"] = {key: os.environ.get(key) for key in (
+        "HUANYU_VLLM_SOURCE", "HUANYU_VLLM_OMNI_ROOT", "PYTHONPATH",
+    )}
     with Path(os.environ["HUANYU_TEST_EVENTS"]).open("a", encoding="utf-8") as stream:
         stream.write(json.dumps(item) + "\\n")
 """
@@ -80,6 +83,16 @@ class HuanyuJobLauncherTests(unittest.TestCase):
         shutil.copyfile(LAUNCHER, self.entry)
         shutil.copyfile(EXAMPLES / "precision_mode.sh", self.examples / "precision_mode.sh")
         shutil.copyfile(EXAMPLES / "audio_train_mode.sh", self.examples / "audio_train_mode.sh")
+        shutil.copyfile(EXAMPLES / "native_source.sh", self.examples / "native_source.sh")
+        self.native_source = self.project / "fake vllm source"
+        for relative in (
+            "vllm_omni/__init__.py",
+            "vllm_omni/model_executor/models/minicpmo_5_0/huanyu_audio.py",
+            "vllm_omni/model_executor/models/minicpmo_5_0/minicpmo_5_0_omni_llm.py",
+        ):
+            target = self.native_source / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("# native fixture\n", encoding="utf-8")
         shutil.copyfile(EXAMPLES / "check_native_runtime.py", self.examples / "check_native_runtime.py")
         self.package = self.project / "verl_omni_ext/models/qwen3_6_huanyu"
         self.package.mkdir(parents=True)
@@ -149,20 +162,26 @@ command = sys.argv[1]
 record(command, sys.argv[2:])
 if command == "flock" and os.environ.get("HUANYU_TEST_LOCK_BUSY") == "1":
     raise SystemExit(1)
+if command == "ray" and "start" in sys.argv[2:]:
+    raise SystemExit(int(os.environ.get("HUANYU_TEST_RAY_START_EXIT", "0")))
 if command == "pgrep":
+    events = [json.loads(line) for line in Path(os.environ["HUANYU_TEST_EVENTS"]).read_text().splitlines()]
     if os.environ.get("HUANYU_TEST_RAY_LIVE") == "once":
-        events = Path(os.environ["HUANYU_TEST_EVENTS"]).read_text().splitlines()
-        calls = sum(json.loads(line)["kind"] == "pgrep" for line in events)
+        calls = sum(event["kind"] == "pgrep" for event in events)
         raise SystemExit(0 if calls == 1 else 1)
+    joined = any(e["kind"] == "ray" and "start" in e["args"] and "--head" not in e["args"] for e in events)
+    if joined:
+        # Simulate a live detached worker for one supervision cycle, then loss.
+        raise SystemExit(1 if any(e["kind"] == "sleep" for e in events) else 0)
     raise SystemExit(0 if os.environ.get("HUANYU_TEST_RAY_LIVE") == "1" else 1)
-if command not in ("ray", "git", "pip", "flock", "env-source"):
+if command not in ("ray", "git", "pip", "flock", "env-source", "sleep"):
     raise RuntimeError("Unexpected external command: " + command)
 """,
             encoding="utf-8",
         )
         self.bin = self.project / "bin"
         self.bin.mkdir()
-        for name in ("ray", "git", "pgrep", "flock"):
+        for name in ("ray", "git", "pgrep", "flock", "sleep"):
             self.write_executable(
                 name,
                 '#!/usr/bin/env bash\nexec "$HUANYU_TEST_PYTHON" '
@@ -306,6 +325,14 @@ if command not in ("ray", "git", "pip", "flock", "env-source"):
     def assert_success(self, result):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def assert_worker_supervised_until_exit(self, result):
+        # The fixture's raylet disappears after one sleep; a node job must
+        # stay alive after ray start returns, then surface that loss as failure.
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("worker launcher staying alive", result.stdout)
+        self.assertIn("worker raylet exited", result.stdout + result.stderr)
+        self.assertEqual([e["args"] for e in self.events("sleep")], [["30"]])
+
     def test_nonzero_local_ranks_skip_before_lock_and_all_setup(self):
         for rank in (1, 15):
             with self.subTest(rank=rank):
@@ -391,8 +418,8 @@ if command not in ("ray", "git", "pip", "flock", "env-source"):
         ray = self.events("ray")
         self.assertEqual(len(ray), 1)
         self.assertIn("--head", ray[0]["args"])
-        self.assertIn("--node-ip-address=192.0.2.10", ray[0]["args"])
-        self.assertNotIn("--block", ray[0]["args"])
+        self.assertEqual(ray[0]["args"], ["start", "--head", "--port=6925",
+                         "--dashboard-host=0.0.0.0", "--dashboard-port=8960", '--resources={"NPU": 16}'])
         waits = [event for event in self.events("helper") if event["args"][0] == "wait-cluster"]
         self.assertEqual(len(waits), 1)
         self.assertEqual(waits[0]["args"][-2:], ["--mode", "all"])
@@ -409,14 +436,13 @@ if command not in ("ray", "git", "pip", "flock", "env-source"):
             for event in self.events(kind):
                 self.assert_precision_defaults(event)
 
-    def test_worker_joins_head_with_block_and_never_runs_training(self):
+    def test_worker_uses_manual_start_command_and_keeps_job_alive(self):
         result = self.run_launcher({"VC_TASK_INDEX": "1"})
-        self.assert_success(result)
+        self.assert_worker_supervised_until_exit(result)
         ray = self.events("ray")
         self.assertEqual(len(ray), 1)
         self.assertIn("--address=192.0.2.10:6925", ray[0]["args"])
-        self.assertIn("--node-ip-address=192.0.2.11", ray[0]["args"])
-        self.assertIn("--block", ray[0]["args"])
+        self.assertEqual(ray[0]["args"], ["start", "--address=192.0.2.10:6925", '--resources={"NPU": 16}'])
         self.assertNotIn("--head", ray[0]["args"])
         self.assertTrue(any(event["args"][0] == "wait-head" for event in self.events("helper")))
         self.assertFalse(self.events("train"))
@@ -424,6 +450,16 @@ if command not in ("ray", "git", "pip", "flock", "env-source"):
         for kind in ("runtime", "ray"):
             for event in self.events(kind):
                 self.assert_precision_defaults(event)
+
+    def test_ray_start_failure_stops_head_and_worker_without_training_or_keepalive(self):
+        for rank in ("0", "1"):
+            with self.subTest(rank=rank):
+                result = self.run_launcher({"VC_TASK_INDEX": rank, "HUANYU_TEST_RAY_START_EXIT": "23"})
+                self.assertEqual(result.returncode, 23, result.stdout + result.stderr)
+                self.assertFalse(self.events("train"))
+                self.assertFalse(self.events("sleep"))
+                self.assertNotIn("worker launcher staying alive", result.stdout)
+                self.events_file.write_text("", encoding="utf-8")
 
     def test_stem_head_uses_all_128_cards_and_restores_profile_after_site_env(self):
         env_file = self.examples / "env_export_huanyu.sh"
@@ -472,12 +508,11 @@ if command not in ("ray", "git", "pip", "flock", "env-source"):
             "VC_WORKER_NUM": "16", "VC_TASK_INDEX": "15", "RM_ENABLE": "0",
             "VC_WORKER_HOSTS": ",".join(f"node-{i}" for i in range(16)),
         })
-        self.assert_success(result)
+        self.assert_worker_supervised_until_exit(result)
         self.assertFalse(self.events("train"))
         ray = self.events("ray")
         self.assertEqual(len(ray), 1)
-        self.assertIn("--node-ip-address=192.0.2.25", ray[0]["args"])
-        self.assertIn("--block", ray[0]["args"])
+        self.assertEqual(ray[0]["args"], ["start", "--address=192.0.2.10:6925", '--resources={"NPU": 16}'])
 
     def test_stem_invalid_topology_rejected_before_setup(self):
         base = {"HUANYU_JOB_MODE": "stem", "HUANYU_CLUSTER_NODES": "8", "NNODES": "8", "RM_ENABLE": "0",
@@ -604,7 +639,7 @@ if command not in ("ray", "git", "pip", "flock", "env-source"):
 
     def test_allocator_is_inherited_by_worker_probe_and_ray_start(self):
         result = self.run_launcher({"VC_TASK_INDEX": "1"})
-        self.assert_success(result)
+        self.assert_worker_supervised_until_exit(result)
         for kind in ("helper", "pip", "env-source", "runtime", "ray"):
             with self.subTest(kind=kind):
                 self.assertTrue(self.events(kind), kind)
@@ -793,12 +828,11 @@ if command not in ("ray", "git", "pip", "flock", "env-source"):
         }.items():
             self.assertEqual(capture["env"][key], expected)
 
-    def test_existing_ray_verifies_code_without_reinstalling_or_restarting(self):
+    def test_existing_ray_uses_source_without_copy_reinstall_or_restart(self):
         result = self.run_launcher({"HUANYU_TEST_RAY_LIVE": "1"})
         self.assert_success(result)
-        sync = [event for event in self.events("helper") if event["args"][0] == "sync"]
-        self.assertEqual(len(sync), 1)
-        self.assertIn("--ray-running", sync[0]["args"])
+        self.assertFalse(any(event["args"][0] == "sync" for event in self.events("helper")))
+        self.assertIn("existing workers keep their loaded code", result.stdout)
         self.assertFalse(self.events("pip"))
         self.assertFalse(self.events("git"))
         self.assertFalse(self.events("ray"))
@@ -806,6 +840,34 @@ if command not in ("ray", "git", "pip", "flock", "env-source"):
         self.assertTrue(any(
             event["args"][0] == "wait-cluster" for event in self.events("helper")
         ))
+
+    def test_selected_source_survives_old_site_environment(self):
+        with (self.examples / "env_export_huanyu.sh").open("a", encoding="utf-8") as stream:
+            stream.write(
+                'export HUANYU_VLLM_SOURCE=/obsolete/source\n'
+                'export HUANYU_VLLM_OMNI_ROOT=/vllm-workspace/vllm-omni\n'
+                'export PYTHONPATH=/vllm-workspace/vllm-omni:/preserved/dependency\n'
+            )
+        before = {str(p.relative_to(self.native_source)): p.read_bytes()
+                  for p in self.native_source.rglob("*.py")}
+        result = self.run_launcher()
+        self.assert_success(result)
+        self.assertFalse(any(e["args"][0] == "sync" for e in self.events("helper")))
+        for event in self.events("runtime") + self.events("ray") + self.events("train"):
+            for key in ("HUANYU_VLLM_SOURCE", "HUANYU_VLLM_OMNI_ROOT"):
+                self.assertEqual(Path(event["native_env"][key]).resolve(), self.native_source.resolve())
+            self.assertNotIn("/vllm-workspace/vllm-omni", event["native_env"]["PYTHONPATH"])
+            self.assertIn("preserved/dependency", event["native_env"]["PYTHONPATH"].replace("\\", "/"))
+        self.assertEqual(before, {str(p.relative_to(self.native_source)): p.read_bytes()
+                                  for p in self.native_source.rglob("*.py")})
+
+    def test_incomplete_selected_source_fails_before_install_or_ray(self):
+        (self.native_source / "vllm_omni/model_executor/models/minicpmo_5_0/huanyu_audio.py").unlink()
+        result = self.run_launcher()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("source is incomplete", result.stderr + result.stdout)
+        for kind in ("pip", "env-source", "runtime", "ray", "train"):
+            self.assertFalse(self.events(kind), kind)
 
     def test_existing_worker_checks_membership_and_never_runs_training(self):
         result = self.run_launcher({

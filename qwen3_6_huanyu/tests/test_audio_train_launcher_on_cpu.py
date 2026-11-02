@@ -150,6 +150,7 @@ class AudioTrainingLauncherTests(unittest.TestCase):
             "precision_mode.sh",
             "graph_mode.sh",
             "audio_train_mode.sh",
+            "native_source.sh",
         ):
             shutil.copyfile(EXAMPLES / name, self.examples / name)
         self.model = self.project / "verl_omni_ext" / "models" / "qwen3_6_huanyu"
@@ -197,6 +198,7 @@ class AudioTrainingLauncherTests(unittest.TestCase):
             if key.startswith(("HUANYU_", "MINICPMO_", "ROLLOUT_", "PPO_", "DEBUG_")):
                 self.env.pop(key)
         self.env.update(
+            HUANYU_VLLM_SOURCE=shell_path(self.project / "native source"),
             PROJECT_ROOT=shell_path(self.project),
             TRAIN_FILE=shell_path(self.train),
             VAL_FILE=shell_path(self.validation),
@@ -215,6 +217,14 @@ class AudioTrainingLauncherTests(unittest.TestCase):
             ENABLE_THINKING="1",
             TOTAL_TRAINING_STEPS="2",
         )
+        for relative in (
+            "vllm_omni/__init__.py",
+            "vllm_omni/model_executor/models/minicpmo_5_0/huanyu_audio.py",
+            "vllm_omni/model_executor/models/minicpmo_5_0/minicpmo_5_0_omni_llm.py",
+        ):
+            target = self.project / "native source" / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("# native fixture\n", encoding="utf-8")
 
     def run_script(self, updates=None, arguments=(), entry="run_huanyu_aqa_audio_train.sh"):
         env = dict(self.env, **(updates or {}))
@@ -236,6 +246,10 @@ class AudioTrainingLauncherTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         capture = json.loads(self.capture.read_text())
         actual = dict(item.lstrip("+").split("=", 1) for item in capture["argv"])
+        for key in ("HUANYU_VLLM_SOURCE", "HUANYU_VLLM_OMNI_ROOT"):
+            self.assertEqual(Path(capture["env"][key]).resolve(), (self.project / "native source").resolve())
+            self.assertEqual(json.loads(actual["ray_kwargs.ray_init.runtime_env.env_vars." + key]),
+                             capture["env"][key])
         self.assertEqual(actual["actor_rollout_ref.model.override_config.huanyu_freeze_audio"], "false")
         self.assertEqual(actual["actor_rollout_ref.actor.use_dynamic_bsz"], "true")
         self.assertEqual(actual["actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu"], "1")

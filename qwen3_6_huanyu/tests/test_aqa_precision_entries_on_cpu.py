@@ -183,11 +183,11 @@ class AqaPrecisionEntryTests(unittest.TestCase):
     def test_common_job_worker_only_joins_ray_with_requested_precision(self):
         config = self.use_job()
         result = self.fixture.run_launcher(dict(config, VC_TASK_INDEX="1"))
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.fixture.assert_worker_supervised_until_exit(result)
         self.assertFalse(self.fixture.events("train"))
         ray = self.fixture.events("ray")
         self.assertEqual(len(ray), 1)
-        self.assertIn("--block", ray[0]["args"])
+        self.assertEqual(ray[0]["args"], ["start", "--address=192.0.2.10:6925", '--resources={"NPU": 16}'])
         self.aqa.assert_precision_environment(ray[0]["env"])
         self.assertEqual(ray[0]["env"]["MAX_PROMPT_LENGTH"], "14336")
         self.assertEqual(ray[0]["env"]["HUANYU_GRAPH_MODE"], "0")

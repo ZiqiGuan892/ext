@@ -253,12 +253,12 @@ class AqaJobLauncherTests(unittest.TestCase):
             encoding="utf-8",
         )
         result = self.fixture.run_launcher({"VC_TASK_INDEX": "1"})
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.fixture.assert_worker_supervised_until_exit(result)
         self.assertFalse(self.fixture.events("train"))
         ray = self.fixture.events("ray")
         self.assertEqual(len(ray), 1)
         self.assertIn("--address=192.0.2.10:6925", ray[0]["args"])
-        self.assertIn("--block", ray[0]["args"])
+        self.assertEqual(ray[0]["args"], ["start", "--address=192.0.2.10:6925", '--resources={"NPU": 16}'])
         self.assertNotIn("--head", ray[0]["args"])
         self.assert_online_environment(ray[0]["env"])
         self.assert_precision_environment(ray[0]["env"])
@@ -340,11 +340,11 @@ class AqaJobLauncherTests(unittest.TestCase):
             with self.subTest(encoder=encoder, projector=projector):
                 mode = {"HUANYU_TRAIN_AUDIO_ENCODER": encoder, "HUANYU_TRAIN_AUDIO_PROJECTOR": projector}
                 result = self.fixture.run_launcher(dict(mode, VC_TASK_INDEX="1"))
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.fixture.assert_worker_supervised_until_exit(result)
                 self.assertFalse(self.fixture.events("train"))
                 ray = self.fixture.events("ray")
                 self.assertEqual(len(ray), 1)
-                self.assertIn("--block", ray[0]["args"])
+                self.assertEqual(ray[0]["args"], ["start", "--address=192.0.2.10:6925", '--resources={"NPU": 16}'])
                 for event in ray + self.fixture.events("runtime"):
                     for key, value in mode.items():
                         self.assertEqual(event["env"][key], value, key)

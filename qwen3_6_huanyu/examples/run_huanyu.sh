@@ -10,7 +10,7 @@ source "${_HUANYU_EXAMPLE_DIR}/run_output.sh" || exit $?
 
 # The driver and NEW Ray workers must import the same Huanyu-enabled checkout.
 # Exporting PYTHONPATH only in this shell does not establish the Ray job's env.
-export HUANYU_VLLM_OMNI_ROOT=/vllm-workspace/vllm-omni
+source "${_HUANYU_EXAMPLE_DIR}/native_source.sh" || exit $?
 _huanyu_retained_path=""
 IFS=: read -r -a _huanyu_path_entries <<< "${PYTHONPATH:-}"
 for _huanyu_path in "${_huanyu_path_entries[@]}"; do
@@ -29,6 +29,7 @@ export PYTHONPATH="${HUANYU_VLLM_OMNI_ROOT}:${PWD}${_huanyu_retained_path:+:${_h
 python3 -B "${_HUANYU_EXAMPLE_DIR}/check_native_runtime.py" --check
 # JSON quotes are passed as part of ONE argv element for Hydra to parse; no eval.
 _huanyu_ray_pythonpath="$(python3 -c 'import json, os; print(json.dumps(os.environ["PYTHONPATH"]))')"
+_huanyu_ray_native_root="$(python3 -c 'import json, os; print(json.dumps(os.environ["HUANYU_VLLM_OMNI_ROOT"]))')"
 
 export MODEL_PATH="${MODEL_PATH:-/opt/huawei/dataset/model_gy/downloaded_models/Qwen3.6-35B-A3B-huanyu06b-iter2000-omni4b-hf-huanyu7tokens}"
 export TRAIN_FILE="${TRAIN_FILE:-/opt/huawei/dataset/infra_data/data/train.parquet}"
@@ -59,4 +60,5 @@ exec bash "${PROJECT_ROOT}/examples/qwen3_6_huanyu/$_HUANYU_BACKEND" \
     data.custom_cls.name=Qwen36HuanyuOmniRLHFDataset \
     ++actor_rollout_ref.rollout.engine_kwargs.vllm_omni.pipeline_name=qwen3_6_huanyu \
     "++ray_kwargs.ray_init.runtime_env.env_vars.PYTHONPATH=${_huanyu_ray_pythonpath}" \
-    "++ray_kwargs.ray_init.runtime_env.env_vars.HUANYU_VLLM_OMNI_ROOT=${HUANYU_VLLM_OMNI_ROOT}"
+    "++ray_kwargs.ray_init.runtime_env.env_vars.HUANYU_VLLM_OMNI_ROOT=${_huanyu_ray_native_root}" \
+    "++ray_kwargs.ray_init.runtime_env.env_vars.HUANYU_VLLM_SOURCE=${_huanyu_ray_native_root}"

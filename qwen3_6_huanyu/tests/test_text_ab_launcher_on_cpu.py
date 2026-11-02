@@ -430,14 +430,26 @@ class TextABLauncherTests(unittest.TestCase):
         self.assertEqual(hydra_options(rollout)["actor_rollout_ref.rollout.engine_kwargs.vllm_omni.async_scheduling"], "false")
 
     def test_serve_pythonpath_prefers_native_and_retains_unrelated_entries(self):
-        native = "/vllm-workspace/vllm-omni"
-        stale = "/opt/huawei/dataset/infra_data/code/vllm-omni-xy-qwen-vit"
+        native = "/opt/huawei/dataset/infra_data/code/vllm-omni-xy-qwen-vit"
+        stale = "/vllm-workspace/vllm-omni"
         with patch.dict(os.environ, {"PYTHONPATH": os.pathsep.join((stale, str(self.project), native, "/extra/lib"))}):
             entries = self.plan("serve")["env"]["PYTHONPATH"].split(os.pathsep)
         self.assertEqual(entries[:2], [native, str(self.project)])
         self.assertNotIn(stale, entries)
         self.assertEqual(entries.count(native), 1)
         self.assertIn("/extra/lib", entries)
+
+    def test_both_launch_modes_honor_custom_source_over_stale_root(self):
+        selected = "/shared/custom native source"
+        with patch.dict(os.environ, {"HUANYU_VLLM_SOURCE": selected,
+                                     "HUANYU_VLLM_OMNI_ROOT": "/vllm-workspace/vllm-omni"}):
+            for side in ("serve", "rollout"):
+                plan = self.plan(side)
+                self.assertEqual(plan["env"]["HUANYU_VLLM_SOURCE"], selected)
+                self.assertEqual(plan["env"]["HUANYU_VLLM_OMNI_ROOT"], selected)
+                if side == "serve":
+                    self.assertEqual(plan["env"]["PYTHONPATH"].split(os.pathsep)[0], selected)
+                    self.assertIn("native_source.sh", plan["argv"][2])
 
     def test_invalid_sampling_context_or_topology_is_rejected_before_launch(self):
         for section, key, value in (("sampling", "temperature", 0.8), ("sampling", "n", 4),

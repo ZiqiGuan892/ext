@@ -141,6 +141,13 @@ class StemMultinodeJobTests(unittest.TestCase):
         self.assertEqual(json.loads(actual[_aqa.ENV_PREFIX + "MINICPMO_HUANYU_ROLLOUT_TP"]), str(tp))
         self.assertEqual(actual["actor_rollout_ref.rollout.ignore_eos"].lower(), ignore_eos)
         self.assertEqual(capture["env"]["HUANYU_USE_PRECOMPUTE"], "0")
+        for key in ("HUANYU_VLLM_SOURCE", "HUANYU_VLLM_OMNI_ROOT"):
+            self.assertEqual(Path(capture["env"][key]).resolve(), self.fixture.native_source.resolve())
+            # Hydra values remain quoted, including source paths with spaces.
+            self.assertEqual(json.loads(actual[_aqa.ENV_PREFIX + key]).replace("\\", "/"),
+                             capture["env"][key].replace("\\", "/"))
+        self.assertNotIn("/vllm-workspace/vllm-omni",
+                         json.loads(actual[_aqa.ENV_PREFIX + "PYTHONPATH"]))
 
     def test_128_cards_rule_reward_and_final_batch_lengths(self):
         capture, actual = self.launch({"HUANYU_TEST_FAIL_WAIT": "wait-cluster"})
@@ -270,12 +277,11 @@ class StemMultinodeJobTests(unittest.TestCase):
                     "VC_TASK_INDEX": str(rank), "LOCAL_RANK": "0",
                     "RANK": str(rank * 16), "WORLD_SIZE": str(total), "LOCAL_WORLD_SIZE": "16",
                 })
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.fixture.assert_worker_supervised_until_exit(result)
                 self.assertFalse(self.fixture.events("train"))
                 rays = self.fixture.events("ray")
                 self.assertEqual(len(rays), 1)
-                self.assertIn("--block", rays[0]["args"])
-                self.assertIn("--node-ip-address=192.0.2.%d" % (10 + rank), rays[0]["args"])
+                self.assertEqual(rays[0]["args"], ["start", "--address=192.0.2.10:6925", '--resources={"NPU": 16}'])
                 self.assertNotIn("--head", rays[0]["args"])
                 self.assertEqual(rays[0]["env"]["HUANYU_STEM_TEXT_TRAIN"], "1")
                 self.fixture.events_file.write_text("", encoding="utf-8")
