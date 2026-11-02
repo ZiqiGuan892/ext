@@ -239,7 +239,7 @@ source "$PROJECT_ROOT/examples/qwen3_6_huanyu/prepare_huanyu_env.sh" --start-ray
 
 以默认端口为例，主节点执行 `ray start --head --port=6925 --dashboard-host=0.0.0.0 --dashboard-port=8960 --resources='{"NPU": 16}'`。从节点等主节点端口可连接后执行 `ray start --address="${VC_WORKER_HOSTS%%,*}:6925" --resources='{"NPU": 16}'`（脚本会先把主机名解析为 IPv4）。端口分别可通过 `RAY_PORT` 和 `RAY_DASHBOARD_PORT` 设置。若检测到本地已有 raylet，直接检查它在目标集群的注册。
 
-检查使用 Ray State API，经指定的 GCS 地址查询 ALIVE 节点及其注册的 NPU 总数。主节点要求节点 IP 集合与清单一致、每节点恰好 16 张 NPU，从节点只等待自身 IP 注册 16 张。默认每 5 秒轮询，单个等待阶段最多 900 秒，可设置 `RAY_CLUSTER_POLL_INTERVAL` 和 `RAY_CLUSTER_WAIT_TIMEOUT`。所有节点需能访问主节点的 Ray Dashboard。成功后主节点日志有 `[huanyu-env] RAY_READY mode=all`，从节点有 `mode=local`。此时可在主节点运行训练；激活环境已包含正确的 `RAY_ADDRESS`。检查失败时，本次 prepare 返回非零，已启动的 Ray 保留供排查。
+prepare 直接向主节点的 GCS 查询 ALIVE 节点和各节点注册的 NPU 总数。即使 Dashboard 无法启动，也能完成检查。主节点核对清单中的每个 IP 恰好注册一次、每节点恰好 16 张 NPU。从节点只等待自身 IP 注册 16 张。默认每 5 秒轮询，单个等待阶段最多 900 秒，可设置 `RAY_CLUSTER_POLL_INTERVAL` 和 `RAY_CLUSTER_WAIT_TIMEOUT`。成功后主节点日志有 `[huanyu-env] RAY_READY mode=all`，从节点有 `mode=local`。此时可在主节点运行训练，激活环境已包含本次集群的 `RAY_ADDRESS`。检查超时会返回非零，已启动的 Ray 保留供排查。
 
 AQA在线训练将上面模式与组件配置改为下例；准备完成后使用对应普通训练入口：
 

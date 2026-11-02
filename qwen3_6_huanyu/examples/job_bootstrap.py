@@ -226,24 +226,28 @@ def wait_head(address, timeout, interval):
             time.sleep(interval)
 
 
-def wait_cluster_state(address, expected_ips, local_ip, mode, timeout, interval):
-    """Verify prepared nodes against the selected GCS without registering a driver."""
-    from ray.util.state import list_nodes
-    from ray.util.state.exception import RayStateApiException
+def wait_cluster_gcs(address, expected_ips, local_ip, mode, timeout, interval):
+    """Read live registrations directly from GCS, including on headless clusters."""
+    from ray._raylet import GcsClient
+    from ray.exceptions import RayError
 
     deadline = time.monotonic() + timeout
     required = {ip: 16 for ip in (expected_ips if mode == "all" else [local_ip])}
-    print(f"[huanyu-env] checking Ray address={address} mode={mode} expected_NPU={required}", flush=True)
+    print(f"[huanyu-env] checking Ray via GCS address={address} mode={mode} expected_NPU={required}", flush=True)
+    client = None
     while True:
         try:
-            nodes = list_nodes(address=address, filters=[("state", "=", "ALIVE")],
-                               detail=True, timeout=min(timeout, 15))
-        except (RayStateApiException, ConnectionError, ValueError) as exc:
-            print(f"[huanyu-env] waiting for Ray State API at {address}: {exc}", flush=True)
+            if client is None:
+                client = GcsClient(address=address)
+            nodes = client.get_all_node_info(timeout=min(timeout, 15))
+        except (RayError, OSError) as exc:
+            client = None
+            print(f"[huanyu-env] waiting for GCS at {address}: {exc}", flush=True)
         else:
-            live = {node.node_ip: node.resources_total.get("NPU", 0) for node in nodes}
-            observed = live if mode == "all" else {local_ip: live.get(local_ip)}
-            if observed == required:
+            live = [(node.node_manager_address, node.resources_total.get("NPU", 0))
+                    for node in nodes.values() if node.state == node.ALIVE]
+            observed = live if mode == "all" else [entry for entry in live if entry[0] == local_ip]
+            if sorted(observed) == sorted(required.items()):
                 print(f"[huanyu-env] RAY_READY mode={mode} address={address} "
                       f"nodes={len(required)} total_NPU={sum(required.values())} live_NPU={live}", flush=True)
                 return
@@ -292,7 +296,7 @@ def main():
         wait.add_argument("--timeout", type=int, required=True)
         wait.add_argument("--interval", type=int, default=5)
         if command == "wait-cluster":
-            wait.add_argument("--state-api", action="store_true", help="query node registrations without a Ray driver")
+            wait.add_argument("--gcs", "--state-api", action="store_true", help="query node registrations directly from GCS")
             wait.add_argument("--expected-ips", required=True)
             wait.add_argument("--local-ip", required=True)
             wait.add_argument("--mode", choices=("all", "local"), required=True)
@@ -312,7 +316,7 @@ def main():
     elif args.command == "wait-head":
         wait_head(args.address, args.timeout, args.interval)
     else:
-        check = wait_cluster_state if args.state_api else wait_cluster
+        check = wait_cluster_gcs if args.gcs else wait_cluster
         check(args.address, args.expected_ips.split(","), args.local_ip,
               args.mode, args.timeout, args.interval)
 

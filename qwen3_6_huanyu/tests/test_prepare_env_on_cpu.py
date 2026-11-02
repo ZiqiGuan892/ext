@@ -217,7 +217,7 @@ exit "$prepare_status"
         ])
         check = self.fixture.events("helper")[-1]["args"]
         self.assertEqual(check[0], "wait-cluster")
-        self.assertIn("--state-api", check)
+        self.assertIn("--gcs", check)
         self.assertEqual(check[check.index("--mode") + 1], "all")
         self.assertEqual(check[check.index("--expected-ips") + 1], "192.0.2.10,192.0.2.11")
         self.assertEqual(self.prepared()["env"]["RAY_ADDRESS"], "192.0.2.10:6925")
@@ -234,7 +234,7 @@ exit "$prepare_status"
         ])
         operations = [e["args"] for e in self.fixture.events("helper")]
         self.assertEqual([args[0] for args in operations][-2:], ["wait-head", "wait-cluster"])
-        self.assertIn("--state-api", operations[-1])
+        self.assertIn("--gcs", operations[-1])
         self.assertEqual(operations[-1][operations[-1].index("--mode") + 1], "local")
         self.assertEqual(operations[-1][operations[-1].index("--local-ip") + 1], "192.0.2.11")
         self.assertTrue(self.activation_files())

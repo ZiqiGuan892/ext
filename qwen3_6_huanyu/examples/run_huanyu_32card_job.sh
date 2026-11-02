@@ -475,7 +475,7 @@ echo '[huanyu-job] native import check exited successfully'
 wait_for_cluster() {
     local -a options=()
     if (( _PREPARE_RAY )); then
-        options+=(--state-api)
+        options+=(--gcs)
     elif [[ "$_RAY_READINESS_CHECK" == 0 ]]; then
         echo "[huanyu-job] Ray readiness probe disabled (HUANYU_RAY_READINESS_CHECK=0 mode=$1); no extra ray.init, membership/resources not verified"
         return 0

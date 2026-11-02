@@ -285,35 +285,42 @@ def node(ip, npu=16, alive=True):
 
 
 class ReadinessTests(unittest.TestCase):
-    def test_prepare_state_probe_waits_for_requested_hosts_and_per_node_capacity(self):
+    def test_prepare_checks_gcs_membership_and_capacity_without_dashboard(self):
         head, worker = "10.0.0.1", "10.0.0.2"
 
-        def registered(ip, npu):
-            return SimpleNamespace(node_ip=ip, resources_total={"NPU": npu})
+        def registered(ip, npu=16, state=0):
+            return SimpleNamespace(node_manager_address=ip, resources_total={"NPU": npu}, state=state, ALIVE=0)
 
-        list_nodes = Mock(side_effect=[
-            ConnectionError("dashboard starting"),
-            [registered(head, 16), registered("10.0.0.3", 16)],
-            [registered(head, 17), registered(worker, 15)],
-            [registered(head, 16), registered(worker, 16)],
-        ])
-        modules = {"ray.util.state": SimpleNamespace(list_nodes=list_nodes),
-                   "ray.util.state.exception": SimpleNamespace(RayStateApiException=RuntimeError)}
+        client = Mock()
+        client.get_all_node_info.side_effect = [
+            ConnectionError("GCS still starting"),
+            {1: registered(head), 2: registered("10.0.0.3")},
+            {1: registered(head, 17), 2: registered(worker, 15)},
+            {1: registered(head), 2: registered(worker, state=1)},
+            {1: registered(head), 2: registered(worker), 3: registered(worker)},
+            {1: registered(head), 2: registered(worker), 3: registered(worker, state=1)},
+        ]
+        factory = Mock(return_value=client)
+        modules = {"ray._raylet": SimpleNamespace(GcsClient=factory),
+                   "ray.exceptions": SimpleNamespace(RayError=RuntimeError),
+                   "ray.util.state": None}
         with patch.dict("sys.modules", modules), patch.object(bootstrap.time, "sleep") as sleep:
-            bootstrap.wait_cluster_state(f"{head}:6925", [head, worker], head, "all", 30, 1)
-        self.assertEqual(sleep.call_count, 3)
-        list_nodes.assert_called_with(address=f"{head}:6925", detail=True,
-                                      filters=[("state", "=", "ALIVE")], timeout=15)
+            bootstrap.wait_cluster_gcs(f"{head}:6925", [head, worker], head, "all", 30, 1)
+        self.assertEqual(sleep.call_count, 5)
+        factory.assert_called_with(address=f"{head}:6925")
+        client.get_all_node_info.assert_called_with(timeout=15)
 
-        list_nodes.side_effect = [[], [registered(worker, 16)]]
+        client.get_all_node_info.side_effect = [
+            {1: registered(head)}, {1: registered(head), 2: registered(worker)},
+        ]
         with patch.dict("sys.modules", modules), patch.object(bootstrap.time, "sleep") as sleep:
-            bootstrap.wait_cluster_state(f"{head}:6925", [head, worker], worker, "local", 30, 1)
+            bootstrap.wait_cluster_gcs(f"{head}:6925", [head, worker], worker, "local", 30, 1)
         self.assertEqual(sleep.call_count, 1)
 
-        list_nodes.side_effect = [[registered(head, 16)]]
+        client.get_all_node_info.side_effect = [{1: registered(head)}]
         with patch.dict("sys.modules", modules), patch.object(bootstrap.time, "monotonic", side_effect=[0, 2]):
             with self.assertRaisesRegex(TimeoutError, worker):
-                bootstrap.wait_cluster_state(f"{head}:6925", [head, worker], worker, "local", 1, 1)
+                bootstrap.wait_cluster_gcs(f"{head}:6925", [head, worker], worker, "local", 1, 1)
 
     def test_sixteen_nodes_all_required_even_when_total_capacity_is_sufficient(self):
         ips = [f"10.0.0.{i}" for i in range(1, 17)]
