@@ -70,7 +70,7 @@ def write_activation(snapshot_path, output, stack_limit):
     project = current["PROJECT_ROOT"]
     lines = [
         "#!/usr/bin/env bash",
-        "# Generated on this node. Source before starting Ray; no Ray or training is launched.",
+        "# Generated on this node. Sourcing only applies the prepared environment.",
         f"cd -- {shlex.quote(project)} || return $?",
         f"ulimit -S -s {stack_limit} || return $?",
     ]
@@ -83,7 +83,7 @@ def write_activation(snapshot_path, output, stack_limit):
             lines.append(f"export {key}={shlex.quote(value)} || return $?")
     lines += [
         f"export HUANYU_PREPARED_ENV_FILE={shlex.quote(str(output))} || return $?",
-        "echo '[huanyu-env] environment activated; Ray and training must be started separately'",
+        "echo '[huanyu-env] environment activated'",
     ]
     output = Path(output)
     descriptor, temporary = tempfile.mkstemp(prefix=".activate-", dir=output.parent)

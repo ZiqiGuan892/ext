@@ -48,7 +48,7 @@ class HuanyuPrepareEnvironmentTests(unittest.TestCase):
         for key in ("VC_TASK_INDEX", "VC_WORKER_HOSTS", "VC_WORKER_NUM"):
             fixture.env.pop(key, None)
 
-    def run_prepare(self, updates=None, *, sourced=True, prefix=""):
+    def run_prepare(self, updates=None, *, sourced=True, prefix="", arguments=()):
         env = dict(self.fixture.env)
         for key, value in (updates or {}).items():
             if value is None:
@@ -61,7 +61,7 @@ class HuanyuPrepareEnvironmentTests(unittest.TestCase):
 set +e +u +x
 set -o pipefail
 export HUANYU_TEST_OPTIONS_BEFORE="$-"
-if source "$HUANYU_TEST_PREPARE_ENTRY"; then
+if source "$HUANYU_TEST_PREPARE_ENTRY" "$@"; then
     prepare_status=0
 else
     prepare_status=$?
@@ -72,9 +72,9 @@ export HUANYU_TEST_PREPARE_STATUS="$prepare_status"
 exit "$prepare_status"
 """
         else:
-            body += 'exec bash "$HUANYU_TEST_PREPARE_ENTRY"\n'
+            body += 'exec bash "$HUANYU_TEST_PREPARE_ENTRY" "$@"\n'
         return subprocess.run(
-            [job_fixture.find_bash(), "--noprofile", "--norc", "-c", body],
+            [job_fixture.find_bash(), "--noprofile", "--norc", "-c", body, "prepare-test", *arguments],
             cwd=self.fixture.project.parent,
             env=env,
             capture_output=True,
@@ -202,6 +202,53 @@ exit "$prepare_status"
         self.assertIn("activate.sh", result.stdout)
         self.assertFalse(self.capture.exists())
         self.assertEqual(len(self.activation_files()), 1)
+
+    def test_stem_prepare_starts_head_and_checks_all_nodes_before_activation(self):
+        self.use_stem_entry()
+        result = self.run_prepare(
+            {"TOTAL_NPUS": "32", "VC_TASK_INDEX": "0", "VC_WORKER_HOSTS": "head,worker",
+             "RAY_ADDRESS": "auto", "HUANYU_RAY_READINESS_CHECK": "0"},
+            arguments=("--start-ray",),
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual([e["args"] for e in self.fixture.events("ray")], [
+            ["start", "--head", "--port=6925", "--dashboard-host=0.0.0.0",
+             "--dashboard-port=8960", '--resources={"NPU": 16}'],
+        ])
+        check = self.fixture.events("helper")[-1]["args"]
+        self.assertEqual(check[0], "wait-cluster")
+        self.assertIn("--state-api", check)
+        self.assertEqual(check[check.index("--mode") + 1], "all")
+        self.assertEqual(check[check.index("--expected-ips") + 1], "192.0.2.10,192.0.2.11")
+        self.assertEqual(self.prepared()["env"]["RAY_ADDRESS"], "192.0.2.10:6925")
+        self.assertFalse(self.fixture.events("train"))
+
+    def test_prepare_worker_checks_its_own_registration_and_returns(self):
+        result = self.run_prepare(
+            {"VC_TASK_INDEX": "1", "VC_WORKER_HOSTS": "head,worker", "RAY_PORT": "7001"},
+            arguments=("--start-ray",), sourced=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual([e["args"] for e in self.fixture.events("ray")], [
+            ["start", "--address=192.0.2.10:7001", '--resources={"NPU": 16}'],
+        ])
+        operations = [e["args"] for e in self.fixture.events("helper")]
+        self.assertEqual([args[0] for args in operations][-2:], ["wait-head", "wait-cluster"])
+        self.assertIn("--state-api", operations[-1])
+        self.assertEqual(operations[-1][operations[-1].index("--mode") + 1], "local")
+        self.assertEqual(operations[-1][operations[-1].index("--local-ip") + 1], "192.0.2.11")
+        self.assertTrue(self.activation_files())
+        self.assertFalse(self.fixture.events("train"))
+
+    def test_existing_ray_must_pass_check_before_activation(self):
+        result = self.run_prepare(
+            {"VC_TASK_INDEX": "1", "VC_WORKER_HOSTS": "head,worker", "HUANYU_TEST_RAY_LIVE": "1",
+             "HUANYU_TEST_FAIL_WAIT": "wait-cluster"}, arguments=("--start-ray",),
+        )
+        self.assertEqual(result.returncode, 19, result.stdout + result.stderr)
+        self.assertFalse(self.fixture.events("ray"))
+        self.assertFalse(self.activation_files())
+        self.assertFalse(self.fixture.events("train"))
 
     def test_bash_activation_replays_temporary_managed_environment(self):
         expected = {

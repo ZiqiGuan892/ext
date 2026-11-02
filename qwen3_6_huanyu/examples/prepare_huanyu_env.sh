@@ -1,10 +1,21 @@
 #!/usr/bin/env bash
-# Run/source on EACH node before manually starting Ray. Reuse the job's setup
-# in an isolated shell so env_export's set -ex cannot alter the caller's shell.
+# Run/source on EACH node. Pass --start-ray to start and verify the cluster.
+# With Ray enabled, set VC_TASK_INDEX and the same ordered VC_WORKER_HOSTS
+# on every node. Rank 0 waits for all nodes; start the scripts concurrently.
+# Usage: source prepare_huanyu_env.sh [--stem] [--start-ray]
+# Run the job's setup in an isolated shell so env_export's set -ex cannot alter the caller's shell.
 # source applies the resulting environment; bash prints an activation command.
 huanyu_prepare_environment() {
     local mode="${HUANYU_JOB_MODE:-frozen_cache}" setup_entry=run_huanyu_32card_job.sh
-    if [[ "${1:-}" == --stem ]]; then mode=stem; shift; fi
+    local start_ray=0 arg
+    local -a setup_args=()
+    for arg in "$@"; do
+        case "$arg" in
+            --stem) mode=stem ;;
+            --start-ray) start_ray=1 ;;
+            *) setup_args+=("$arg") ;;
+        esac
+    done
     local project="${PROJECT_ROOT:-/opt/huawei/dataset/infra_data/verl_omni_qwen36_gzq_new}"
     if [[ "$mode" == stem ]]; then
         setup_entry=run_huanyu_stem_job.sh
@@ -35,11 +46,11 @@ huanyu_prepare_environment() {
     python3 -S "$examples/prepared_env.py" snapshot "$snapshot" || return $?
     echo "[huanyu-env] preparing mode=$mode log=$run_dir/prepare.log"
     # A fresh bash retains strict error handling even when this sourced function
-    # is called in an if/|| expression. No Ray/engine processes are launched.
+    # is called in an if/|| expression.
     if PROJECT_ROOT="$project" HUANYU_JOB_MODE="$mode" HUANYU_PREPARE_ONLY=1 \
         HUANYU_PREPARE_SNAPSHOT="$snapshot" HUANYU_PREPARE_LOG_DIR="$run_dir" \
-        HUANYU_PREPARED_ENV_FILE="$activation" \
-        bash "$examples/$setup_entry" "$@" \
+        HUANYU_PREPARED_ENV_FILE="$activation" HUANYU_PREPARE_START_RAY="$start_ray" \
+        bash "$examples/$setup_entry" "${setup_args[@]}" \
         > >(tee -a "$run_dir/prepare.log") 2>&1; then
         [[ -s "$activation" ]] || {
             echo '[huanyu-env] FATAL: setup returned without an activation file' >&2
@@ -53,8 +64,7 @@ huanyu_prepare_environment() {
     if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
         source "$activation" || return $?
     else
-        echo '[huanyu-env] preparation complete. Apply the environment in this node'
-        echo '[huanyu-env] before manually starting Ray and an ordinary training entry:'
+        echo '[huanyu-env] preparation complete. Apply the environment on this node:'
         printf 'source %q\n' "$activation"
     fi
 }

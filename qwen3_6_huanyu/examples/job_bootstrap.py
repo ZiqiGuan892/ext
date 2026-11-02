@@ -1,4 +1,4 @@
-"""File preparation and bounded Ray readiness checks for the two-node launcher.
+"""File preparation and bounded Ray readiness checks for the Huanyu launchers.
 
 Run this file directly: preparation must not import the ext plugin or load NPU
 libraries before the selected vLLM-Omni checkout and environment are ready.
@@ -226,6 +226,34 @@ def wait_head(address, timeout, interval):
             time.sleep(interval)
 
 
+def wait_cluster_state(address, expected_ips, local_ip, mode, timeout, interval):
+    """Verify prepared nodes against the selected GCS without registering a driver."""
+    from ray.util.state import list_nodes
+    from ray.util.state.exception import RayStateApiException
+
+    deadline = time.monotonic() + timeout
+    required = {ip: 16 for ip in (expected_ips if mode == "all" else [local_ip])}
+    print(f"[huanyu-env] checking Ray address={address} mode={mode} expected_NPU={required}", flush=True)
+    while True:
+        try:
+            nodes = list_nodes(address=address, filters=[("state", "=", "ALIVE")],
+                               detail=True, timeout=min(timeout, 15))
+        except (RayStateApiException, ConnectionError, ValueError) as exc:
+            print(f"[huanyu-env] waiting for Ray State API at {address}: {exc}", flush=True)
+        else:
+            live = {node.node_ip: node.resources_total.get("NPU", 0) for node in nodes}
+            observed = live if mode == "all" else {local_ip: live.get(local_ip)}
+            if observed == required:
+                print(f"[huanyu-env] RAY_READY mode={mode} address={address} "
+                      f"nodes={len(required)} total_NPU={sum(required.values())} live_NPU={live}", flush=True)
+                return
+            print(f"[huanyu-env] waiting for nodes: live_NPU={live} expected_NPU={required}", flush=True)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"Ray at {address} did not report expected_NPU={required}")
+        time.sleep(min(interval, remaining))
+
+
 def wait_cluster(address, expected_ips, local_ip, mode, timeout, interval):
     import ray
 
@@ -264,6 +292,7 @@ def main():
         wait.add_argument("--timeout", type=int, required=True)
         wait.add_argument("--interval", type=int, default=5)
         if command == "wait-cluster":
+            wait.add_argument("--state-api", action="store_true", help="query node registrations without a Ray driver")
             wait.add_argument("--expected-ips", required=True)
             wait.add_argument("--local-ip", required=True)
             wait.add_argument("--mode", choices=("all", "local"), required=True)
@@ -283,8 +312,9 @@ def main():
     elif args.command == "wait-head":
         wait_head(args.address, args.timeout, args.interval)
     else:
-        wait_cluster(args.address, args.expected_ips.split(","), args.local_ip,
-                     args.mode, args.timeout, args.interval)
+        check = wait_cluster_state if args.state_api else wait_cluster
+        check(args.address, args.expected_ips.split(","), args.local_ip,
+              args.mode, args.timeout, args.interval)
 
 
 if __name__ == "__main__":

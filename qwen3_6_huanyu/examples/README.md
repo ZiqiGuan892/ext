@@ -10,7 +10,7 @@
 
 | 场景 | 最外层脚本 | 运行位置 | 主要默认配置 |
 |---|---|---|---|
-| 仅准备环境，之后手动启动Ray与训练 | `source prepare_huanyu_env.sh` | 每个节点 | 复用一键准备流程；默认frozen_cache，不连接/启动Ray，不提交训练 |
+| 准备环境，可选启动 Ray | `source prepare_huanyu_env.sh [--start-ray]` | 每个节点 | 默认仅准备环境。加 `--start-ray` 按节点 rank 启动或复用 Ray，检查通过后返回。训练由主节点单独提交。 |
 | 冻结 Huanyu、OmniMix/通用多模态数据、缓存训练 | `run_huanyu_32card_job.sh` | 两节点各执行一次 | `frozen_cache`，encoder/projector 都冻结，Actor16 + RM16，prompt3072 + response2048 |
 | 冻结缓存训练，16K | `run_huanyu_32card_16k_job.sh` | 两节点 | prompt14336 + response2048，SDPA，默认16+16 |
 | 冻结缓存训练，对照 Whisper 启动参数 | `run_huanyu_32card_whisper_aligned_job.sh` | 两节点 | 保留 Huanyu 接口；Actor BF16、rollout TP2、RM TP4，5K |
@@ -205,9 +205,9 @@ run_huanyu_aqa_audio_train_16card.sh
 
 ## 4. 启动命令
 
-### 只准备环境，手动启动 Ray 和训练
+### 准备环境并选择是否启动 Ray
 
-在每个节点的 Bash 终端执行一次；不要求先设置 `VC_WORKER_HOSTS` 或 `VC_TASK_INDEX`。默认准备冻结缓存训练：
+在每个节点的 Bash 终端执行一次。默认只准备冻结缓存训练环境，此模式无需设置 `VC_WORKER_HOSTS` 或 `VC_TASK_INDEX`。
 
 ```bash
 export PROJECT_ROOT=/opt/huawei/dataset/infra_data/verl_omni_qwen36_gzq_new
@@ -228,7 +228,18 @@ source prepare_huanyu_env.sh
   → 在当前终端source activate.sh，保留环境变量和工作目录
 ```
 
-准备过程不执行Ray启动/停止、集群等待、训练入口或worker保活。完成后再分别手动启动Ray，仅在主节点执行普通训练脚本，例如冻结用 `run_huanyu.sh`。准备成功会设 `HUANYU_SKIP_EDITABLE_INSTALL=1`，普通入口可复用已安装插件。
+不带参数时，准备成功后可手动启动 Ray。也可以在所有节点的普通 Bash 终端并行执行下面的命令，由 prepare 启动 Ray 并检查注册。所有节点使用相同的 `VC_WORKER_HOSTS`，按 rank 顺序填写 Ray 实际使用的 IP，第一项为主节点。平台已注入这些变量时直接沿用。
+
+```bash
+# 两节点示例。将两个示例 IP 换成本次作业的真实地址。
+export VC_WORKER_HOSTS=192.0.2.10,192.0.2.11
+export VC_TASK_INDEX=0   # 主节点填 0，从节点填 1
+source "$PROJECT_ROOT/examples/qwen3_6_huanyu/prepare_huanyu_env.sh" --start-ray
+```
+
+以默认端口为例，主节点执行 `ray start --head --port=6925 --dashboard-host=0.0.0.0 --dashboard-port=8960 --resources='{"NPU": 16}'`。从节点等主节点端口可连接后执行 `ray start --address="${VC_WORKER_HOSTS%%,*}:6925" --resources='{"NPU": 16}'`（脚本会先把主机名解析为 IPv4）。端口分别可通过 `RAY_PORT` 和 `RAY_DASHBOARD_PORT` 设置。若检测到本地已有 raylet，直接检查它在目标集群的注册。
+
+检查使用 Ray State API，经指定的 GCS 地址查询 ALIVE 节点及其注册的 NPU 总数。主节点要求节点 IP 集合与清单一致、每节点恰好 16 张 NPU，从节点只等待自身 IP 注册 16 张。默认每 5 秒轮询，单个等待阶段最多 900 秒，可设置 `RAY_CLUSTER_POLL_INTERVAL` 和 `RAY_CLUSTER_WAIT_TIMEOUT`。所有节点需能访问主节点的 Ray Dashboard。成功后主节点日志有 `[huanyu-env] RAY_READY mode=all`，从节点有 `mode=local`。此时可在主节点运行训练；激活环境已包含正确的 `RAY_ADDRESS`。检查失败时，本次 prepare 返回非零，已启动的 Ray 保留供排查。
 
 AQA在线训练将上面模式与组件配置改为下例；准备完成后使用对应普通训练入口：
 
@@ -238,13 +249,13 @@ export HUANYU_TRAIN_AUDIO_ENCODER=true HUANYU_TRAIN_AUDIO_PROJECTOR=true
 source "$PROJECT_ROOT/examples/qwen3_6_huanyu/prepare_huanyu_env.sh"
 ```
 
-支持 `frozen_cache`、`aqa_unfreeze` 两种模式。AQA准备关闭embedding cache，默认使用AQA的train/validation路径；通过 `HUANYU_PRECISION_PROFILE=full HUANYU_GRAPH_MODE=0` 选择完整修复。准备完成后统一运行 `run_huanyu_aqa_audio_train.sh`，长度、batch与梯度同步由启动参数配置。
+可选 `frozen_cache`、`aqa_unfreeze` 或 `--stem` 对应的 STEM 环境。AQA 准备使用在线音频及 AQA 的 train/validation 路径。环境和 Ray 就绪后，在主节点运行 `run_huanyu_aqa_audio_train.sh`。
 
 默认环境文件是本目录的 `env_export_huanyu.sh`。如站点文件叫 `source_env_export.sh`，在准备前 `export HUANYU_ENV_FILE=/绝对路径/source_env_export.sh`。项目/模型/数据路径、显式的输出目录与缓存路径会在source后恢复。不要用一个会主动启动Ray或训练的文件作为环境文件。
 
 `source` 会将成功准备的环境应用到当前终端，保留原有shell选项。若用 `bash prepare_huanyu_env.sh`，准备完成后须执行它打印的 `source .../activate.sh`；子进程不能直接修改父终端环境。准备子进程失败不会生成可用的新激活文件，也不会应用部分环境到父终端；已完成的复制/安装不会因此撤销。激活文件保留受管理的运行配置及其他环境变化，包含unset，并用私有权限保存。
 
-准备日志和激活文件在 `$PROJECT_ROOT/runs/environment/prepare_<时间>_<随机串>/`，可通过 `HUANYU_PREPARE_LOG_ROOT` 改根目录；分别为 `prepare.log`、`activate.sh`。每个节点使用自己刚生成的激活文件。准备时若本地已有Ray，源码不同则拒绝替换；源码一致则跳过复制和项目editable安装，但仍加载环境并检查。新环境不会自动进入已有raylet，应在手动启动Ray之前完成准备。
+每个节点的准备日志 `prepare.log` 和激活文件 `activate.sh` 位于 `$PROJECT_ROOT/runs/environment/prepare_<时间>_<随机串>/`。可通过 `HUANYU_PREPARE_LOG_ROOT` 指定根目录。已有 raylet 时跳过 editable 安装，继续检查源码及环境。重用的进程保留启动时继承的环境。
 
 ### 两节点一键启动
 
@@ -271,7 +282,7 @@ jemalloc 先查 `HUANYU_JEMALLOC_LIBRARY` / `Q36_JEMALLOC_LIBRARY`，再查 `LD_
 
 ### 已准备环境和 Ray 的普通启动
 
-各节点先按上一节 `source prepare_huanyu_env.sh`，随后手动准备Ray。仅在主节点执行：
+在各节点完成环境准备并启动 Ray 后，仅在主节点执行：
 
 ```bash
 RAY_ADDRESS=auto TOTAL_TRAINING_STEPS=2 \
@@ -1178,7 +1189,9 @@ export STEM_IGNORE_EOS=false
 source "$PROJECT_ROOT/examples/qwen3_6_huanyu/prepare_huanyu_stem_env.sh"
 ```
 
-确认出现 `[huanyu-env] environment activated` 后再继续。此入口直接选择 `HUANYU_VLLM_SOURCE`，必要时 editable 安装当前项目，在隔离子 shell 中 source `HUANYU_ENV_FILE`，恢复选定源码的导入优先级，执行原生导入和16卡可见性检查，然后将成功准备的环境应用到当前 shell。它不替换 `/vllm-workspace/vllm-omni`，不解析主机、不调用 `ray start/status/init`、不等待集群、不训练；准备本身不需要 `VC_TASK_INDEX`。已有 Ray 时跳过项目安装，不停止旧进程，也不改变它们已导入的代码。新训练任务通过 runtime_env 获得所选路径。使用自定义 `export_export.sh` 时，把 `HUANYU_ENV_FILE` 指向它即可。
+若由 prepare 启动并检查 Ray，设置好 `VC_TASK_INDEX`、`VC_WORKER_HOSTS`，将最后一行改为 `source "$PROJECT_ROOT/examples/qwen3_6_huanyu/prepare_huanyu_stem_env.sh" --start-ray`。在所有节点并行执行，等待主节点打印 `RAY_READY mode=all` 后直接进入下方的 `--train-only` 步骤。32 卡时设置 `TOTAL_NPUS=32`，主节点应报告 `nodes=2 total_NPU=32`。
+
+每个节点出现 `[huanyu-env] environment activated` 后，当前 shell 已加载本次配置。默认模式只选定 `HUANYU_VLLM_SOURCE`、准备插件和站点环境、检查原生导入与 16 卡可见性。使用自定义 `export_export.sh` 时，把 `HUANYU_ENV_FILE` 指向该文件。
 
 若用 `bash prepare_huanyu_stem_env.sh`，子进程无法修改父 shell，必须执行其打印的 `source .../activate.sh`。新终端也需 source **该节点**本次生成的激活文件；日志与激活文件位于 `$PROJECT_ROOT/runs/environment/prepare_<时间戳>_<随机后缀>/`。
 

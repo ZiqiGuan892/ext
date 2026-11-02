@@ -66,6 +66,13 @@ case "$_PREPARE_ONLY" in
     *) echo 'FATAL: HUANYU_PREPARE_ONLY must be 0 or 1' >&2; exit 2 ;;
 esac
 
+_PREPARE_RAY=0
+if (( _PREPARE_ONLY )); then
+    _PREPARE_RAY="${HUANYU_PREPARE_START_RAY:-0}"
+    [[ "$_PREPARE_RAY" == 0 || "$_PREPARE_RAY" == 1 ]] || { echo 'FATAL: invalid prepare Ray selection' >&2; exit 2; }
+fi
+_MANAGE_RAY=$(( ! _PREPARE_ONLY || _PREPARE_RAY ))
+
 export PROJECT_ROOT="${PROJECT_ROOT:-/opt/huawei/dataset/infra_data/verl_omni_qwen36_gzq_new}"
 _HUANYU_EXAMPLE_DIR="${PROJECT_ROOT}/examples/qwen3_6_huanyu"
 cd "$PROJECT_ROOT"
@@ -211,11 +218,11 @@ done
     exit 1
 }
 _REQUIRED_COMMANDS=("$_PYTHON" git pgrep flock)
-if (( ! _PREPARE_ONLY )); then _REQUIRED_COMMANDS+=(ray timeout); fi
+if (( _MANAGE_RAY )); then _REQUIRED_COMMANDS+=(ray timeout); fi
 for _command in "${_REQUIRED_COMMANDS[@]}"; do
     command -v "$_command" >/dev/null || { echo "FATAL: missing command $_command" >&2; exit 1; }
 done
-if (( ! _PREPARE_ONLY )); then
+if (( _MANAGE_RAY )); then
     if [[ ! "$_RANK" =~ ^(0|[1-9][0-9]?)$ ]] || (( _RANK >= _CLUSTER_NODES )); then
         echo "FATAL: set VC_TASK_INDEX=0..$((_CLUSTER_NODES - 1)); rank 0 is head; no implicit rank 0" >&2
         exit 2
@@ -285,7 +292,7 @@ huanyu_preload_allocator
     echo "FATAL: missing Huanyu package, env file or precision_mode.sh" >&2; exit 1;
 }
 echo "[huanyu-job] allocator before Python/env setup: LD_PRELOAD=$LD_PRELOAD"
-if (( ! _PREPARE_ONLY )); then
+if (( _MANAGE_RAY )); then
     _IPS="$("$_PYTHON" -B "$_HELPER" resolve "${VC_WORKER_HOSTS:-}" --expected-nodes "$_CLUSTER_NODES")"
     IFS=, read -r -a _NODE_IPS <<< "$_IPS"
     _MASTER_IP="${_NODE_IPS[0]}"
@@ -359,7 +366,7 @@ fi
 exec 9>"${TMPDIR:-/tmp}/huanyu-32card-${UID}.lock"
 flock -n 9 || { echo 'FATAL: another Huanyu job launcher is already running on this node' >&2; exit 1; }
 if (( _PREPARE_ONLY )); then
-    echo "[huanyu-env] setup only mode=$_JOB_MODE log=$_LOG_DIR/prepare.log"
+    echo "[huanyu-env] prepare mode=$_JOB_MODE start_ray=$_PREPARE_RAY log=$_LOG_DIR/prepare.log"
 else
     echo "[huanyu-job] rank=$_RANK platform_ip=$_NODE_IP ray_node_ip=auto head=$_MASTER_IP:$_PORT log=$_LOG_DIR/rank_$_RANK.log"
 fi
@@ -403,7 +410,7 @@ huanyu_preload_allocator
 echo "[huanyu-job] allocator for native check/Ray: LD_PRELOAD=$LD_PRELOAD"
 export RAY_PORT="$_PORT" RAY_DASHBOARD_PORT="$_DASHBOARD_PORT"
 export HUANYU_RAY_READINESS_CHECK="$_RAY_READINESS_CHECK"
-if (( ! _PREPARE_ONLY )); then export RAY_ADDRESS="$_MASTER_IP:$_PORT"; fi
+if (( _MANAGE_RAY )); then export RAY_ADDRESS="$_MASTER_IP:$_PORT"; fi
 export HUANYU_JOB_MODE="$_JOB_MODE" HUANYU_CLUSTER_NODES="$_CLUSTER_NODES"
 export RAY_USAGE_STATS_ENABLED=0 PYTHONUNBUFFERED=1 HYDRA_FULL_ERROR=1
 export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
@@ -465,6 +472,44 @@ echo "[huanyu-job] physical=16x${_CLUSTER_NODES} actor=${NUM_NPUS}x${NNODES} rol
 echo '[huanyu-job] native import check exited successfully'
 "$_PYTHON" -B "$_HELPER" check-devices
 
+wait_for_cluster() {
+    local -a options=()
+    if (( _PREPARE_RAY )); then
+        options+=(--state-api)
+    elif [[ "$_RAY_READINESS_CHECK" == 0 ]]; then
+        echo "[huanyu-job] Ray readiness probe disabled (HUANYU_RAY_READINESS_CHECK=0 mode=$1); no extra ray.init, membership/resources not verified"
+        return 0
+    fi
+    local status=0
+    timeout --foreground "${_WAIT}s" "$_PYTHON" -B "$_HELPER" wait-cluster \
+        --address "$RAY_ADDRESS" --expected-ips "$_IPS" --local-ip "$_NODE_IP" \
+        --timeout "$_WAIT" --interval "$_INTERVAL" --mode "$1" "${options[@]}" || status=$?
+    if (( status )); then
+        echo "FATAL: Ray readiness check failed/timed out (exit $status); training not started" >&2
+        return "$status"
+    fi
+}
+
+if (( _MANAGE_RAY )); then
+    echo "[huanyu-job] Ray rank=$_RANK address=$RAY_ADDRESS local_ip=$_NODE_IP"
+    if (( _RANK == 0 )); then
+        if (( ! _LIVE_RAY )); then
+            ray start --head --port="$RAY_PORT" \
+                --dashboard-host=0.0.0.0 --dashboard-port="$RAY_DASHBOARD_PORT" \
+                --resources='{"NPU": 16}' 9>&-
+        fi
+        wait_for_cluster all
+    else
+        timeout --foreground "${_WAIT}s" "$_PYTHON" -B "$_HELPER" wait-head \
+            --address "$RAY_ADDRESS" --timeout "$_WAIT" --interval "$_INTERVAL"
+        if (( ! _LIVE_RAY )); then
+            echo '[huanyu-job] joining as worker; no training on this node'
+            ray start --address="$RAY_ADDRESS" --resources='{"NPU": 16}' 9>&-
+        fi
+        if (( _PREPARE_RAY || _LIVE_RAY )); then wait_for_cluster local; fi
+    fi
+fi
+
 if (( _PREPARE_ONLY )); then
     if (( _LIVE_RAY )); then
         echo '[huanyu-env] existing Ray was left running; activation does not update its inherited environment'
@@ -477,31 +522,7 @@ if (( _PREPARE_ONLY )); then
     exit 0
 fi
 
-wait_for_cluster() {
-    if [[ "$_RAY_READINESS_CHECK" == 0 ]]; then
-        echo "[huanyu-job] Ray readiness probe disabled (HUANYU_RAY_READINESS_CHECK=0 mode=$1); no extra ray.init, membership/resources not verified"
-        return 0
-    fi
-    local status=0
-    timeout --foreground "${_WAIT}s" "$_PYTHON" -B "$_HELPER" wait-cluster \
-        --address "$RAY_ADDRESS" --expected-ips "$_IPS" --local-ip "$_NODE_IP" \
-        --timeout "$_WAIT" --interval "$_INTERVAL" --mode "$1" || status=$?
-    if (( status )); then
-        echo "FATAL: Ray readiness check failed/timed out (exit $status); training not started" >&2
-        return "$status"
-    fi
-}
-
 if (( _RANK == 0 )); then
-    if (( ! _LIVE_RAY )); then
-        # Match the working manual command: let Ray select its local address.
-        # A platform hostname's DNS address is not necessarily the Ray NIC.
-        ray start --head --port="$RAY_PORT" \
-            --dashboard-host=0.0.0.0 --dashboard-port="$RAY_DASHBOARD_PORT" \
-            --resources='{"NPU": 16}' 9>&-
-    fi
-    wait_for_cluster all
-
     # Explicitly propagate cache settings and the allocator even when the Raylet
     # predates this job. Neither Huanyu nor LD_PRELOAD is in the shared ext
     # environment whitelist; Ray can also strip its own allocator preload.
@@ -525,18 +546,12 @@ if (( _RANK == 0 )); then
         "++actor_rollout_ref.model.override_config.huanyu_train_audio_projector=${HUANYU_TRAIN_AUDIO_PROJECTOR}" \
         "${_RUNTIME_ARGS[@]}" "${HUANYU_PRECISION_ARGS[@]}"
 else
-    timeout --foreground "${_WAIT}s" "$_PYTHON" -B "$_HELPER" wait-head \
-        --address "$RAY_ADDRESS" --timeout "$_WAIT" --interval "$_INTERVAL"
     if (( _LIVE_RAY )); then
-        wait_for_cluster local
         if [[ "$_RAY_READINESS_CHECK" == 1 ]]; then
             echo '[huanyu-job] worker registered in the selected cluster; waiting, no training on this node'
         else
             echo '[huanyu-job] keeping existing worker raylet; cluster membership unchecked, no training on this node'
         fi
-    else
-        echo '[huanyu-job] joining as worker; no training on this node'
-        ray start --address="$RAY_ADDRESS" --resources='{"NPU": 16}' 9>&-
     fi
     # ray start returns after startup, just like the working manual command.
     # Keep the node job and its lock alive without creating a Ray probe driver.
