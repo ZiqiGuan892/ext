@@ -311,6 +311,32 @@ class LogitsProbeTests(unittest.TestCase):
             self.both()
         self.assertEqual(self.report()["summary"]["status"], "PASS")
 
+    def test_off_case_checks_actual_disabled_controls_instead_of_skipping_verification(self):
+        self.case["determinism_check"] = {"enabled": True, "mode": "off"}
+        actual = {"environment": {"VLLM_BATCH_INVARIANT": "0", "HCCL_DETERMINISTIC": "false",
+                                  "ASCEND_LAUNCH_BLOCKING": "0", "NCCL_DETERMINISTIC": "0",
+                                  "LCCL_DETERMINISTIC": "0"},
+                  "batch_invariant_registered": False, "torch_deterministic_algorithms": False,
+                  "torch_deterministic_warn_only": False}
+        with patch.object(probe, "_determinism_state", return_value=actual):
+            self.both()
+        self.assertEqual(self.report()["summary"]["status"], "PASS")
+        paths = list((self.root / "logits").rglob("runtime-*.json"))
+        originals = {p: compare.read(p) for p in paths}
+        for bad in ("flags", "torch", "missing"):
+            for p, original in originals.items():
+                record = copy.deepcopy(original)
+                if bad == "flags":
+                    record["determinism"]["environment"]["HCCL_DETERMINISTIC"] = "strict"
+                elif bad == "torch":
+                    record["determinism"]["torch_deterministic_algorithms"] = True
+                else:
+                    del record["determinism"]
+                p.write_text(json.dumps(record), encoding="utf-8")
+            report = self.report()
+            self.assertEqual(report["summary"]["status"], "INCOMPLETE" if bad == "missing" else "DIFFERENT")
+            self.assertIsNone(report["samples"][0]["first_different_logits"])
+
     def test_observer_does_not_change_actual_forward_and_preserves_pre_mutation_bytes(self):
         runner = self.runner("serve", penalty=4.0)
         output = self.step(runner)

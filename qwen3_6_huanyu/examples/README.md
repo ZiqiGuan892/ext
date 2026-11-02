@@ -1236,7 +1236,7 @@ rollout 则为 `null / 0 / null / 0`；两侧 `torch_deterministic_algorithms=fa
 这证明了实验配置不对齐，尚不能证明它就是 logits 差异的唯一原因。
 
 修复后的普通 A/B 启动器无论是否采集 logits，都会向两侧设置相同变量并显式转发
-Ray runtime_env。使用 `--batch-invariant false` 时实际预期为：
+Ray runtime_env。默认 `--determinism on`，使用 `--batch-invariant false` 时实际预期为：
 
 ```text
 HCCL_DETERMINISTIC=strict
@@ -1258,7 +1258,7 @@ batch_invariant_registered=false（原生模块未加载时可能为null）
 也不改变独立 repeat/control 实验原有的设置。
 
 新准备的 `case.json` 写入 `determinism_check`；logits 比较器同时核对两侧与 case 的预期，
-避免“两侧都关闭但相同”误判通过。旧报告没有该契约时仍按原始证据解释，不追溯改写。
+避免两侧实际设置虽然相同、却不符合 case 指定模式时误判通过。旧报告没有该契约时仍按原始证据解释，不追溯改写。
 已有 case 的启动器也会强制传参，但重新实验应使用新目录、新 case，保持产物来源明确。
 上面的 prepare/serve/rollout 命令不变，继续指定 `--batch-invariant false`。
 
@@ -1267,6 +1267,39 @@ ASCEND_LAUNCH_BLOCKING控制同步执行；NCCL变量也不是NPU通信确定性
 Torch 对已知不支持确定性的操作会按严格模式报错，不降级为仅告警；参见
 [PyTorch API](https://docs.pytorch.org/docs/stable/generated/torch.use_deterministic_algorithms.html)。
 最终仍需比较同一 case、同一前缀的输入、forward、logits 和实际选词。
+
+普通 A/B 的关闭对照须在 **prepare** 时显式指定 `--determinism off`，不能只修改外层
+shell 环境，因为启动器会根据 case 覆盖环境，并转发给 Ray worker。关闭模式同时设置
+`HCCL_DETERMINISTIC=false`、`ASCEND_LAUNCH_BLOCKING=0`、`NCCL_DETERMINISTIC=0`、
+`LCCL_DETERMINISTIC=0`、`VLLM_BATCH_INVARIANT=0`，且在原生设备初始化前调用
+`torch.use_deterministic_algorithms(False, warn_only=False)`。
+`--determinism off --batch-invariant true` 会直接报错。
+`HUANYU_TEXT_AB_DETERMINISM=1` 在此模式下仍保留，它是 worker 检查开关；实际模式由
+`HUANYU_TEXT_AB_DETERMINISM_MODE=off` 指定。两侧 actual 日志必须包含 `"mode": "off"`、
+上述环境值及 `"torch_deterministic_algorithms": false`。
+关闭值参见 [HCCL 文档](https://www.hiascend.com/doc_center/source/zh/canncommercial/900/API/hcclug/hcclenvref_07_0010.html)
+和 [LCCL 文档](https://www.hiascend.com/doc_center/source/en/CANNCommunityEdition/900/API/ascendtb/ascendtb_01_0171.html)。
+
+例如抽取4条、保持每个引擎BS=1和贪心解码，同时比较文字和全部实际生成步骤：
+
+```bash
+export AB_ROOT="$PROJECT_ROOT/runs/huanyu_ab4_detoff_$(date +%Y%m%d_%H%M%S)"
+python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/aqa_text_ab.py" prepare \
+  --parquet /opt/huawei/dataset/infra_data/data/aqa_dataset/validation.parquet \
+  --export-dir /opt/huawei/dataset/infra_data/data/validation_vllm \
+  --output-dir "$AB_ROOT" --model-path "$MODEL_PATH" \
+  --sample-size 4 --seed 42 --prompt-mode system_audio \
+  --enable-thinking true --tp 4 --max-tokens 2048 \
+  --determinism off --batch-invariant false \
+  --embedding-check true --logits-check true \
+  --logits-top-k 100 --logits-max-steps 0 --forward-check false
+```
+
+随后沿用上述 serve 启动、HTTP 请求、停止 serve、rollout 验证、文字及 logits 比较命令。
+必须启动新进程，不能继续复用开启模式下的服务。新建 case 目录由 prepare 创建。
+logits 比较器会检查实际关闭状态；两个 worker 同时误开启也不能 PASS。
+top-100 只限制数值落盘，全词表字节哈希仍用于严格一致性判断。
+关闭模式的本地CPU回归通过；该结果不代表已完成NPU实测。
 
 #### 输入一致、prefill logits 不一致时：定位实际 forward 边界
 

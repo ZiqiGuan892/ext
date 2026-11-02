@@ -74,13 +74,13 @@ class TextCaseTests(unittest.TestCase):
         return rows
 
     def prepare(self, size=3, mode="system_audio", destination=None, embedding=False, logits=False, max_steps=0, invariant=False,
-                forward=False, forward_steps=2, top_k=100):
+                forward=False, forward_steps=2, top_k=100, determinism="on"):
         args = SimpleNamespace(parquet=str(self.source), export_dir=str(self.export),
                                output_dir=str(destination or self.case), sample_size=size, seed=42,
                                prompt_mode=mode, model_path=str(self.model), enable_thinking="true", tp=4,
                                max_tokens=2048, embedding_check="true" if embedding else "false",
                                logits_check="true" if logits else "false", logits_max_steps=max_steps, logits_top_k=top_k,
-                               batch_invariant="true" if invariant else "false",
+                               batch_invariant="true" if invariant else "false", determinism=determinism,
                                forward_check="true" if forward else "false", forward_max_steps=forward_steps)
         with redirect_stdout(io.StringIO()):
             self.assertEqual(ab.prepare_case(args), 0)
@@ -90,10 +90,25 @@ class TextCaseTests(unittest.TestCase):
         self.fixtures(count=3)
         _, case, _ = self.prepare(embedding=True, logits=True)
         self.assertEqual(case["logits_check"]["max_steps"], case["sampling"]["max_tokens"])
-        self.assertEqual(case["determinism_check"], {"enabled": True, "torch_deterministic_algorithms": True,
+        self.assertEqual(case["determinism_check"], {"enabled": True, "mode": "on", "torch_deterministic_algorithms": True,
                                                    "torch_deterministic_warn_only": False})
         _, limited, _ = self.prepare(embedding=True, logits=True, max_steps=128, destination=self.root / "limited")
         self.assertEqual(limited["logits_check"]["max_steps"], 128)
+
+    def test_off_four_samples_preserves_prompt_sampling_and_capture_contract(self):
+        self.fixtures(count=6)
+        _, on, on_rows = self.prepare(size=4, embedding=True, logits=True)
+        _, off, rows = self.prepare(size=4, embedding=True, logits=True, determinism="off",
+                                    destination=self.root / "off")
+        self.assertEqual(off["determinism_check"], dict(enabled=True, mode="off",
+                         torch_deterministic_algorithms=False, torch_deterministic_warn_only=False))
+        for key in ("sampling", "engine", "logits_check", "embedding_check"):
+            self.assertEqual(off[key], on[key])
+        self.assertEqual([(r["sample_id"], r["prompt"], r["wav_sha256"]) for r in rows],
+                         [(r["sample_id"], r["prompt"], r["wav_sha256"]) for r in on_rows])
+        with self.assertRaisesRegex(ValueError, "batch-invariant=false"):
+            self.prepare(determinism="off", invariant=True, destination=self.root / "invalid")
+        self.assertFalse((self.root / "invalid").exists())
 
     def test_top100_default_is_capture_only_and_full_storage_is_explicit(self):
         self.fixtures(count=3)

@@ -230,6 +230,11 @@ def _load_records(root, case, rows, sides=("serve", "rollout")):
 
 def compare_case(root, case, rows, *, loaded=None):
     root = Path(root)
+    determinism_mode = (case.get("determinism_check") or {}).get("mode", "on")
+    if determinism_mode not in ("on", "off"):
+        raise ValueError("invalid determinism_check.mode")
+    if not case.get("serve_repeat") and determinism_mode == "off" and case["engine"].get("batch_invariant"):
+        raise ValueError("determinism=off requires batch_invariant=false")
     if not case.get("logits_check", {}).get("enabled"):
         raise ValueError("case was not prepared with --logits-check true")
     # Repeatability tests reuse this validation on two requests from one serve
@@ -298,6 +303,10 @@ def compare_case(root, case, rows, *, loaded=None):
                                     "NCCL_DETERMINISTIC": "1", "LCCL_DETERMINISTIC": "1"},
                     "torch_deterministic_algorithms": True, "torch_deterministic_warn_only": False,
                 }
+                if determinism_mode == "off":
+                    requested["environment"].update(HCCL_DETERMINISTIC="false", ASCEND_LAUNCH_BLOCKING="0",
+                                                    NCCL_DETERMINISTIC="0", LCCL_DETERMINISTIC="0")
+                    requested["torch_deterministic_algorithms"] = False
                 for side, runtime in (("serve", a_runtime), ("rollout", b_runtime)):
                     actual = runtime.get("determinism") or {}
                     missing = [k for k in requested if k not in actual]

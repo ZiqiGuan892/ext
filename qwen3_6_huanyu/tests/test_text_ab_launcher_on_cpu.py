@@ -244,6 +244,31 @@ class TextABLauncherTests(unittest.TestCase):
                 self.assertEqual(plan["env"]["VLLM_BATCH_INVARIANT"], "0")
                 self.assertEqual(plan["env"]["HUANYU_TEXT_AB_DETERMINISM"], "1")
 
+    def test_off_case_overrides_stale_on_flags_in_both_process_and_ray_environment(self):
+        self.case["determinism_check"] = {"enabled": True, "mode": "off", "torch_deterministic_algorithms": False}
+        self.case["engine"]["batch_invariant"] = False
+        expected = dict(HCCL_DETERMINISTIC="false", ASCEND_LAUNCH_BLOCKING="0", NCCL_DETERMINISTIC="0",
+                        LCCL_DETERMINISTIC="0", VLLM_BATCH_INVARIANT="0", HUANYU_TEXT_AB_DETERMINISM="1",
+                        HUANYU_TEXT_AB_DETERMINISM_MODE="off")
+        with patch.dict(os.environ, {key: "1" for key in expected}):
+            for mode in ("serve", "rollout"):
+                plan = self.plan(mode)
+                self.assertEqual({key: plan["env"][key] for key in expected}, expected)
+                if mode == "rollout":
+                    options = hydra_options(plan)
+                    for key, value in expected.items():
+                        self.assertEqual(json.loads(options["ray_kwargs.ray_init.runtime_env.env_vars." + key]), value)
+        self.write_case()
+        with patch.object(LAUNCHER.subprocess, "call", return_value=0):
+            status, output, _ = self.invoke("serve")
+        self.assertEqual(status, 0)
+        self.assertIn("ab_mode=off", output)
+        self.assertIn("HCCL_DETERMINISTIC=false ASCEND_LAUNCH_BLOCKING=0 NCCL_DETERMINISTIC=0", output)
+        self.case["engine"]["batch_invariant"] = True
+        for mode in ("serve", "rollout"):
+            with self.assertRaisesRegex(ValueError, "batch_invariant=false"):
+                self.plan(mode)
+
     def test_nonbatch_ab_prints_requested_settings_and_saves_worker_contract(self):
         with patch.object(LAUNCHER.subprocess, "call", return_value=0):
             status, stdout, stderr = self.invoke("serve")

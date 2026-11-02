@@ -1,4 +1,4 @@
-"""Enable and verify both A/B inference workers, independently of batch invariance.
+"""Set and verify both A/B inference workers, independently of batch invariance.
 
 The launcher sets communication flags before process creation. Do not repair
 missing flags inside an initialized worker: the backend may have cached them.
@@ -14,12 +14,19 @@ import sys
 
 
 _GATE = "HUANYU_TEXT_AB_DETERMINISM"
+_MODE = "HUANYU_TEXT_AB_DETERMINISM_MODE"
 _MARKER = "_huanyu_ab_determinism_check"
 _WORKER = "vllm_omni.platforms.npu.worker.npu_ar_worker"
 
 
 def _expected_environment(*, initialized):
     batch = os.environ.get("HUANYU_TEXT_AB_BATCH_INVARIANT", "0") == "1"
+    mode = os.environ.get(_MODE, "on")
+    if mode not in ("on", "off") or (mode == "off" and batch):
+        raise RuntimeError("invalid A/B determinism mode or incompatible batch invariance")
+    if mode == "off":
+        return {"VLLM_BATCH_INVARIANT": "0", "HCCL_DETERMINISTIC": "false",
+                "ASCEND_LAUNCH_BLOCKING": "0", "NCCL_DETERMINISTIC": "0", "LCCL_DETERMINISTIC": "0"}
     return {
         "VLLM_BATCH_INVARIANT": "1" if batch and initialized else "0",
         "HCCL_DETERMINISTIC": "true" if batch and not initialized else "strict",
@@ -45,11 +52,12 @@ def verify_ab_determinism(worker, *, initialized=True):
         batch = expected["VLLM_BATCH_INVARIANT"] == "1"
         if (batch and registered is not True) or (not batch and registered):
             errors.append("native batch-invariant registration disagrees with requested mode")
-        if not enabled or warn_only:
-            errors.append("torch deterministic algorithms must be enabled with warn_only=False")
+        if enabled != (os.environ.get(_MODE, "on") == "on") or warn_only:
+            errors.append("torch deterministic algorithms disagree with requested mode or warn_only=False")
     if initialized or errors:
         state = dict(host=socket.gethostname(), pid=os.getpid(), rank=getattr(worker, "rank", None),
-                     side=side, environment=environment, batch_invariant_registered=registered,
+                     side=side, mode=os.environ.get(_MODE, "on"), environment=environment,
+                     batch_invariant_registered=registered,
                      torch_deterministic_algorithms=enabled, torch_deterministic_warn_only=warn_only,
                      errors=errors)
         print("[huanyu-determinism] actual scope=ab_worker_init status="
@@ -76,7 +84,7 @@ def install_ab_determinism_check():
         verify_ab_determinism(self, initialized=False)
         # Before native device/distributed initialization, not merely in the
         # driver: torch settings are process-local under spawn/Ray.
-        torch.use_deterministic_algorithms(True, warn_only=False)
+        torch.use_deterministic_algorithms(os.environ.get(_MODE, "on") == "on", warn_only=False)
         result = original(self, *args, **kwargs)
         verify_ab_determinism(self)
         return result

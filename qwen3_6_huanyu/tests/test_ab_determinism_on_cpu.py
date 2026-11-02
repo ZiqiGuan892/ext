@@ -17,6 +17,7 @@ spec = importlib.util.spec_from_file_location("ab_determinism_tested", ROOT / "a
 check = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(check)
 ENV = {"HUANYU_TEXT_AB_DETERMINISM": "1", "HUANYU_TEXT_AB_SIDE": "serve",
+       "HUANYU_TEXT_AB_DETERMINISM_MODE": "on",
        "HUANYU_TEXT_AB_BATCH_INVARIANT": "0", "VLLM_BATCH_INVARIANT": "0",
        "HCCL_DETERMINISTIC": "strict", "LCCL_DETERMINISTIC": "1",
        "ASCEND_LAUNCH_BLOCKING": "1", "NCCL_DETERMINISTIC": "1"}
@@ -24,7 +25,8 @@ ENV = {"HUANYU_TEXT_AB_DETERMINISM": "1", "HUANYU_TEXT_AB_SIDE": "serve",
 
 class ABDeterminismTests(unittest.TestCase):
     def exercise(self, *, env=None, reset=None, original_error=False, batch=False):
-        state = NS(enabled=False, warn=True, calls=[])
+        expected_enabled = (env or {}).get("HUANYU_TEXT_AB_DETERMINISM_MODE", "on") == "on"
+        state = NS(enabled=not expected_enabled, warn=True, calls=[])
         native = NS(_batch_invariant_LIB=None)
 
         def enable(value, *, warn_only):
@@ -40,7 +42,7 @@ class ABDeterminismTests(unittest.TestCase):
             rank = 2
 
             def init_device(self, marker):
-                test.assertTrue(state.enabled)
+                test.assertEqual(state.enabled, expected_enabled)
                 test.assertFalse(state.warn)
                 state.calls.append("native")
                 if original_error:
@@ -49,7 +51,7 @@ class ABDeterminismTests(unittest.TestCase):
                     os.environ.update(VLLM_BATCH_INVARIANT="1", HCCL_DETERMINISTIC="strict")
                     native._batch_invariant_LIB = object()
                 if reset == "torch":
-                    state.enabled = False
+                    state.enabled = not state.enabled
                 elif reset == "warn":
                     state.warn = True
                 elif reset == "env":
@@ -97,6 +99,26 @@ class ABDeterminismTests(unittest.TestCase):
             self.assertEqual(calls, [])
             self.assertIn(key, error)
             self.assertIn("status=FAILED", output)
+
+    def test_off_disables_before_native_init_on_both_sides_and_rejects_overrides(self):
+        off = dict(HUANYU_TEXT_AB_DETERMINISM_MODE="off", HCCL_DETERMINISTIC="false",
+                   ASCEND_LAUNCH_BLOCKING="0", NCCL_DETERMINISTIC="0", LCCL_DETERMINISTIC="0")
+        for side in ("serve", "rollout"):
+            calls, output, error = self.exercise(env=dict(off, HUANYU_TEXT_AB_SIDE=side))
+            self.assertIsNone(error)
+            self.assertEqual(calls, ["enable", "native"])
+            record = json.loads(output[output.index("{"):])
+            self.assertEqual(record["mode"], "off")
+            self.assertFalse(record["torch_deterministic_algorithms"])
+            self.assertIn("SETTINGS_VERIFIED", output)
+        for key in ("HCCL_DETERMINISTIC", "ASCEND_LAUNCH_BLOCKING", "NCCL_DETERMINISTIC", "LCCL_DETERMINISTIC"):
+            calls, _, error = self.exercise(env=dict(off, **{key: ENV[key]}))
+            self.assertEqual(calls, [])
+            self.assertIn(key, error)
+        for reset in ("torch", "registration"):
+            _, output, error = self.exercise(env=off, reset=reset)
+            self.assertIsNotNone(error)
+            self.assertNotIn("SETTINGS_VERIFIED", output)
 
     def test_native_resets_are_not_silently_repaired(self):
         for reset in ("torch", "warn", "env", "registration"):

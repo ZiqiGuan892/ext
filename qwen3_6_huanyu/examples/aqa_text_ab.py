@@ -88,6 +88,11 @@ def prepare_case(args):
 
     if args.sample_size < 1 or args.max_tokens < 1 or args.tp != 4 or not 0 <= args.seed < 2**63:
         raise ValueError("positive sample size/max tokens, nonnegative seed and TP=4 required")
+    determinism = getattr(args, "determinism", "on")
+    if determinism not in ("on", "off"):
+        raise ValueError("determinism must be on or off")
+    if determinism == "off" and getattr(args, "batch_invariant", "false") == "true":
+        raise ValueError("determinism=off requires batch-invariant=false")
     logits_check = getattr(args, "logits_check", "false") == "true"
     logits_max_steps = getattr(args, "logits_max_steps", 0)
     if logits_max_steps < 0:
@@ -174,7 +179,8 @@ def prepare_case(args):
         "sample_size": len(rows), "selection_seed": args.seed, "prompt_mode": args.prompt_mode,
         "manifest_sha256": sha256(manifest), "checkpoint_file_sha256": fingerprints,
         "enable_thinking": args.enable_thinking == "true",
-        "determinism_check": {"enabled": True, "torch_deterministic_algorithms": True,
+        "determinism_check": {"enabled": True, "mode": determinism,
+                              "torch_deterministic_algorithms": determinism == "on",
                               "torch_deterministic_warn_only": False},
         "embedding_check": {"enabled": getattr(args, "embedding_check", "false") == "true",
                             "scope": "llm_inputs_embeds", "strict": True, "expected_tp_size": args.tp},
@@ -453,6 +459,8 @@ def main(argv=None):
     prepare.add_argument("--prompt-mode", choices=("system_audio", "original"), default="system_audio")
     prepare.add_argument("--model-path", default=DEFAULT_MODEL)
     prepare.add_argument("--enable-thinking", choices=("true", "false"), default="true")
+    prepare.add_argument("--determinism", choices=("on", "off"), default="on",
+                         help="Set and verify both engines' determinism controls; default on")
     prepare.add_argument("--tp", type=int, default=4)
     prepare.add_argument("--max-tokens", type=int, default=2048)
     prepare.add_argument("--embedding-check", choices=("true", "false"), default="true",
