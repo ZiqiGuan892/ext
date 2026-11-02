@@ -106,7 +106,7 @@ _PYTHON=python3
 _HELPER="${_HUANYU_EXAMPLE_DIR}/job_bootstrap.py"
 _ENV_FILE="${HUANYU_ENV_FILE:-${_HUANYU_EXAMPLE_DIR}/env_export_huanyu.sh}"
 _PRECISION_FILE="${_HUANYU_EXAMPLE_DIR}/precision_mode.sh"
-_VLLM_SOURCE="${HUANYU_VLLM_SOURCE:-${HUANYU_VLLM_OMNI_ROOT:-/opt/huawei/dataset/infra_data/code/vllm-omni-xy-qwen-vit}}"
+_VLLM_SOURCE="${HUANYU_VLLM_SOURCE:-${HUANYU_VLLM_OMNI_ROOT:-/opt/huawei/dataset/infra_data/code/vllm-omni-xy-dbb-dev}}"
 _NATIVE_PATH_FILE="${_HUANYU_EXAMPLE_DIR}/native_source.sh"
 _RANK="${VC_TASK_INDEX:-}"
 _WAIT="${RAY_CLUSTER_WAIT_TIMEOUT:-900}"
@@ -123,8 +123,8 @@ case "$_RAY_READINESS_CHECK" in
 esac
 _CLUSTER_NODES="${HUANYU_CLUSTER_NODES:-2}"
 if [[ "$_JOB_MODE" == stem ]]; then
-    [[ "$_CLUSTER_NODES" == 8 || "$_CLUSTER_NODES" == 16 ]] || {
-        echo 'FATAL: STEM jobs require HUANYU_CLUSTER_NODES=8 or 16 (16 NPUs per node)' >&2; exit 2;
+    [[ "$_CLUSTER_NODES" == 1 || "$_CLUSTER_NODES" == 2 || "$_CLUSTER_NODES" == 8 || "$_CLUSTER_NODES" == 16 ]] || {
+        echo 'FATAL: STEM jobs require HUANYU_CLUSTER_NODES=1, 2, 8 or 16 (16 NPUs per node)' >&2; exit 2;
     }
 else
     [[ "$_CLUSTER_NODES" == 2 ]] || {

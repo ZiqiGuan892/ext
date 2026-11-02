@@ -45,6 +45,13 @@ def worker_modules(*, fail=None):
     package.__path__ = [str(ROOT)]
     reload = load_file(PACKAGE + ".weight_reload", ROOT / "weight_reload.py")
     modules = {BASE_MODULE: base, PACKAGE: package, reload.__name__: reload}
+    source = ModuleType(PACKAGE + ".runtime_imports")
+    def report_native_source(scope):
+        events.append("source:" + scope)
+        if fail == "source":
+            raise RuntimeError("source mismatch")
+    source.report_native_source = report_native_source
+    modules[source.__name__] = source
     for module_name, installer in (
         ("job_determinism", "install_job_determinism_check"),
         ("ab_determinism", "install_ab_determinism_check"),
@@ -116,7 +123,7 @@ class WorkerExtensionTests(unittest.TestCase):
             self.assertTrue(getattr(cls.update_weights_from_ipc, reload._PATCH_MARKER))
             self.assertIs(cls.__new__, base.__new__)
             cls()
-        self.assertEqual(events, ["processor_compat", "rollout_precision", "cache_precision", "base-new"])
+        self.assertEqual(events, ["processor_compat", "rollout_precision", "cache_precision", "source:inference-worker", "base-new"])
         self.assertIn("[huanyu-worker] explicit precision extension selected", output.getvalue())
         self.assertIn("ipc_signature=", output.getvalue())
 
@@ -126,7 +133,7 @@ class WorkerExtensionTests(unittest.TestCase):
                 module = load_file(PACKAGE + ".worker_extension", ROOT / "worker_extension.py")
                 worker = module.HuanyuColocateWorkerExtension()
                 self.assertEqual(worker.update_weights_from_ipc(), "original")
-        self.assertEqual(events, ["processor_compat", "rollout_precision", "cache_precision", "base-new", "original-update"])
+        self.assertEqual(events, ["processor_compat", "rollout_precision", "cache_precision", "source:inference-worker", "base-new", "original-update"])
         self.assertIn("enabled=0", output.getvalue())
         self.assertIn("delegated to original IPC handler", output.getvalue())
 
@@ -136,6 +143,13 @@ class WorkerExtensionTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, failed + " unavailable"):
                     load_file(PACKAGE + ".worker_extension", ROOT / "worker_extension.py")
                 self.assertNotIn("explicit precision extension selected", output.getvalue())
+
+    def test_factory_import_checks_source_after_native_hooks_and_propagates_mismatch(self):
+        with worker_modules(fail="source") as (_, events, _), redirect_stdout(io.StringIO()) as output:
+            with self.assertRaisesRegex(RuntimeError, "source mismatch"):
+                load_file(PACKAGE + ".worker_extension", ROOT / "worker_extension.py")
+        self.assertEqual(events, ["processor_compat", "rollout_precision", "cache_precision", "source:inference-worker"])
+        self.assertNotIn("explicit precision extension selected", output.getvalue())
 
     def test_actual_server_deploy_writer_receives_huanyu_stage_extension(self):
         registry = {}

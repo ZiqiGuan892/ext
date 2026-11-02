@@ -49,8 +49,26 @@ cp "$PROJECT_ROOT/verl_omni_ext/models/qwen3_6_huanyu/examples/"*.sh \
 | 通用 `TRAIN_FILE` / `VAL_FILE` | `/opt/huawei/dataset/infra_data/data/train.parquet` / 同目录 `validation.parquet` |
 | AQA 数据 | `/opt/huawei/dataset/infra_data/data/aqa_dataset/train.parquet` / 同目录 `validation.parquet` |
 | `HUANYU_EMBED_CACHE_DIR`，冻结一键模式 | `/opt/huawei/dataset/ccb_data/data/omni/embed_cache_huanyu_sampleall_q128` |
-| `HUANYU_VLLM_SOURCE`，直接运行的源码根目录 | `/opt/huawei/dataset/infra_data/code/vllm-omni-xy-qwen-vit` |
+| `HUANYU_VLLM_SOURCE`，直接运行的源码根目录 | `/opt/huawei/dataset/infra_data/code/vllm-omni-xy-dbb-dev` |
 | `HUANYU_VLLM_OMNI_ROOT`，导入检查目录 | 由所选源码目录设置，不再固定到 `/vllm-workspace/vllm-omni` |
+
+serve 的真实源码检查：`launch_huanyu_aqa_text_ab.py serve` 在实际API进程进入CLI前打印
+`[huanyu-source] scope=serve-api status=VERIFIED`；显式Huanyu worker扩展在安装原生钩子后
+打印 `scope=inference-worker`。JSON中的 `origins` 来自当前进程已导入模块的 `__file__`，
+包含包入口以及已加载的音频、模型和NPU worker/runner模块，并记录host、pid、side、expected_root。
+检查会核对当时全部已加载且有文件来源的 `vllm_omni.*` 模块；混用其他目录会打印
+`status=FAILED` 和mismatches并停止启动。未提供预期目录时只报告 `REPORTED`，不声称校验通过。
+该记录不覆盖其他进程或此后才加载的模块；应同时查看API与各 `Worker_TP*` 的记录。
+
+```bash
+grep -n '\[huanyu-source\]' "$AB_ROOT/serve_console.log"
+# repeat实验改用 "$REPEAT_ROOT/serve_console.log"
+```
+
+默认 `expected_root` 为 `/opt/huawei/dataset/infra_data/code/vllm-omni-xy-dbb-dev`，
+所有 `origins` 应在该目录的 `vllm_omni/` 下。显式设置 `HUANYU_VLLM_SOURCE` 仍可选其他目录。
+`serve.launch.json` 同时保存启动时选定的源码变量和PYTHONPATH，作为配置记录；实际导入以
+上述进程日志为准。更换源码需重启对应serve进程。启动脚本仍清除PYTHONPATH中的已知旧目录。
 
 “35B”“4B”“sampleall”不会自动选择另一份数据，实际内容由 parquet 路径决定。冻结缓存模式还要求缓存与所选数据、模型和预处理匹配；两节点均需能读取 `manifest.json` 和缓存内容。
 
@@ -132,7 +150,7 @@ prompt3072+response2048、engine预算5248、Actor16+GenRM16、TP4。
 export PROJECT_ROOT=/opt/huawei/dataset/infra_data/code/verl_omni_qwen36_gzq_new
 export MODEL_PATH=/opt/huawei/dataset/model_gy/downloaded_models/2748
 export RM_MODEL_PATH=/opt/huawei/dataset/model_gy/downloaded_models/Qwen3.5-35B-A3B
-export HUANYU_VLLM_SOURCE=/opt/huawei/dataset/infra_data/code/vllm-omni-xy-qwen-vit
+export HUANYU_VLLM_SOURCE=/opt/huawei/dataset/infra_data/code/vllm-omni-xy-dbb-dev
 bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/run_huanyu_aqa_frozen_deterministic_32card_job.sh"
 ```
 
@@ -188,7 +206,7 @@ run_huanyu_aqa_audio_train_16card.sh
 ```bash
 export PROJECT_ROOT=/opt/huawei/dataset/infra_data/verl_omni_qwen36_gzq_new
 export HUANYU_JOB_MODE=frozen_cache
-export HUANYU_VLLM_SOURCE=/opt/huawei/dataset/infra_data/code/vllm-omni-xy-qwen-vit
+export HUANYU_VLLM_SOURCE=/opt/huawei/dataset/infra_data/code/vllm-omni-xy-dbb-dev
 export HUANYU_EMBED_CACHE_DIR=/opt/huawei/dataset/ccb_data/data/omni/embed_cache_huanyu_sampleall_q128
 source "$PROJECT_ROOT/examples/qwen3_6_huanyu/prepare_huanyu_env.sh"
 ```
@@ -1063,22 +1081,39 @@ python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/aqa_text_ab.py" compare --case-di
 
 本次本地验证：98 项相关 CPU 测试通过，覆盖请求身份传递、启动配置、真实 BF16 张量采集、全部 TP rank 比较，以及采集→NPZ→文字 A/B 汇总的串联测试。改动单个音频 embedding 元素会判为 FAIL；缺少一个 rank 会判为 INCOMPLETE。未运行真实 Huanyu/NPU 模型，100 条是否严格一致仍须以上述服务器运行结果为准。
 
-## 12. STEM 数学规则奖励：128 / 256 卡一键训练
+## 12. STEM 数学规则奖励：16 / 32 / 128 / 256 卡一键训练
 
 在每个节点执行 `run_huanyu_stem_job.sh`。每节点16卡，全部用于 Actor/rollout；数学奖励在 CPU 上计算，不启动 GenRM。默认 checkpoint 为 `/opt/huawei/dataset/model_gy/downloaded_models/2748`，STEM Parquet 目录为 `/opt/huawei/dataset/infra_data/data/rl_stem_data`。目录需包含 `train.parquet` 和 `val.parquet`（或 `validation.parquet`）。每行 `data_source` 必须是 `math_dapo`，`reward_model.ground_truth` 为字符串。
 
-| 设置 | 128卡 | 256卡 |
-| --- | --- | --- |
-| `TOTAL_NPUS` / 节点数 | 128 / 8 | 256 / 16 |
-| Actor FSDP2 分片规模（`fsdp_size=-1`） | 128 | 256 |
-| Actor 数据并行规模，SP=1 | 128 | 256 |
-| 训练 TP / SP | 1 / 1 | 1 / 1 |
-| rollout TP（默认，可改16） | 8 | 8 |
-| rollout 独立推理副本数 | 16 | 32 |
-| BS / PPO mini-batch / N | 128 / 128 / 16 | 128 / 128 / 16 |
-| 每步轨迹数 | 2048 | 2048 |
-| 每 rank 的 micro-batch 数（micro-batch=1） | 16 | 8 |
-| prompt / response 上限 / max_model_len | 2048 / 10240 / 12288 | 2048 / 10240 / 12288 |
+| 设置（使用默认batch参数） | 16卡 | 32卡 | 128卡 | 256卡 |
+| --- | --- | --- | --- | --- |
+| `TOTAL_NPUS` / 节点数 | 16 / 1 | 32 / 2 | 128 / 8 | 256 / 16 |
+| Actor FSDP2 分片规模（`fsdp_size=-1`） | 16 | 32 | 128 | 256 |
+| Actor 数据并行规模，SP=1 | 16 | 32 | 128 | 256 |
+| 训练 TP / SP | 1 / 1 | 1 / 1 | 1 / 1 | 1 / 1 |
+| rollout TP（默认，可改4/16） | 8 | 8 | 8 | 8 |
+| rollout 独立推理副本数 | 2 | 4 | 16 | 32 |
+| BS / PPO mini-batch / N | 128 / 128 / 16 | 128 / 128 / 16 | 128 / 128 / 16 | 128 / 128 / 16 |
+| 每步轨迹数 | 2048 | 2048 | 2048 | 2048 |
+| 每 rank 每个mini-batch的 micro-batch 数（micro-batch=1） | 128 | 64 | 16 | 8 |
+| prompt / response 上限 / max_model_len | 2048 / 10240 / 12288 | 2048 / 10240 / 12288 | 2048 / 10240 / 12288 | 2048 / 10240 / 12288 |
+
+通过环境变量配置卡数和batch，脚本顶部注释包含四种卡数的完整命令。32卡示例（两节点执行相同命令，平台分别提供 `VC_TASK_INDEX=0/1`）：
+
+```bash
+TOTAL_NPUS=32 TRAIN_BATCH_SIZE=16 PPO_MINI_BATCH_SIZE=8 ROLLOUT_N=4 \
+bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/run_huanyu_stem_job.sh"
+```
+
+`TOTAL_NPUS` 是总卡数，每节点仍固定16卡；`TRAIN_BATCH_SIZE` 是全局prompt数，
+`PPO_MINI_BATCH_SIZE` 是乘N之前的mini-batch prompt数，`ROLLOUT_N` 是每prompt生成数。
+上述示例每步64条轨迹，每个mini-batch32条轨迹。要求train batch能被mini batch整除，
+且 `PPO_MINI_BATCH_SIZE * ROLLOUT_N` 能被总卡数整除。环境变量控制这些配置，冲突的尾部Hydra覆盖不生效。
+手动准备环境和Ray后，只在主节点给同一命令追加 `--train-only`。
+四种规模均强制 `RM_ENABLE=0`、`RM_NNODES=0`、`REWARD_POOL_NPUS=0`，最终配置
+`reward.reward_model.enable=false`、`enable_resource_pool=false`，使用CPU `math_dapo`，不需要RM checkpoint。
+未显式设置总卡数时，从 `VC_WORKER_NUM=1/2/8/16` 推导；无节点信息时仍默认128卡。
+支持启动配置不表示已验证对应硬件上的显存或训练速度。
 
 训练使用全卡 FSDP，不使用 rollout 的 TP 切分训练。单机16卡不要求 TP=16；`Actor卡数/TP` 是 rollout 副本数，不能填入训练 DP 或 `rollout.data_parallel_size`。默认推理 PP=1、引擎内部 DP=1，由外层启动多个 TP8 副本。改为 TP16 时，128/256卡分别有8/16个副本；单副本权重更省显存，但副本数减半，速度需实测。参考 [vLLM 并行说明](https://docs.vllm.ai/en/stable/serving/parallelism_scaling/)。
 
@@ -1088,8 +1123,8 @@ python3 "$PROJECT_ROOT/examples/qwen3_6_huanyu/aqa_text_ab.py" compare --case-di
 
 ```text
 每个节点 run_huanyu_stem_job.sh
-  → run_huanyu_32card_job.sh（共享实现，stem模式支持8/16节点）
-  → jemalloc → 按内容摘要备份/替换 vllm-omni → editable安装当前项目
+  → run_huanyu_32card_job.sh（共享实现，stem模式支持1/2/8/16节点）
+  → jemalloc → 将所选 vllm-omni 源码目录置于 PYTHONPATH 首位 → editable安装当前项目
   → source env_export_huanyu.sh → 恢复本次参数 → 原生导入/NPU检查
   → rank0启动Ray head；其余节点加入Ray并阻塞等待
   → rank0直接提交一次训练（默认不运行额外Ray就绪探针）
@@ -1114,7 +1149,7 @@ TOTAL_NPUS=128 HUANYU_RAY_READINESS_CHECK=0 \
 bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/run_huanyu_stem_job.sh"
 ```
 
-在所有节点部署相同代码、模型与数据路径，`PROJECT_ROOT/runs` 必须是共享目录，其他节点需要读取主节点准备的 Parquet。作业平台通常注入 `VC_TASK_INDEX`、`VC_WORKER_HOSTS`、`VC_WORKER_NUM`；没有注入时，分别设置0..7或0..15的 rank，所有节点设置同一份完整逗号分隔主机列表，首个为 head。不要把所有节点 rank 都设成0。
+在所有节点部署相同代码、模型与数据路径，多节点时 `PROJECT_ROOT/runs` 必须是共享目录，其他节点需要读取主节点准备的 Parquet。作业平台通常注入 `VC_TASK_INDEX`、`VC_WORKER_HOSTS`、`VC_WORKER_NUM`；没有注入时，按节点数设置0到节点数减1的 rank，所有节点设置同一份完整逗号分隔主机列表，首个为 head。16卡仅有rank0，host列表只有本机；多节点不要把所有节点rank都设成0。
 
 该入口是节点级启动器，优先配置平台为**每节点执行一次 Bash**；Ray/verl 后续自行启动16卡训练进程。如果平台通过 `torchrun` / `torch.distributed.launch` 在每节点重复启动16份脚本，共享 job 会识别 `LOCAL_RANK`，以及 `--local-rank` / `--local_rank` 的等号或分开传值形式：每节点仅本地 rank 0 准备环境、获取锁和启动 Ray，其他本地 rank 在这些操作前正常退出（exit 0）。节点编号仍由 `VC_TASK_INDEX` 决定，不能用全局 `RANK=0` 代替。外层分布式 rank 环境不会传给环境准备进程和 Ray driver；设备可见性不做修改，仍检查每节点可见16张卡。
 
@@ -1129,10 +1164,10 @@ bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/run_huanyu_stem_job.sh"
 ```bash
 export PROJECT_ROOT=/opt/huawei/dataset/infra_data/code/verl_omni_qwen36_gzq_new
 export MODEL_PATH=/opt/huawei/dataset/model_gy/downloaded_models/2748
-export HUANYU_VLLM_SOURCE=/opt/huawei/dataset/infra_data/code/vllm-omni-xy-qwen-vit
+export HUANYU_VLLM_SOURCE=/opt/huawei/dataset/infra_data/code/vllm-omni-xy-dbb-dev
 export HUANYU_ENV_FILE="$PROJECT_ROOT/examples/qwen3_6_huanyu/env_export_huanyu.sh"
 export STEM_DATA_DIR=/opt/huawei/dataset/infra_data/data/rl_stem_data
-export TOTAL_NPUS=128   # 256卡时，每节点都改成256
+export TOTAL_NPUS=128   # 支持16/32/128/256；所有节点设置相同值
 export STEM_IGNORE_EOS=false
 source "$PROJECT_ROOT/examples/qwen3_6_huanyu/prepare_huanyu_stem_env.sh"
 ```
@@ -1141,7 +1176,7 @@ source "$PROJECT_ROOT/examples/qwen3_6_huanyu/prepare_huanyu_stem_env.sh"
 
 若用 `bash prepare_huanyu_stem_env.sh`，子进程无法修改父 shell，必须执行其打印的 `source .../activate.sh`。新终端也需 source **该节点**本次生成的激活文件；日志与激活文件位于 `$PROJECT_ROOT/runs/environment/prepare_<时间戳>_<随机后缀>/`。
 
-随后在已激活环境的各节点手动确定地址（`VC_TASK_INDEX`、`VC_WORKER_HOSTS` 由平台提供；128卡应有8个主机，256卡应有16个）：
+随后在已激活环境的各节点手动确定地址（`VC_TASK_INDEX`、`VC_WORKER_HOSTS` 由平台提供；16/32/128/256卡分别为1/2/8/16个主机）：
 
 ```bash
 HUANYU_IPS="$(python3 -B "$PROJECT_ROOT/examples/qwen3_6_huanyu/job_bootstrap.py" \
@@ -1164,7 +1199,7 @@ ray start --head --port=6925 \
 ray start --address="$RAY_ADDRESS" --resources='{"NPU":16}'
 ```
 
-主节点确认 `ray status --address="$RAY_ADDRESS"` 显示预期的8/16个节点、总计128/256张NPU后，只在主节点执行：
+主节点确认 `ray status --address="$RAY_ADDRESS"` 显示预期的1/2/8/16个节点、总计16/32/128/256张NPU后，只在主节点执行：
 
 ```bash
 TOTAL_TRAINING_STEPS=2 \
@@ -1176,7 +1211,7 @@ bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/run_huanyu_stem_job.sh" --train-only
 ```bash
 export PROJECT_ROOT=/opt/huawei/dataset/infra_data/code/verl_omni_qwen36_gzq_new
 export MODEL_PATH=/opt/huawei/dataset/model_gy/downloaded_models/2748
-export HUANYU_VLLM_SOURCE=/opt/huawei/dataset/infra_data/code/vllm-omni-xy-qwen-vit
+export HUANYU_VLLM_SOURCE=/opt/huawei/dataset/infra_data/code/vllm-omni-xy-dbb-dev
 
 # 每个节点运行；VC_* 由平台按上述要求提供。先完成2个完整训练step。
 TOTAL_NPUS=128 TOTAL_TRAINING_STEPS=2 \
@@ -1204,7 +1239,7 @@ OOM估计（以此前35.57B总参数、单卡约61.27GiB可见显存为假设，
 
 因此128卡可作为保守配置的首次测试，256卡可降低参数/状态分片量、增加吞吐，但两者都不能仅凭总卡数保证不OOM。必须跑过实际长序列的生成、old-logprob、反向、首次optimizer step及权重同步；只启动模型成功不足以判断。若rollout OOM，先把 `ROLLOUT_MAX_NUM_SEQS=4`；若Actor单条12K反向仍OOM，单纯加DP卡或降低全局BS未必解决，需要针对激活/logits进一步处理。默认full精度reference实现和跨节点逐微批同步有性能代价，本脚本优先提供内存可控的起跑配置。
 
-本次启动链路验证共70项CPU测试通过：bootstrap22、共享job23、环境准备14、原STEM3、新多节点STEM8。覆盖最终Hydra配置、TP16覆盖、无GenRM、rank7/15只加入Ray、旧环境覆盖、规则奖励预检失败和旧诊断开关清空。使用命令桩，不是128/256卡NPU实测，不能由此宣称显存或HCCL性能已验证。
+四种卡数的启动链路验证共73项CPU测试通过：共享job34、环境准备17、原STEM3、多节点STEM19。覆盖四种规模、batch覆盖、最终Hydra配置、TP16覆盖、无GenRM、从节点只加入Ray、旧环境覆盖、规则奖励预检失败和旧诊断开关清空。使用命令桩，不是NPU实测，不能由此宣称显存或HCCL性能已验证。
 
 ## 13. serve / rollout 的 prefill、decode logits 和最终采样参数检查
 
@@ -1409,7 +1444,7 @@ serve 的 shell 与 rollout 的 Ray worker 都必须通过，不能仅依据启�
 export PROJECT_ROOT=/opt/huawei/dataset/infra_data/code/verl_omni_qwen36_gzq_new
 export MODEL_PATH=/opt/huawei/dataset/model_gy/downloaded_models/2748
 export RM_MODEL_PATH=/opt/huawei/dataset/model_gy/downloaded_models/Qwen3.5-35B-A3B
-export HUANYU_VLLM_SOURCE=/opt/huawei/dataset/infra_data/code/vllm-omni-xy-qwen-vit
+export HUANYU_VLLM_SOURCE=/opt/huawei/dataset/infra_data/code/vllm-omni-xy-dbb-dev
 export RAY_ADDRESS=auto
 export HCCL_DETERMINISTIC=strict
 export ASCEND_LAUNCH_BLOCKING=1

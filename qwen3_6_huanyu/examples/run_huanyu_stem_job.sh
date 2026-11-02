@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run this SAME entry on every 16-NPU node. Only VC_TASK_INDEX=0 submits training.
-# TOTAL_NPUS=128 (8 nodes) or 256 (16 nodes); all devices serve Actor/rollout.
+# TOTAL_NPUS=16/32/128/256 (1/2/8/16 nodes); all devices serve Actor/rollout.
 # CPU math_dapo rule reward, no GenRM. Defaults: BS128, mini128, N16, 2K+10K.
 # Reuses the common job's vLLM-Omni source selection, editable install, site
 # environment, native checks and Ray head/worker startup.
@@ -17,6 +17,40 @@
 # TOTAL_TRAINING_STEPS=2 STEM_IGNORE_EOS=true bash .../run_huanyu_stem_job.sh
 # --train-only: on VC_TASK_INDEX=0 after prepare_huanyu_stem_env.sh and manual
 # Ray startup. Keeps this profile but skips ALL common job setup/Ray startup.
+#
+# Launch commands (choose ONE size; run the same command on every job node):
+# export PROJECT_ROOT=/opt/huawei/dataset/infra_data/code/verl_omni_qwen36_gzq_new
+# export MODEL_PATH=/opt/huawei/dataset/model_gy/downloaded_models/2748
+# export STEM_DATA_DIR=/opt/huawei/dataset/infra_data/data/rl_stem_data
+# export HUANYU_VLLM_SOURCE=/opt/huawei/dataset/infra_data/code/vllm-omni-xy-dbb-dev
+#
+# 16 cards: one node; platform VC_TASK_INDEX=0, VC_WORKER_NUM=1.
+# TOTAL_NPUS=16 TRAIN_BATCH_SIZE=16 PPO_MINI_BATCH_SIZE=8 ROLLOUT_N=4 \
+#   bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/run_huanyu_stem_job.sh"
+# 32 cards: two nodes; platform VC_TASK_INDEX=0/1, VC_WORKER_NUM=2.
+# TOTAL_NPUS=32 TRAIN_BATCH_SIZE=16 PPO_MINI_BATCH_SIZE=8 ROLLOUT_N=4 \
+#   bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/run_huanyu_stem_job.sh"
+# 128 cards: eight nodes; platform VC_TASK_INDEX=0..7, VC_WORKER_NUM=8.
+# TOTAL_NPUS=128 TRAIN_BATCH_SIZE=128 PPO_MINI_BATCH_SIZE=128 ROLLOUT_N=16 \
+#   bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/run_huanyu_stem_job.sh"
+# 256 cards: sixteen nodes; platform VC_TASK_INDEX=0..15, VC_WORKER_NUM=16.
+# TOTAL_NPUS=256 TRAIN_BATCH_SIZE=128 PPO_MINI_BATCH_SIZE=128 ROLLOUT_N=16 \
+#   bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/run_huanyu_stem_job.sh"
+#
+# VC_WORKER_HOSTS must list all nodes, head first (one host for 16 cards).
+# Set these VC_* variables yourself only if the platform does not supply them.
+# TOTAL_NPUS is global; NUM_NPUS stays 16 per node. RM is always disabled:
+# RM_ENABLE=0, REWARD_POOL_NPUS=0, rule reward=math_dapo. No RM_MODEL_PATH needed.
+# TRAIN_BATCH_SIZE -> data.train_batch_size (global prompt count)
+# PPO_MINI_BATCH_SIZE -> actor.ppo_mini_batch_size (prompt count before N repeats)
+# ROLLOUT_N -> rollout.n (responses per prompt); trajectories per step = BS*N.
+# Required: TRAIN_BATCH_SIZE % PPO_MINI_BATCH_SIZE == 0 and
+# (PPO_MINI_BATCH_SIZE * ROLLOUT_N) % TOTAL_NPUS == 0.
+# ROLLOUT_TP=4/8/16 (default 8); replicas = TOTAL_NPUS/ROLLOUT_TP.
+# Batch/card settings use these environment variables, not Hydra overrides.
+# If environment and Ray are ALREADY prepared, run only on the head:
+# TOTAL_NPUS=32 TRAIN_BATCH_SIZE=16 PPO_MINI_BATCH_SIZE=8 ROLLOUT_N=4 RAY_ADDRESS=auto \
+#   bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/run_huanyu_stem_job.sh" --train-only
 set -euo pipefail
 
 _STEM_TRAIN_ONLY=0
@@ -36,9 +70,9 @@ for _file in run_huanyu_32card_job.sh run_huanyu_stem.sh run_huanyu.sh; do
     [[ -r "$_STEM_JOB_EXAMPLES/$_file" ]] || { echo "FATAL: missing $_STEM_JOB_EXAMPLES/$_file" >&2; exit 2; }
 done
 if [[ -z "${TOTAL_NPUS:-}" ]]; then
-    case "${VC_WORKER_NUM:-}" in 8) TOTAL_NPUS=128 ;; 16) TOTAL_NPUS=256 ;; *) TOTAL_NPUS=128 ;; esac
+    case "${VC_WORKER_NUM:-}" in 1) TOTAL_NPUS=16 ;; 2) TOTAL_NPUS=32 ;; 8) TOTAL_NPUS=128 ;; 16) TOTAL_NPUS=256 ;; *) TOTAL_NPUS=128 ;; esac
 fi
-case "$TOTAL_NPUS" in 128|256) ;; *) echo 'FATAL: TOTAL_NPUS must be 128 or 256' >&2; exit 2 ;; esac
+case "$TOTAL_NPUS" in 16|32|128|256) ;; *) echo 'FATAL: TOTAL_NPUS must be 16, 32, 128 or 256' >&2; exit 2 ;; esac
 export TOTAL_NPUS HUANYU_CLUSTER_NODES=$((TOTAL_NPUS / 16))
 if [[ "${HUANYU_PREPARE_ONLY:-0}" != 1 ]]; then
     [[ "${VC_TASK_INDEX:-}" =~ ^(0|[1-9][0-9]?)$ ]] && (( VC_TASK_INDEX < HUANYU_CLUSTER_NODES )) || {

@@ -2,7 +2,7 @@
 # STEM text-only training on an already prepared Ray cluster.
 # Run ONCE on the head node. No environment setup, installs or Ray start/stop.
 # Direct defaults: Actor16 + GenRM16, TP4; frozen media, dynamic token batches.
-# run_huanyu_stem_job.sh selects 128/256 Actor cards and CPU rule reward instead.
+# run_huanyu_stem_job.sh selects 16/32/128/256 Actor cards and CPU rule reward instead.
 # Defaults: no initial validation; engine-default gradient synchronization.
 # Lengths are token LIMITS (1K=1024), including the rendered chat prompt:
 #   bash run_huanyu_stem.sh                           # 2048 + 3072 = 5K
@@ -142,8 +142,8 @@ export TRAIN_FILE="$HUANYU_RUN_DIR/stem_data/train.parquet" VAL_FILE="$HUANYU_RU
 
 # Override stale 24+8, AQA and debug settings inherited from shared env files.
 if [[ "${STEM_SCALED_JOB:-0}" == 1 ]]; then
-    [[ "$STEM_REWARD_MODE" == rule && "${NUM_NPUS:-}" == 16 && "${NNODES:-}" =~ ^(8|16)$ ]] || {
-        echo 'FATAL: scaled STEM requires rule reward and 8/16 nodes of 16 NPUs; use run_huanyu_stem_job.sh' >&2; exit 2;
+    [[ "$STEM_REWARD_MODE" == rule && "${NUM_NPUS:-}" == 16 && "${NNODES:-}" =~ ^(1|2|8|16)$ ]] || {
+        echo 'FATAL: scaled STEM requires rule reward and 1/2/8/16 nodes of 16 NPUs; use run_huanyu_stem_job.sh' >&2; exit 2;
     }
     for _key in TRAIN_BATCH_SIZE PPO_MINI_BATCH_SIZE ROLLOUT_N ROLLOUT_TP ROLLOUT_MAX_NUM_SEQS; do
         [[ "${!_key:-}" =~ ^[1-9][0-9]{0,5}$ ]] || { echo "FATAL: invalid $_key" >&2; exit 2; }

@@ -455,7 +455,7 @@ class TextABLauncherTests(unittest.TestCase):
         self.assertEqual(hydra_options(rollout)["actor_rollout_ref.rollout.engine_kwargs.vllm_omni.async_scheduling"], "false")
 
     def test_serve_pythonpath_prefers_native_and_retains_unrelated_entries(self):
-        native = "/opt/huawei/dataset/infra_data/code/vllm-omni-xy-qwen-vit"
+        native = "/opt/huawei/dataset/infra_data/code/vllm-omni-xy-dbb-dev"
         stale = "/vllm-workspace/vllm-omni"
         with patch.dict(os.environ, {"PYTHONPATH": os.pathsep.join((stale, str(self.project), native, "/extra/lib"))}):
             entries = self.plan("serve")["env"]["PYTHONPATH"].split(os.pathsep)
@@ -513,6 +513,8 @@ class TextABLauncherTests(unittest.TestCase):
         self.assertEqual(snapshot["selected_environment"]["HCCL_OP_EXPANSION_MODE"],
                          call.call_args.kwargs["env"]["HCCL_OP_EXPANSION_MODE"])
         self.assertEqual(snapshot["argv"], call.call_args.args[0])
+        for key in ("HUANYU_VLLM_SOURCE", "HUANYU_VLLM_OMNI_ROOT", "PYTHONPATH"):
+            self.assertEqual(snapshot["selected_environment"][key], call.call_args.kwargs["env"][key])
         self.assertEqual(call.call_args.kwargs["env"]["MODEL_PATH"], str(self.model))
         self.assertEqual(json.loads((self.root / "serve.deploy.yaml").read_text()), snapshot["deploy"])
         with patch.object(LAUNCHER.subprocess, "call") as second_call:
@@ -581,6 +583,8 @@ class TextABLauncherTests(unittest.TestCase):
             "verl_omni_ext.models.qwen3_6_whisper.vllm_omni": registration,
             "vllm_omni.config.pipeline_registry": SimpleNamespace(register_pipeline=register),
             "vllm.entrypoints.cli.main": SimpleNamespace(main=cli_main),
+            "verl_omni_ext.models.qwen3_6_huanyu.runtime_imports": SimpleNamespace(
+                report_native_source=lambda scope: events.append("source:" + scope)),
         }
         def load(name):
             if name == "vllm.entrypoints.cli.main":
@@ -588,7 +592,7 @@ class TextABLauncherTests(unittest.TestCase):
             return modules[name]
         with patch.object(LAUNCHER.importlib, "import_module", side_effect=load), redirect_stdout(io.StringIO()):
             self.assertEqual(LAUNCHER.main(["_serve_cli", *native_arguments]), 17)
-        self.assertEqual(events, ["register", "native_cli"])
+        self.assertEqual(events, ["register", "source:serve-api", "native_cli"])
         self.assertIs(LAUNCHER.sys.argv, original_argv)
 
     def test_api_registration_failure_never_falls_back_to_unregistered_native_cli(self):
@@ -598,6 +602,24 @@ class TextABLauncherTests(unittest.TestCase):
                 LAUNCHER.main(["_serve_cli", "serve", str(self.model), "--omni"])
         self.assertEqual(load.call_count, 1)
         self.assertIs(LAUNCHER.sys.argv, original_argv)
+
+    def test_api_source_mismatch_stops_before_native_cli_main(self):
+        from unittest.mock import Mock
+        cli = Mock()
+        reporter = Mock(side_effect=RuntimeError("source mismatch"))
+        modules = {
+            "verl_omni_ext.models.qwen3_6_whisper.vllm_omni": SimpleNamespace(
+                QWEN36_WHISPER_THINKER_ONLY_PIPELINE=SimpleNamespace(model_type="qwen3_6_whisper_thinker_only")
+            ),
+            "vllm_omni.config.pipeline_registry": SimpleNamespace(register_pipeline=Mock()),
+            "vllm.entrypoints.cli.main": SimpleNamespace(main=cli),
+            "verl_omni_ext.models.qwen3_6_huanyu.runtime_imports": SimpleNamespace(report_native_source=reporter),
+        }
+        with patch.object(LAUNCHER.importlib, "import_module", side_effect=modules.__getitem__), redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(RuntimeError, "source mismatch"):
+                LAUNCHER.serve_cli(["serve", str(self.model), "--omni"])
+        reporter.assert_called_once_with("serve-api")
+        cli.assert_not_called()
 
     def test_internal_entry_rejects_non_serve_commands_without_imports(self):
         with patch.object(LAUNCHER.importlib, "import_module") as load:

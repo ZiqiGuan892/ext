@@ -1,6 +1,9 @@
 """Exercise native import diagnostics without importing ext or the GPU stack."""
 
 import importlib.util
+from contextlib import redirect_stdout
+import io
+import json
 import os
 import shutil
 import socket
@@ -53,6 +56,7 @@ class RuntimeImportsTests(unittest.TestCase):
         environment_patch.start()
         self.addCleanup(environment_patch.stop)
         os.environ.pop("HUANYU_VLLM_OMNI_ROOT", None)
+        os.environ.pop("HUANYU_VLLM_SOURCE", None)
         self.original_path = list(sys.path)
 
     def write_native(self, source=VALID_NATIVE):
@@ -83,6 +87,49 @@ class RuntimeImportsTests(unittest.TestCase):
         self.assertTrue(all(callable(getattr(native, name)) for name in SYMBOLS))
         self.assertIs(runtime_imports.load_huanyu_native(self.checkout), native)
         self.assert_selection_unchanged()
+
+    def test_source_report_uses_real_loaded_paths_and_selected_root(self):
+        self.write_native()
+        native = runtime_imports.load_huanyu_native(self.checkout)
+        with patch.dict(os.environ, {"HUANYU_VLLM_SOURCE": str(self.checkout),
+                                     "HUANYU_VLLM_OMNI_ROOT": "/stale/root", "HUANYU_TEXT_AB_SIDE": "serve"}), \
+                redirect_stdout(io.StringIO()) as output:
+            record = runtime_imports.report_native_source("inference-worker")
+        self.assertEqual(record["status"], "VERIFIED")
+        self.assertEqual(record["pid"], os.getpid())
+        self.assertEqual(record["side"], "serve")
+        self.assertEqual(record["origins"][NATIVE_MODULE], str(Path(native.__file__).resolve()))
+        self.assertEqual(record["expected_root"], str(self.checkout.resolve()))
+        self.assertEqual(json.loads(output.getvalue().split(" ", 3)[3]), record)
+        self.assert_selection_unchanged()
+
+    def test_source_report_rejects_mixed_loaded_submodule_without_reimporting(self):
+        rogue = ModuleType("vllm_omni.platforms.npu.rogue")
+        rogue.__file__ = str(self.checkout.parent / "other-checkout/vllm_omni/rogue.py")
+        sys.modules[rogue.__name__] = rogue
+        with patch.dict(os.environ, {"HUANYU_VLLM_SOURCE": str(self.checkout)}), redirect_stdout(io.StringIO()) as output:
+            with self.assertRaisesRegex(RuntimeError, "source mismatch"):
+                runtime_imports.report_native_source("serve-api")
+        record = json.loads(output.getvalue().split(" ", 3)[3])
+        self.assertEqual(record["status"], "FAILED")
+        self.assertIn(rogue.__name__, record["mismatches"])
+        self.assertIs(sys.modules[rogue.__name__], rogue)
+        self.assertNotIn(NATIVE_MODULE, sys.modules)  # logging must not eagerly load model modules
+        self.assert_selection_unchanged()
+
+    def test_source_report_without_expected_root_does_not_claim_verification(self):
+        with redirect_stdout(io.StringIO()):
+            record = runtime_imports.report_native_source("serve-api")
+        self.assertEqual(record["status"], "REPORTED")
+        self.assertIsNone(record["expected_root"])
+        self.assertNotIn(NATIVE_MODULE, sys.modules)
+
+    def test_source_report_rejects_package_without_file(self):
+        del self.packages["vllm_omni"].__file__
+        with redirect_stdout(io.StringIO()) as output:
+            with self.assertRaisesRegex(RuntimeError, "source mismatch"):
+                runtime_imports.report_native_source("serve-api")
+        self.assertIn("status=FAILED", output.getvalue())
 
     def test_environment_selects_root_and_explicit_argument_takes_precedence(self):
         self.write_native()
@@ -191,7 +238,7 @@ class RuntimeImportsTests(unittest.TestCase):
     def test_missing_native_without_root_reports_default_checkout_candidate(self):
         with self.assertRaises(RuntimeError) as raised:
             runtime_imports.load_huanyu_native()
-        self.assertIn("vllm-workspace", str(raised.exception))
+        self.assertIn("vllm-omni-xy-dbb-dev", str(raised.exception))
         self.assertIn("vllm-omni", str(raised.exception))
         self.assertIn("expected_native_file=", str(raised.exception))
         self.assertIsInstance(raised.exception.__cause__, ModuleNotFoundError)

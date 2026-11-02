@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Source in each launcher before Python imports. No copying or installation.
 huanyu_select_native_source() {
-    local root="${HUANYU_VLLM_SOURCE:-${HUANYU_VLLM_OMNI_ROOT:-/opt/huawei/dataset/infra_data/code/vllm-omni-xy-qwen-vit}}"
+    local root="${HUANYU_VLLM_SOURCE:-${HUANYU_VLLM_OMNI_ROOT:-/opt/huawei/dataset/infra_data/code/vllm-omni-xy-dbb-dev}}"
     local entry retained="" required
     local -a entries=()
     if [[ "$root" != /* || "$root" == *:* || "$root" == *$'\n'* ]]; then

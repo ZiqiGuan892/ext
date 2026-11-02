@@ -33,6 +33,8 @@ def serve_cli(argv):
     registry.register_pipeline(pipeline)
     print("[huanyu-text-ab] API pipeline registered: {}".format(pipeline.model_type), flush=True)
     native_cli = importlib.import_module("vllm.entrypoints.cli.main")
+    source_reporter = importlib.import_module("verl_omni_ext.models.qwen3_6_huanyu.runtime_imports")
+    source_reporter.report_native_source("serve-api")
     previous_argv = sys.argv
     try:
         sys.argv = ["vllm", *argv]
@@ -187,7 +189,7 @@ def build_launch(root, case, project, mode, port=28889, served_model="qwen3.8", 
         env[key] = "0"
     # Both launch paths use the same source selector as environment preparation.
     native = (env.get("HUANYU_VLLM_SOURCE") or env.get("HUANYU_VLLM_OMNI_ROOT")
-              or "/opt/huawei/dataset/infra_data/code/vllm-omni-xy-qwen-vit")
+              or "/opt/huawei/dataset/infra_data/code/vllm-omni-xy-dbb-dev")
     env["HUANYU_VLLM_SOURCE"] = env["HUANYU_VLLM_OMNI_ROOT"] = native
     deploy = None
     if mode == "serve":
@@ -401,6 +403,7 @@ def main(argv=None):
         snapshot = {key: value for key, value in plan.items() if key != "env"}
         snapshot["selected_environment"] = {
             key: plan["env"][key] for key in (
+                "HUANYU_VLLM_SOURCE", "HUANYU_VLLM_OMNI_ROOT",
                 "HUANYU_PRECISION_PROFILE", "HUANYU_GRAPH_MODE", "HCCL_OP_EXPANSION_MODE",
                 "VLLM_ASCEND_WEIGHT_NZ_MODE", "USE_OPTIMIZED_MODEL",
                 "HUANYU_TRAIN_AUDIO_ENCODER", "HUANYU_TRAIN_AUDIO_PROJECTOR",
@@ -412,7 +415,7 @@ def main(argv=None):
             )
         }
         snapshot["selected_environment"].update({
-            key: plan["env"].get(key) for key in ("VLLM_BATCH_INVARIANT", "HCCL_DETERMINISTIC",
+            key: plan["env"].get(key) for key in ("PYTHONPATH", "VLLM_BATCH_INVARIANT", "HCCL_DETERMINISTIC",
                                                 "ASCEND_LAUNCH_BLOCKING", "NCCL_DETERMINISTIC", "LCCL_DETERMINISTIC")
         })
         with target.open("x", encoding="utf-8") as stream:

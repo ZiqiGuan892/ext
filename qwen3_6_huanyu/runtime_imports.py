@@ -10,6 +10,7 @@ an already imported vLLM module.
 import argparse
 from contextlib import contextmanager
 import importlib
+import json
 import os
 from pathlib import Path
 import socket
@@ -20,7 +21,7 @@ NATIVE_MODULE = "vllm_omni.model_executor.models.minicpmo_5_0.huanyu_audio"
 REQUIRED_SYMBOLS = (
     "HuanyuFbankFeatureExtractor", "HuanyuAudioEncoder", "huanyu_project_and_fold",
 )
-DEFAULT_ROOT = "/vllm-workspace/vllm-omni"
+DEFAULT_ROOT = "/opt/huawei/dataset/infra_data/code/vllm-omni-xy-dbb-dev"
 
 
 @contextmanager
@@ -110,6 +111,48 @@ def load_huanyu_native(expected_root=None):
             f"{_details(expected_root)}"
         )
     return native
+
+
+def report_native_source(scope):
+    """Report loaded module files in this process, without loading model weights.
+
+    Validate every file-backed vllm_omni module already loaded at this boundary.
+    This does not claim to check modules imported later or any other process.
+    """
+    package = importlib.import_module("vllm_omni")
+    selected = os.environ.get("HUANYU_VLLM_SOURCE") or os.environ.get("HUANYU_VLLM_OMNI_ROOT")
+    expected = Path(selected).resolve() if selected else None
+    origins = {}
+    for name, module in list(sys.modules.items()):
+        if name == "vllm_omni" or name.startswith("vllm_omni."):
+            origin = _origin(module)
+            if origin is not None:
+                origins[name] = str(origin)
+    mismatches = {
+        name: path for name, path in origins.items()
+        if expected is not None and not Path(path).is_relative_to((expected / "vllm_omni").resolve())
+    }
+    if _origin(package) is None:
+        mismatches["vllm_omni"] = "missing __file__"
+    interesting = (
+        "vllm_omni", NATIVE_MODULE,
+        "vllm_omni.model_executor.models.minicpmo_5_0.minicpmo_5_0_omni",
+        "vllm_omni.model_executor.models.minicpmo_5_0.minicpmo_5_0_omni_llm",
+        "vllm_omni.platforms.npu.worker.npu_ar_worker",
+        "vllm_omni.platforms.npu.worker.npu_ar_model_runner",
+    )
+    status = "FAILED" if mismatches else ("VERIFIED" if expected else "REPORTED")
+    record = dict(scope=scope, status=status, host=socket.gethostname(), pid=os.getpid(),
+                  rank=os.environ.get("RANK"), local_rank=os.environ.get("LOCAL_RANK"),
+                  side=os.environ.get("HUANYU_TEXT_AB_SIDE", "unknown"),
+                  expected_root=str(expected) if expected else None,
+                  origins={name: origins[name] for name in interesting if name in origins},
+                  checked_module_count=len(origins), mismatches=mismatches)
+    print(f"[huanyu-source] scope={scope} status={status} "
+          + json.dumps(record, ensure_ascii=False, sort_keys=True), flush=True)
+    if mismatches:
+        raise RuntimeError("Huanyu vLLM-Omni source mismatch; see [huanyu-source] actual module paths")
+    return record
 
 
 def main():

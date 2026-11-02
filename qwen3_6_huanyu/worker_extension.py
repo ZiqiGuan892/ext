@@ -16,6 +16,7 @@ from .processor_compat import install_huanyu_processor_compat
 from .rollout_precision import install_huanyu_rollout_precision
 from .weight_reload import bind_huanyu_weight_reload
 from .precision_policy import report_policy
+from .runtime_imports import report_native_source
 
 
 class HuanyuColocateWorkerExtension(vLLMOmniColocateWorkerExtension):
@@ -42,6 +43,7 @@ install_huanyu_cache_precision()
 if os.environ.get("HUANYU_EMBEDDING_AB_DIR", "").strip():
     from .prompt_embedding_probe import install_runtime_probe
     install_runtime_probe()
+report_native_source("inference-worker")
 print(
     f"[huanyu-worker] explicit precision extension selected; host={socket.gethostname()} "
     f"pid={os.getpid()} source={__file__} "
