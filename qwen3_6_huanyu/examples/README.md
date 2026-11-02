@@ -56,9 +56,15 @@ serve 的真实源码检查：`launch_huanyu_aqa_text_ab.py serve` 在实际API�
 `[huanyu-source] scope=serve-api status=VERIFIED`；显式Huanyu worker扩展在安装原生钩子后
 打印 `scope=inference-worker`。JSON中的 `origins` 来自当前进程已导入模块的 `__file__`，
 包含包入口以及已加载的音频、模型和NPU worker/runner模块，并记录host、pid、side、expected_root。
-检查会核对当时全部已加载且有文件来源的 `vllm_omni.*` 模块；混用其他目录会打印
+检查会核对当时已加载且有文件来源的 `vllm_omni.*` 运行模块；混用其他目录会打印
 `status=FAILED` 和mismatches并停止启动。未提供预期目录时只报告 `REPORTED`，不声称校验通过。
 该记录不覆盖其他进程或此后才加载的模块；应同时查看API与各 `Worker_TP*` 的记录。
+
+仅生成的版本元数据模块 `vllm_omni._version` 允许来自安装目录，路径单列在
+`metadata_origins`；不在所选目录时还会出现在 `metadata_outside_selected_root`。
+这不表示版本元数据与所选源码提交一致。`VERIFIED` 仅表示已加载的运行模块通过路径检查；
+`vllm_omni.version`、模型、算子、worker和runner仍严格校验，不能因此混用旧实现。
+`checked_module_count` 不包含上述元数据模块，`loaded_module_count` 包含它。
 
 ```bash
 grep -n '\[huanyu-source\]' "$AB_ROOT/serve_console.log"

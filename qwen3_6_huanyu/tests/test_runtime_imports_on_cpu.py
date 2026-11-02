@@ -117,6 +117,58 @@ class RuntimeImportsTests(unittest.TestCase):
         self.assertNotIn(NATIVE_MODULE, sys.modules)  # logging must not eagerly load model modules
         self.assert_selection_unchanged()
 
+    def install_external_version_metadata(self):
+        module = ModuleType("vllm_omni._version")
+        module.__file__ = str(self.checkout.parent / "installed/vllm_omni/_version.py")
+        sys.modules[module.__name__] = module
+        return module
+
+    def test_installed_version_metadata_does_not_block_selected_runtime(self):
+        self.write_native()
+        native = runtime_imports.load_huanyu_native(self.checkout)
+        metadata = self.install_external_version_metadata()
+        with patch.dict(os.environ, {"HUANYU_VLLM_SOURCE": str(self.checkout)}), redirect_stdout(io.StringIO()) as output:
+            record = runtime_imports.report_native_source("serve-api")
+        self.assertEqual(record["status"], "VERIFIED")
+        self.assertEqual(record["mismatches"], {})
+        self.assertEqual(record["metadata_outside_selected_root"],
+                         {metadata.__name__: str(Path(metadata.__file__).resolve())})
+        self.assertEqual(record["metadata_origins"], record["metadata_outside_selected_root"])
+        self.assertEqual(record["loaded_module_count"], record["checked_module_count"] + 1)
+        self.assertEqual(record["origins"][NATIVE_MODULE], str(Path(native.__file__).resolve()))
+        self.assertEqual(json.loads(output.getvalue().split(" ", 3)[3]), record)
+        self.assertIs(sys.modules[metadata.__name__], metadata)
+        self.assertIs(sys.modules[NATIVE_MODULE], native)
+        self.assert_selection_unchanged()
+
+    def test_version_metadata_exception_never_exempts_runtime_or_similar_names(self):
+        metadata = self.install_external_version_metadata()
+        for name in ("vllm_omni", NATIVE_MODULE, "vllm_omni.platforms.npu.worker.npu_ar_worker",
+                     "vllm_omni.version", "vllm_omni._version_extra", "vllm_omni._version.child"):
+            with self.subTest(name=name):
+                wrong = ModuleType(name)
+                wrong.__file__ = str(self.checkout.parent / "installed" / (name.replace(".", "/") + ".py"))
+                with patch.dict(sys.modules, {name: wrong}), \
+                        patch.dict(os.environ, {"HUANYU_VLLM_SOURCE": str(self.checkout)}), \
+                        redirect_stdout(io.StringIO()) as output:
+                    with self.assertRaisesRegex(RuntimeError, "source mismatch"):
+                        runtime_imports.report_native_source("inference-worker")
+                record = json.loads(output.getvalue().split(" ", 3)[3])
+                self.assertEqual(record["status"], "FAILED")
+                self.assertIn(name, record["mismatches"])
+                self.assertNotIn(metadata.__name__, record["mismatches"])
+                self.assertIn(metadata.__name__, record["metadata_outside_selected_root"])
+        self.assert_selection_unchanged()
+
+    def test_local_version_metadata_is_reported_without_a_foreign_path(self):
+        metadata = self.install_external_version_metadata()
+        metadata.__file__ = str(self.checkout / "vllm_omni/_version.py")
+        with patch.dict(os.environ, {"HUANYU_VLLM_SOURCE": str(self.checkout)}), redirect_stdout(io.StringIO()):
+            record = runtime_imports.report_native_source("serve-api")
+        self.assertEqual(record["status"], "VERIFIED")
+        self.assertEqual(record["metadata_outside_selected_root"], {})
+        self.assertIn(metadata.__name__, record["metadata_origins"])
+
     def test_source_report_without_expected_root_does_not_claim_verification(self):
         with redirect_stdout(io.StringIO()):
             record = runtime_imports.report_native_source("serve-api")

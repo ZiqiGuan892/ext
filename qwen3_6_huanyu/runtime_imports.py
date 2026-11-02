@@ -22,6 +22,10 @@ REQUIRED_SYMBOLS = (
     "HuanyuFbankFeatureExtractor", "HuanyuAudioEncoder", "huanyu_project_and_fold",
 )
 DEFAULT_ROOT = "/opt/huawei/dataset/infra_data/code/vllm-omni-xy-dbb-dev"
+# Generated package-version metadata may be supplied by the installed build
+# while the runtime code comes from PYTHONPATH. Exempt this exact module only;
+# vllm_omni.version and all model/operator/worker modules remain source-checked.
+BUILD_METADATA_MODULES = frozenset({"vllm_omni._version"})
 
 
 @contextmanager
@@ -116,8 +120,10 @@ def load_huanyu_native(expected_root=None):
 def report_native_source(scope):
     """Report loaded module files in this process, without loading model weights.
 
-    Validate every file-backed vllm_omni module already loaded at this boundary.
-    This does not claim to check modules imported later or any other process.
+    Validate file-backed runtime modules already loaded at this boundary.
+    Report generated build-version metadata separately, including foreign paths.
+    This does not claim to check modules imported later or any other process,
+    or that installed version metadata matches the selected source revision.
     """
     package = importlib.import_module("vllm_omni")
     selected = os.environ.get("HUANYU_VLLM_SOURCE") or os.environ.get("HUANYU_VLLM_OMNI_ROOT")
@@ -128,10 +134,12 @@ def report_native_source(scope):
             origin = _origin(module)
             if origin is not None:
                 origins[name] = str(origin)
-    mismatches = {
+    outside_root = {
         name: path for name, path in origins.items()
         if expected is not None and not Path(path).is_relative_to((expected / "vllm_omni").resolve())
     }
+    metadata_origins = {name: path for name, path in origins.items() if name in BUILD_METADATA_MODULES}
+    mismatches = {name: path for name, path in outside_root.items() if name not in BUILD_METADATA_MODULES}
     if _origin(package) is None:
         mismatches["vllm_omni"] = "missing __file__"
     interesting = (
@@ -147,7 +155,13 @@ def report_native_source(scope):
                   side=os.environ.get("HUANYU_TEXT_AB_SIDE", "unknown"),
                   expected_root=str(expected) if expected else None,
                   origins={name: origins[name] for name in interesting if name in origins},
-                  checked_module_count=len(origins), mismatches=mismatches)
+                  loaded_module_count=len(origins),
+                  checked_module_count=len(origins) - len(metadata_origins),
+                  metadata_origins=metadata_origins,
+                  metadata_outside_selected_root={name: path for name, path in outside_root.items()
+                                                  if name in BUILD_METADATA_MODULES},
+                  validation_scope="loaded_runtime_modules_excluding_generated_version_metadata",
+                  mismatches=mismatches)
     print(f"[huanyu-source] scope={scope} status={status} "
           + json.dumps(record, ensure_ascii=False, sort_keys=True), flush=True)
     if mismatches:
