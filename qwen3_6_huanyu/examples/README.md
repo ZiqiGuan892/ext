@@ -257,6 +257,17 @@ source "$PROJECT_ROOT/examples/qwen3_6_huanyu/prepare_huanyu_env.sh"
 
 每个节点的准备日志 `prepare.log` 和激活文件 `activate.sh` 位于 `$PROJECT_ROOT/runs/environment/prepare_<时间>_<随机串>/`。可通过 `HUANYU_PREPARE_LOG_ROOT` 指定根目录。已有 raylet 时跳过 editable 安装，继续检查源码及环境。重用的进程保留启动时继承的环境。
 
+普通和 STEM prepare 均会在检查通过后向当前用户的 `~/.bashrc` 添加一次加载行。新交互式 Bash 会从 `~/.huanyu-vllm-source.sh` 恢复选中的 `HUANYU_VLLM_SOURCE`，将该源码根目录放到 `PYTHONPATH` 首位。再次 prepare 可以切换源码。训练参数、设备和节点 rank 仍由当次作业配置。
+
+已完成准备的节点可以单独执行以下命令持久化源码选择。在新开的交互式 Bash 中验证导入路径，期望输出为所选源码下的 `vllm_omni/__init__.py`。
+
+```bash
+export HUANYU_VLLM_SOURCE=/opt/huawei/dataset/infra_data/code/vllm-omni-xy-dbb-dev
+bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/native_source.sh" --persist
+env -u PYTHONPATH -u HUANYU_VLLM_SOURCE -u HUANYU_VLLM_OMNI_ROOT \
+  bash -ic 'cd / && python3 -c "import importlib.util; print(importlib.util.find_spec(\"vllm_omni\").origin)"'
+```
+
 ### 两节点一键启动
 
 两节点使用相同项目路径和 IP 列表；主节点 `VC_TASK_INDEX=0`，从节点改为1。下例选择冻结缓存训练：

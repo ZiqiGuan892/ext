@@ -192,7 +192,7 @@ def prepare_case(args):
                      "repetition_penalty": 1, "frequency_penalty": 0, "presence_penalty": 0},
         "engine": {"tensor_parallel_size": args.tp, "prompt_length": 3072,
                    "max_model_len": context, "max_num_batched_tokens": context,
-                   "max_num_seqs": 1, "dtype": "bfloat16", "gpu_memory_utilization": 0.5,
+                   "max_num_seqs": 1, "dtype": "bfloat16", "gpu_memory_utilization": 0.9,
                    "enforce_eager": True,
                    "batch_invariant": getattr(args, "batch_invariant", "false") == "true"},
     }

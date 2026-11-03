@@ -27,6 +27,9 @@ class HuanyuPrepareEnvironmentTests(unittest.TestCase):
         self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
         fixture = self.fixture
+        self.user_dir = fixture.project / "test user"
+        self.user_dir.mkdir()
+        fixture.env["HOME"] = job_fixture.shell_path(self.user_dir)
         for name in ("prepare_huanyu_env.sh", "prepared_env.py", "graph_mode.sh"):
             shutil.copyfile(EXAMPLES / name, fixture.examples / name)
         self.entry = fixture.examples / "prepare_huanyu_env.sh"
@@ -203,6 +206,30 @@ exit "$prepare_status"
         self.assertFalse(self.capture.exists())
         self.assertEqual(len(self.activation_files()), 1)
 
+    def test_fresh_interactive_bash_uses_last_prepared_source(self):
+        rc = self.user_dir / ".bashrc"
+        rc.write_bytes(b'export PYTHONPATH="/user/path:/vllm-workspace/vllm-omni"')
+        self.assert_success(self.run_prepare(sourced=False))
+        installed = rc.read_bytes()
+        self.assertTrue(installed.startswith(b'export PYTHONPATH="/user/path:/vllm-workspace/vllm-omni"\n'))
+        alternate = self.fixture.project / "second 'source'"
+        shutil.copytree(self.fixture.native_source, alternate)
+        choice = job_fixture.shell_path(alternate)
+        self.assert_success(self.run_prepare({"HUANYU_VLLM_SOURCE": choice}))
+        self.assertEqual(rc.read_bytes(), installed)
+
+        env = dict(self.fixture.env)
+        for key in ("HUANYU_VLLM_SOURCE", "HUANYU_VLLM_OMNI_ROOT", "PYTHONPATH", "VC_TASK_INDEX"):
+            env.pop(key, None)
+        result = subprocess.run(
+            [job_fixture.find_bash(), "--noprofile", "-ic",
+             'printf "%s\\n" "$HUANYU_VLLM_SOURCE" "$HUANYU_VLLM_OMNI_ROOT" '
+             '"$PYTHONPATH" "${VC_TASK_INDEX-unset}"'],
+            env=env, capture_output=True, text=True, encoding="utf-8", timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), [choice, choice, choice + ":/user/path", "unset"])
+
     def test_stem_prepare_starts_head_and_checks_all_nodes_before_activation(self):
         self.use_stem_entry()
         result = self.run_prepare(
@@ -311,6 +338,7 @@ exit "$prepare_status"
         self.assertEqual(result.returncode, 134, result.stdout + result.stderr)
         self.assert_no_ray_or_training()
         self.assertFalse(self.activation_files())
+        self.assertFalse((self.user_dir / ".bashrc").exists())
         self.assertFalse(any(event["args"][0] == "check-devices" for event in self.fixture.events("helper")))
 
     def test_existing_ray_is_not_started_reinstalled_or_waited_on(self):

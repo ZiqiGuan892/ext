@@ -120,6 +120,16 @@ class TextABLauncherTests(unittest.TestCase):
                 for mode in ("serve", "rollout"):
                     self.assertEqual(self.plan(mode)["env"]["HCCL_OP_EXPANSION_MODE"], expected)
 
+    def test_saved_memory_budget_reaches_both_engines(self):
+        for budget in (0.5, 0.9):
+            with self.subTest(budget=budget):
+                self.case["engine"]["gpu_memory_utilization"] = budget
+                serve = self.plan("serve")
+                self.assertEqual(serve["deploy"]["stages"][0]["gpu_memory_utilization"], budget)
+                self.assertEqual(cli_option(serve["command"], "--gpu-memory-utilization"), str(budget))
+                rollout = hydra_options(self.plan("rollout"))
+                self.assertEqual(rollout["actor_rollout_ref.rollout.gpu_memory_utilization"], str(budget))
+
     def test_forward_window_requires_logits_and_preserves_bs1(self):
         self.case["forward_check"] = {"enabled": True, "max_steps": 2}
         with self.assertRaisesRegex(ValueError, "forward_check"):

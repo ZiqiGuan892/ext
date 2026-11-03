@@ -515,6 +515,7 @@ if (( _PREPARE_ONLY )); then
         echo '[huanyu-env] existing Ray was left running; activation does not update its inherited environment'
     fi
     export HUANYU_SKIP_EDITABLE_INSTALL=1
+    bash "$_NATIVE_PATH_FILE" --persist
     "$_PYTHON" -S "${_HUANYU_EXAMPLE_DIR}/prepared_env.py" write \
         --snapshot "$HUANYU_PREPARE_SNAPSHOT" --output "$HUANYU_PREPARED_ENV_FILE" \
         --stack-limit "$(ulimit -S -s)"

@@ -104,8 +104,11 @@ def build_launch(root, case, project, mode, port=28889, served_model="qwen3.8", 
     seed = int(sampling["seed"])
     if prompt_length < 1 or max_tokens < 1 or context < prompt_length + max_tokens or not 0 <= seed < 2**63:
         raise ValueError("invalid prompt/response/context budget or seed")
+    utilization = engine.get("gpu_memory_utilization")
+    if type(utilization) not in (int, float) or not 0 < utilization <= 1:
+        raise ValueError("engine.gpu_memory_utilization must be a number in (0, 1]")
     for key, expected in {"max_num_batched_tokens": context, "max_num_seqs": 1,
-                          "gpu_memory_utilization": 0.5, "enforce_eager": True}.items():
+                          "enforce_eager": True}.items():
         if engine.get(key) != expected:
             raise ValueError("comparison requires engine.{}={!r}".format(key, expected))
     env = dict(os.environ)
@@ -225,7 +228,7 @@ def build_launch(root, case, project, mode, port=28889, served_model="qwen3.8", 
         engine_values = {
             "tensor_parallel_size": tp, "dtype": engine["dtype"],
             "max_model_len": context, "max_num_batched_tokens": context, "max_num_seqs": 1,
-            "gpu_memory_utilization": 0.5, "enforce_eager": True,
+            "gpu_memory_utilization": utilization, "enforce_eager": True,
             "enable_prefix_caching": False, "enable_chunked_prefill": False,
             "mm_processor_cache_gb": 0, "seed": seed, "generation_config": "vllm",
         }
@@ -246,7 +249,7 @@ def build_launch(root, case, project, mode, port=28889, served_model="qwen3.8", 
             "--deploy-config", str(root / "serve.deploy.yaml"), "--dtype", str(engine["dtype"]),
             "--tensor-parallel-size", str(tp), "--max-model-len", str(context),
             "--max-num-batched-tokens", str(context), "--max-num-seqs", "1",
-            "--gpu-memory-utilization", "0.5", "--seed", str(seed), "--enforce-eager",
+            "--gpu-memory-utilization", str(utilization), "--seed", str(seed), "--enforce-eager",
             "--generation-config", "vllm", "--no-enable-prefix-caching", "--no-enable-chunked-prefill",
             "--mm-processor-cache-gb", "0", "--chat-template-content-format", "string",
             "--additional-config", json.dumps(extras["additional_config"], separators=(",", ":")),
@@ -292,7 +295,8 @@ def build_launch(root, case, project, mode, port=28889, served_model="qwen3.8", 
                    "data.validation_shuffle=false", "data.val_batch_size=1", "data.train_max_samples=-1",
                    "data.val_max_samples=-1", "data.seed={}".format(seed), "actor_rollout_ref.rollout.load_format=safetensors",
                    "actor_rollout_ref.rollout.free_cache_engine=false", "actor_rollout_ref.rollout.dtype=bfloat16",
-                   "actor_rollout_ref.rollout.max_num_seqs=1", "actor_rollout_ref.rollout.gpu_memory_utilization=0.5",
+                   "actor_rollout_ref.rollout.max_num_seqs=1",
+                   "actor_rollout_ref.rollout.gpu_memory_utilization={}".format(utilization),
                    "actor_rollout_ref.rollout.enable_chunked_prefill=false",
                    "actor_rollout_ref.rollout.enable_prefix_caching=false",
                    "actor_rollout_ref.rollout.agent.num_workers=4",
