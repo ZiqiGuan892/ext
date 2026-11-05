@@ -500,8 +500,8 @@ class TextABLauncherTests(unittest.TestCase):
         self.assertEqual(hydra_options(rollout)["actor_rollout_ref.rollout.engine_kwargs.vllm_omni.async_scheduling"], "false")
 
     def test_serve_pythonpath_prefers_native_and_retains_unrelated_entries(self):
-        native = "/opt/huawei/dataset/infra_data/code/vllm-omni-xy-dbb-dev"
-        stale = "/vllm-workspace/vllm-omni"
+        native = "/vllm-workspace/vllm-omni"
+        stale = "/opt/huawei/dataset/infra_data/code/vllm-omni-xy-qwen-vit"
         with patch.dict(os.environ, {"PYTHONPATH": os.pathsep.join((stale, str(self.project), native, "/extra/lib"))}):
             entries = self.plan("serve")["env"]["PYTHONPATH"].split(os.pathsep)
         self.assertEqual(entries[:2], [native, str(self.project)])

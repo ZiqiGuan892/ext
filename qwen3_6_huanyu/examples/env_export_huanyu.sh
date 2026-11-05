@@ -9,7 +9,7 @@ source "${_huanyu_env_example_dir}/precision_mode.sh" || {
 # source 前 export PROJECT_ROOT 可覆盖部署目录；默认使用 infra_data 下的新项目。
 # ext 从 PROJECT_ROOT 加载，verl / verl-omni 继续使用公共安装。
 export PROJECT_ROOT="${PROJECT_ROOT:-/opt/huawei/dataset/infra_data/verl_omni_qwen36_gzq_new}"
-# 兼容旧 Huanyu 入口；插件由 PROJECT_ROOT 选择，推理源码由 HUANYU_VLLM_SOURCE 选择。
+# 插件由 PROJECT_ROOT 选择；vLLM-Omni 使用已有安装，源码变量仅用于核对导入位置。
 export QWEN36_HUANYU_ROOT="${PROJECT_ROOT}"
 source "${_huanyu_env_example_dir}/native_source.sh" || {
     return 1 2>/dev/null || exit 1
@@ -75,10 +75,10 @@ for _huanyu_path in "${_huanyu_python_entries[@]}"; do
     esac
     _huanyu_retained_pythonpath="${_huanyu_retained_pythonpath:+${_huanyu_retained_pythonpath}:}${_huanyu_path}"
 done
-export PYTHONPATH="${HUANYU_VLLM_OMNI_ROOT}:${_huanyu_ext_python_root}:/opt/huawei/algorithm/:/opt/huawei/dataset/ccb_data/code/package_install/verl${_huanyu_retained_pythonpath:+:${_huanyu_retained_pythonpath}}"
+export PYTHONPATH="${_huanyu_ext_python_root}:/opt/huawei/algorithm/:/opt/huawei/dataset/ccb_data/code/package_install/verl${_huanyu_retained_pythonpath:+:${_huanyu_retained_pythonpath}}"
 huanyu_select_native_source || { return 1 2>/dev/null || exit 1; }
 echo "[huanyu env] ext Python root: ${_huanyu_ext_python_root}"
-echo "[huanyu env] vLLM-Omni Python root: ${HUANYU_VLLM_OMNI_ROOT}"
+echo "[huanyu env] expected installed vLLM-Omni: ${HUANYU_VLLM_OMNI_ROOT} (no source PYTHONPATH injection)"
 _huanyu_graph_mode_script="${_huanyu_env_example_dir}/graph_mode.sh"
 unset _huanyu_env_example_dir
 unset _huanyu_candidate _huanyu_ext_python_root

@@ -8,7 +8,8 @@
 # Activation exports the shared Ray worker startup policy (32/1/0) for manual starts.
 # Run the job's setup in an isolated shell so env_export's set -ex cannot alter the caller's shell.
 # source applies the resulting environment; bash prints an activation command.
-# Both persist the selected vLLM-Omni source for new interactive Bash shells via ~/.bashrc.
+# Neither injects a vLLM-Omni checkout into PYTHONPATH or creates a .bashrc hook.
+# Preparation retires the old generated source hook and checks the installed package.
 huanyu_prepare_environment() {
     local mode="${HUANYU_JOB_MODE:-frozen_cache}" setup_entry=run_huanyu_32card_job.sh
     local start_ray=0 arg

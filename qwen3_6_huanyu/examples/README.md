@@ -39,6 +39,7 @@ export RAY_enable_worker_prestart=0
 | 场景 | 最外层脚本 | 运行位置 | 主要默认配置 |
 |---|---|---|---|
 | 准备环境，可选启动 Ray | `source prepare_huanyu_env.sh [--start-ray]` | 每个节点 | 默认仅准备环境。加 `--start-ray` 按节点 rank 启动或复用 Ray，检查通过后返回。训练由主节点单独提交。 |
+| 环境已准备，仅启动 Ray | `bash start_huanyu_ray.sh [--check]` | 每个节点各一次 | 每节点注册16个NPU；主节点启动head，从节点等待并加入。`--check` 直接通过GCS检查资源，完成后返回。 |
 | 冻结 Huanyu、OmniMix/通用多模态数据、缓存训练 | `run_huanyu_32card_job.sh` | 两节点各执行一次 | `frozen_cache`，encoder/projector 都冻结，Actor16 + RM16，prompt3072 + response2048 |
 | 冻结缓存训练，16K | `run_huanyu_32card_16k_job.sh` | 两节点 | prompt14336 + response2048，SDPA，默认16+16 |
 | 冻结缓存训练，对照 Whisper 启动参数 | `run_huanyu_32card_whisper_aligned_job.sh` | 两节点 | 保留 Huanyu 接口；Actor BF16、rollout TP2、RM TP4，5K |
@@ -77,8 +78,8 @@ cp "$PROJECT_ROOT/verl_omni_ext/models/qwen3_6_huanyu/examples/"*.sh \
 | 通用 `TRAIN_FILE` / `VAL_FILE` | `/opt/huawei/dataset/infra_data/data/train.parquet` / 同目录 `validation.parquet` |
 | AQA 数据 | `/opt/huawei/dataset/infra_data/data/aqa_dataset/train.parquet` / 同目录 `validation.parquet` |
 | `HUANYU_EMBED_CACHE_DIR`，冻结一键模式 | `/opt/huawei/dataset/ccb_data/data/omni/embed_cache_huanyu_sampleall_q128` |
-| `HUANYU_VLLM_SOURCE`，直接运行的源码根目录 | `/opt/huawei/dataset/infra_data/code/vllm-omni-xy-dbb-dev` |
-| `HUANYU_VLLM_OMNI_ROOT`，导入检查目录 | 由所选源码目录设置，不再固定到 `/vllm-workspace/vllm-omni` |
+| `HUANYU_VLLM_SOURCE`，准备/训练时预期的安装来源 | `/vllm-workspace/vllm-omni` |
+| `HUANYU_VLLM_OMNI_ROOT`，导入检查目录 | 与预期安装来源一致；不会据此插入 `PYTHONPATH` |
 
 serve 的真实源码检查：`launch_huanyu_aqa_text_ab.py serve` 在实际API进程进入CLI前打印
 `[huanyu-source] scope=serve-api status=VERIFIED`；显式Huanyu worker扩展在安装原生钩子后
@@ -99,8 +100,9 @@ grep -n '\[huanyu-source\]' "$AB_ROOT/serve_console.log"
 # repeat实验改用 "$REPEAT_ROOT/serve_console.log"
 ```
 
-默认 `expected_root` 为 `/opt/huawei/dataset/infra_data/code/vllm-omni-xy-dbb-dev`，
-所有 `origins` 应在该目录的 `vllm_omni/` 下。显式设置 `HUANYU_VLLM_SOURCE` 仍可选其他目录。
+准备和训练默认 `expected_root` 为 `/vllm-workspace/vllm-omni`，
+所有 `origins` 应在该目录的 `vllm_omni/` 下。独立 AB serve 仍可显式选择源码目录；
+与训练对比时请使用同一安装来源，不能只给 serve 切换 checkout。
 `serve.launch.json` 同时保存启动时选定的源码变量和PYTHONPATH，作为配置记录；实际导入以
 上述进程日志为准。更换源码需重启对应serve进程。启动脚本仍清除PYTHONPATH中的已知旧目录。
 
@@ -114,12 +116,64 @@ grep -n '\[huanyu-source\]' "$AB_ROOT/serve_console.log"
 
 1. 解析路径、卡池和音频开关，检查节点编号、地址及 jemalloc。
 2. 配置精度策略，创建节点日志并持有本地 launcher 锁。
-3. 通过 `native_source.sh` 检查完整的 Huanyu 源码，将源码根目录置顶 `PYTHONPATH`。不复制、删除或替换 `/vllm-workspace/vllm-omni`。
+3. 通过 `native_source.sh` 检查预期安装目录并清理继承的 vLLM-Omni `PYTHONPATH` 项。使用已有安装，不复制、替换源码或重新安装 vLLM-Omni。
 4. 无本地 Ray 时执行项目 editable 安装；随后 source `env_export_huanyu.sh`，恢复入口保存的路径、卡池、音频及精度配置。
 5. 检查冻结缓存（仅 `frozen_cache`）、原生导入及设备；启动或复用 Ray。
 6. `VC_TASK_INDEX=0` 等待两个16卡节点就绪后提交训练；`=1` 只加入 Ray 并保持运行。音频、缓存和精度配置传入 Ray `runtime_env`。
 
-源码选择顺序为 `HUANYU_VLLM_SOURCE` → `HUANYU_VLLM_OMNI_ROOT`（兼容直接入口）→ 上表默认目录。选择后两者统一为解析后的源码根目录，源码必须包含 `vllm_omni/__init__.py`、`huanyu_audio.py` 和 `minicpmo_5_0_omni_llm.py`。旧站点环境文件不能覆盖 job 已选择的源码；训练入口将 `PYTHONPATH` 和两个根目录变量显式传入 Ray `runtime_env.env_vars`，原生导入检查核对实际 `__file__`。各节点必须能访问相同路径和版本。已有进程不会热切换已导入代码；保持运行中的源码不变，为新版本使用独立目录和新 worker。路径选择不替代依赖及插件元数据安装。
+准备与训练不再通过 `PYTHONPATH` 切换 vLLM-Omni。默认预期安装目录为 `/vllm-workspace/vllm-omni`；旧环境中 `vllm-omni-xy*` 的源码选择会重置到此目录，PYTHONPATH 中的旧 checkout、工作区源码项及其他含 `vllm_omni/__init__.py` 的目录会移除。ext、CANN 等其他依赖路径保留。显式指定其他安装目录时，`HUANYU_VLLM_SOURCE` / `HUANYU_VLLM_OMNI_ROOT` 仅用于核对来源，不会令 Python 自动导入该目录。安装目录须包含 Huanyu 模型文件，预检还核对实际导入的 `__file__`；如果 editable 安装仍指向旧仓库，会明确失败。脚本不自动重装 vLLM-Omni。
+
+旧站点环境加载后会再次清理路径，下游训练入口也不再插入源码目录。清理后的 ext/依赖 `PYTHONPATH` 和预期来源变量显式传入 Ray `runtime_env.env_vars`。所有节点需要相同安装；已运行的 Ray/worker 不会热切换，更新后应在新进程中验证。
+
+### 3.1.1 环境已准备，只启动 Ray
+
+`start_huanyu_ray.sh` 继承当前终端的环境，不执行安装、模型加载或训练。脚本与
+`job_bootstrap.py` 放在同一目录即可；无需设置 checkpoint 路径。先在每个节点加载
+prepare 生成的 `activate.sh`，或使用已经准备好环境的终端。
+
+更新时同时同步这两个文件。`--check` 会在启动 Ray 前核对 helper 是否支持
+`wait-cluster --gcs`；旧 helper 缺少该接口时会明确报错，不回退到旧 Dashboard 检查。
+若旧版启动脚本已经输出 `Ray runtime started` 后才报 `unrecognized arguments: --gcs`，
+表示 Ray 已启动、检查尚未执行；同步新版 helper 后重新执行即可复用已启动的 Ray。
+
+两节点各执行以下公共配置，填写相同的实际 IP，主节点始终在前：
+
+```bash
+export PROJECT_ROOT=/opt/huawei/dataset/infra_data/code/verl_omni_qwen36_gzq_new
+read -r -p '主节点 IP: ' HEAD_IP
+read -r -p '从节点 IP: ' WORKER_IP
+export VC_WORKER_HOSTS="$HEAD_IP,$WORKER_IP"
+export VC_WORKER_NUM=2
+export RAY_ADDRESS="$HEAD_IP:6925"
+```
+
+主节点执行：
+
+```bash
+VC_TASK_INDEX=0 bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/start_huanyu_ray.sh" --check
+```
+
+从节点执行：
+
+```bash
+VC_TASK_INDEX=1 bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/start_huanyu_ray.sh" --check
+```
+
+两条启动命令需在两个终端并行执行；主节点的 `--check` 等待全部节点，从节点只检查
+自身注册。默认超时900秒，可通过 `RAY_CLUSTER_WAIT_TIMEOUT` 调整。检查不依赖
+Dashboard，也不调用 `ray.init()` 创建额外driver。省略 `--check` 时默认跳过集群
+就绪检查，但从节点仍等待head端口可用；`HUANYU_JOB_PREFLIGHT=1` 也可开启检查。
+单节点只填写一个 `VC_WORKER_HOSTS`，设置 `VC_WORKER_NUM=1 VC_TASK_INDEX=0`。
+
+脚本固定导出 `RAY_worker_maximum_startup_concurrency=32`、
+`RAY_prestart_worker_first_driver=1`、`RAY_enable_worker_prestart=0`。
+主节点使用 `ray start --head --port=6925 --dashboard-host=0.0.0.0 --dashboard-port=8960 --resources='{"NPU": 16}'`；
+从节点使用 `ray start --address="$RAY_ADDRESS" --resources='{"NPU": 16}'`。
+端口可用 `RAY_PORT`、`RAY_DASHBOARD_PORT` 覆盖；训练终端应使用脚本末尾打印的
+`export RAY_ADDRESS=...`。脚本完成后Ray留在后台，不会启动训练。
+
+检测到本地已有raylet时复用它，不自动停止或重启；这三个启动参数只能影响新启动的
+Ray进程。使用 `bash` 执行此脚本，不要 `source`。
 
 ### 3.2 冻结缓存训练
 
@@ -172,7 +226,7 @@ AQA 入口限定音频数据，在线编码，关闭 embedding cache；两个音
 #### AQA 冻结音频并开启确定性计算的32卡入口
 
 `run_huanyu_aqa_frozen_deterministic_32card_job.sh` 复用原 `run_huanyu_aqa_unfreeze_32card_job.sh`
-的环境准备、PYTHONPATH源码选择和Ray启动流程。它强制两个组件开关为false、
+的环境准备、安装来源检查和Ray启动流程。它强制两个组件开关为false、
 `HUANYU_JOB_DETERMINISM=1`、full精度、eager执行，保留BS=4、mini batch=4、N=4、
 prompt3072+response2048、engine预算5248、Actor16+GenRM16、TP4。
 继续在线编码音频并训练LLM；默认训练前验证，保留validation_dump和rollout_dump。
@@ -184,7 +238,7 @@ prompt3072+response2048、engine预算5248、Actor16+GenRM16、TP4。
 export PROJECT_ROOT=/opt/huawei/dataset/infra_data/code/verl_omni_qwen36_gzq_new
 export MODEL_PATH=/opt/huawei/dataset/model_gy/downloaded_models/2748
 export RM_MODEL_PATH=/opt/huawei/dataset/model_gy/downloaded_models/Qwen3.5-35B-A3B
-export HUANYU_VLLM_SOURCE=/opt/huawei/dataset/infra_data/code/vllm-omni-xy-dbb-dev
+export HUANYU_VLLM_SOURCE=/vllm-workspace/vllm-omni
 bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/run_huanyu_aqa_frozen_deterministic_32card_job.sh"
 ```
 
@@ -240,17 +294,17 @@ run_huanyu_aqa_audio_train_16card.sh
 ```bash
 export PROJECT_ROOT=/opt/huawei/dataset/infra_data/verl_omni_qwen36_gzq_new
 export HUANYU_JOB_MODE=frozen_cache
-export HUANYU_VLLM_SOURCE=/opt/huawei/dataset/infra_data/code/vllm-omni-xy-dbb-dev
+export HUANYU_VLLM_SOURCE=/vllm-workspace/vllm-omni
 export HUANYU_EMBED_CACHE_DIR=/opt/huawei/dataset/ccb_data/data/omni/embed_cache_huanyu_sampleall_q128
 source "$PROJECT_ROOT/examples/qwen3_6_huanyu/prepare_huanyu_env.sh"
 ```
 
-它会设置jemalloc，直接从 `HUANYU_VLLM_SOURCE` 导入 vLLM-Omni，安装当前项目插件，加载 `env_export_huanyu.sh`，恢复路径/音频/精度配置，检查原生导入和至少16张可见NPU。env文件还包含mathruler/zarr安装、CANN/ATB环境加载、日志目录与诊断文件准备。不执行源码复制或替换。调用链为：
+它会设置jemalloc，清理 vLLM-Omni 源码路径覆盖，安装当前项目插件，加载 `env_export_huanyu.sh`，恢复音频/精度配置，并检查已有 vLLM-Omni 安装的实际来源和至少16张可见NPU。env文件还包含mathruler/zarr安装、CANN/ATB环境加载、日志目录与诊断文件准备。调用链为：
 
 ```text
 source prepare_huanyu_env.sh
   → 独立bash运行 run_huanyu_32card_job.sh（HUANYU_PREPARE_ONLY=1）
-  → native_source.sh选择源码 → editable安装 → source环境文件 → 恢复源码路径
+  → native_source.sh清理源码覆盖 → ext editable安装 → source环境文件 → 再次清理源码覆盖
   → 音频/精度配置 → 原生导入检查 → check-devices
   → prepared_env.py生成activate.sh → 结束准备子进程
   → 在当前终端source activate.sh，保留环境变量和工作目录
@@ -285,13 +339,12 @@ source "$PROJECT_ROOT/examples/qwen3_6_huanyu/prepare_huanyu_env.sh"
 
 每个节点的准备日志 `prepare.log` 和激活文件 `activate.sh` 位于 `$PROJECT_ROOT/runs/environment/prepare_<时间>_<随机串>/`。可通过 `HUANYU_PREPARE_LOG_ROOT` 指定根目录。已有 raylet 时跳过 editable 安装，继续检查源码及环境。重用的进程保留启动时继承的环境。
 
-普通和 STEM prepare 均会在检查通过后向当前用户的 `~/.bashrc` 添加一次加载行。新交互式 Bash 会从 `~/.huanyu-vllm-source.sh` 恢复选中的 `HUANYU_VLLM_SOURCE`，将该源码根目录放到 `PYTHONPATH` 首位。再次 prepare 可以切换源码。训练参数、设备和节点 rank 仍由当次作业配置。
+普通和 STEM prepare 不再写入 `~/.bashrc`，也不生成源码路径 hook。检查通过后会停用旧版脚本自动生成的 `~/.huanyu-vllm-source.sh`，保留为同目录的 `.disabled.*` 备份；用户自行维护的文件或符号链接不改动。原 `.bashrc` 的条件加载行保留，目标不存在时不执行。旧的 `activate.sh` 仍保存旧环境，请重新 prepare 后使用新生成的激活文件。
 
-已完成准备的节点可以单独执行以下命令持久化源码选择。在新开的交互式 Bash 中验证导入路径，期望输出为所选源码下的 `vllm_omni/__init__.py`。
+已完成准备的节点可单独停用上述旧 hook，并检查新进程的实际导入位置，期望为 `/vllm-workspace/vllm-omni/vllm_omni/__init__.py`（解析符号链接后）：
 
 ```bash
-export HUANYU_VLLM_SOURCE=/opt/huawei/dataset/infra_data/code/vllm-omni-xy-dbb-dev
-bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/native_source.sh" --persist
+bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/native_source.sh" --clear-persisted-source
 env -u PYTHONPATH -u HUANYU_VLLM_SOURCE -u HUANYU_VLLM_OMNI_ROOT \
   bash -ic 'cd / && python3 -c "import importlib.util; print(importlib.util.find_spec(\"vllm_omni\").origin)"'
 ```
@@ -472,7 +525,7 @@ bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/run_huanyu_stem.sh"
 | `run_output.sh` | 创建唯一运行目录及console.log、genrm_dump；同一调用链重复source复用目录 |
 | `job_bootstrap.py` | `resolve`、`sync`、`check-devices`、`wait-head`、`wait-cluster`，供一键启动调用 |
 | `check_native_runtime.py` | 原生导入与路径检查，常用 `--check --expected-root "$HUANYU_VLLM_OMNI_ROOT"` |
-| `native_source.sh` | 直接选择完整 Huanyu vLLM-Omni 源码并置顶导入路径，不复制目录 |
+| `native_source.sh` | 清理 vLLM-Omni 源码路径覆盖，记录预期安装来源；独立 AB serve 可显式选择 checkout |
 | `check_runtime.py` | 必填 `--model-path`，检查导入/processor/合成音频图片/mRoPE；不加载权重、不启Ray |
 | `check_aqa_audio_train.py` | `--train`、`--validation`、`--train-batch-size`，检查AQA来源/字段/媒体路径；不解码音频、不检查归档内部成员 |
 | `migrate_aqa_audio.py` | 复制音频归档并改写parquet，支持预检查、批量读取和进度日志，不执行训练 |
@@ -1180,7 +1233,7 @@ bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/run_huanyu_stem_job.sh"
 ```text
 每个节点 run_huanyu_stem_job.sh
   → run_huanyu_32card_job.sh（共享实现，stem模式支持1/2/8/16节点）
-  → jemalloc → 将所选 vllm-omni 源码目录置于 PYTHONPATH 首位 → editable安装当前项目
+  → jemalloc → 清除 vLLM-Omni 的 PYTHONPATH 覆盖并核对工作区安装 → editable安装当前项目
   → source env_export_huanyu.sh → 恢复本次参数 → 原生导入/NPU检查
   → rank0启动Ray head；其余节点加入Ray并阻塞等待
   → rank0直接提交一次训练（默认不运行额外Ray就绪探针）
@@ -1220,7 +1273,7 @@ bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/run_huanyu_stem_job.sh"
 ```bash
 export PROJECT_ROOT=/opt/huawei/dataset/infra_data/code/verl_omni_qwen36_gzq_new
 export MODEL_PATH=/opt/huawei/dataset/model_gy/downloaded_models/2748
-export HUANYU_VLLM_SOURCE=/opt/huawei/dataset/infra_data/code/vllm-omni-xy-dbb-dev
+export HUANYU_VLLM_SOURCE=/vllm-workspace/vllm-omni
 export HUANYU_ENV_FILE="$PROJECT_ROOT/examples/qwen3_6_huanyu/env_export_huanyu.sh"
 export STEM_DATA_DIR=/opt/huawei/dataset/infra_data/data/rl_stem_data
 export TOTAL_NPUS=128   # 支持16/32/128/256；所有节点设置相同值
@@ -1269,7 +1322,7 @@ bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/run_huanyu_stem_job.sh" --train-only
 ```bash
 export PROJECT_ROOT=/opt/huawei/dataset/infra_data/code/verl_omni_qwen36_gzq_new
 export MODEL_PATH=/opt/huawei/dataset/model_gy/downloaded_models/2748
-export HUANYU_VLLM_SOURCE=/opt/huawei/dataset/infra_data/code/vllm-omni-xy-dbb-dev
+export HUANYU_VLLM_SOURCE=/vllm-workspace/vllm-omni
 
 # 每个节点运行；VC_* 由平台按上述要求提供。先完成2个完整训练step。
 TOTAL_NPUS=128 TOTAL_TRAINING_STEPS=2 \
@@ -1502,7 +1555,7 @@ serve 的 shell 与 rollout 的 Ray worker 都必须通过，不能仅依据启�
 export PROJECT_ROOT=/opt/huawei/dataset/infra_data/code/verl_omni_qwen36_gzq_new
 export MODEL_PATH=/opt/huawei/dataset/model_gy/downloaded_models/2748
 export RM_MODEL_PATH=/opt/huawei/dataset/model_gy/downloaded_models/Qwen3.5-35B-A3B
-export HUANYU_VLLM_SOURCE=/opt/huawei/dataset/infra_data/code/vllm-omni-xy-dbb-dev
+export HUANYU_VLLM_SOURCE=/vllm-workspace/vllm-omni
 export RAY_ADDRESS=auto
 export HCCL_DETERMINISTIC=strict
 export ASCEND_LAUNCH_BLOCKING=1

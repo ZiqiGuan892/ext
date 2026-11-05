@@ -18,7 +18,7 @@
 #
 # 前置：各节点由你 source 更新后的 env_export.sh，并按新 vLLM-Omni 路径启动
 # 32 NPU Ray 集群。本脚本不 source 环境、不安装依赖、不 start/stop ray。
-# 此处导出路径仅影响新进程，不能切换已启动的旧 Ray Worker。
+# 使用已有的 vLLM-Omni 安装；不注入源码路径，不切换已启动的旧 Ray Worker。
 #
 # 用法（由 run_huanyu.sh 传入 Huanyu 适配参数后调用）：
 #   bash examples/qwen3_6_huanyu/run_qwen36_huanyu_32card.sh
@@ -41,23 +41,29 @@ if [ ! -f "${_huanyu_vllm_omni_root}/vllm_omni/__init__.py" ]; then
     exit 1
 fi
 
-# 保留 ext/verl 等路径，清除已知旧版路径和新版本的重复项。
+# 保留 ext/verl 等路径，移除 vLLM-Omni 源码覆盖，使用现有安装。
 _huanyu_retained_pythonpath=""
 IFS=: read -r -a _huanyu_python_entries <<< "${PYTHONPATH:-}"
 for _huanyu_path in "${_huanyu_python_entries[@]}"; do
     case "${_huanyu_path%/}" in
-        ""|/opt/huawei/dataset/ccb_data/code/hufenyu/vllm-omni-xy|/vllm-workspace/vllm-omni|\
+        ""|/vllm-workspace/vllm-omni|/vllm-workspace/vllm-omni/*|\
         /opt/huawei/dataset/hfy_guiyang/vllm-omni-xy-qwen-vit|\
         /opt/huawei/dataset/hfy_guiyang/vllm-omni-xy-qwen-vit/*|\
         /opt/huawei/dataset/infra_data/code/vllm-omni-xy-qwen-vit|\
-        /opt/huawei/dataset/infra_data/code/vllm-omni-xy-qwen-vit/*)
+        /opt/huawei/dataset/infra_data/code/vllm-omni-xy-qwen-vit/*|\
+        */vllm-omni-xy|*/vllm-omni-xy/*|*/vllm-omni-xy-*|*/vllm-omni-xy-*/*)
             continue ;;
     esac
+    [[ -f "$_huanyu_path/vllm_omni/__init__.py" ]] && continue
     _huanyu_retained_pythonpath="${_huanyu_retained_pythonpath:+${_huanyu_retained_pythonpath}:}${_huanyu_path}"
 done
-export PYTHONPATH="${_huanyu_vllm_omni_root}${_huanyu_retained_pythonpath:+:${_huanyu_retained_pythonpath}}"
+if [[ -n "$_huanyu_retained_pythonpath" ]]; then
+    export PYTHONPATH="$_huanyu_retained_pythonpath"
+else
+    unset PYTHONPATH
+fi
 export FILTER_OVERLONG="${FILTER_OVERLONG:-false}"
-echo "[huanyu config] vLLM-Omni Python root: ${_huanyu_vllm_omni_root}; FILTER_OVERLONG=${FILTER_OVERLONG}"
+echo "[huanyu config] expected installed vLLM-Omni: ${_huanyu_vllm_omni_root}; FILTER_OVERLONG=${FILTER_OVERLONG}"
 unset _huanyu_vllm_omni_root _huanyu_retained_pythonpath _huanyu_python_entries _huanyu_path
 
 # ---------------------------------------------------------------- 1) 模型

@@ -121,7 +121,7 @@ _PYTHON=python3
 _HELPER="${_HUANYU_EXAMPLE_DIR}/job_bootstrap.py"
 _ENV_FILE="${HUANYU_ENV_FILE:-${_HUANYU_EXAMPLE_DIR}/env_export_huanyu.sh}"
 _PRECISION_FILE="${_HUANYU_EXAMPLE_DIR}/precision_mode.sh"
-_VLLM_SOURCE="${HUANYU_VLLM_SOURCE:-${HUANYU_VLLM_OMNI_ROOT:-/opt/huawei/dataset/infra_data/code/vllm-omni-xy-dbb-dev}}"
+_VLLM_SOURCE="${HUANYU_VLLM_SOURCE:-${HUANYU_VLLM_OMNI_ROOT:-/vllm-workspace/vllm-omni}}"
 _NATIVE_PATH_FILE="${_HUANYU_EXAMPLE_DIR}/native_source.sh"
 _RANK="${VC_TASK_INDEX:-}"
 _WAIT="${RAY_CLUSTER_WAIT_TIMEOUT:-900}"
@@ -378,7 +378,7 @@ if pgrep -x raylet >/dev/null; then _LIVE_RAY=1; fi
 export HUANYU_VLLM_SOURCE="$_VLLM_SOURCE"
 source "$_NATIVE_PATH_FILE" || exit $?
 _VLLM_SOURCE="$HUANYU_VLLM_SOURCE"
-echo "[huanyu-job] vLLM-Omni source=$_VLLM_SOURCE (PYTHONPATH; no checkout replacement)"
+echo "[huanyu-job] expected installed vLLM-Omni=$_VLLM_SOURCE (no source PYTHONPATH injection)"
 if (( _LIVE_RAY )); then
     echo '[huanyu-job] reusing local Ray; editable installation skipped; existing workers keep their loaded code'
 else
@@ -398,7 +398,7 @@ source "$_ENV_FILE"
 set +x
 set -euo pipefail
 # A custom/older site env may reset these to /vllm-workspace/vllm-omni.
-# Restore the caller's source and its import priority before any runtime check.
+# Restore the expected installed origin and remove old source-path overrides.
 export HUANYU_VLLM_SOURCE="$_VLLM_SOURCE"
 source "$_NATIVE_PATH_FILE" || exit $?
 for _key in "${!_HUANYU_PATH_CONFIG[@]}"; do
@@ -525,7 +525,7 @@ if (( _PREPARE_ONLY )); then
         echo '[huanyu-env] existing Ray was left running; activation does not update its inherited environment'
     fi
     export HUANYU_SKIP_EDITABLE_INSTALL=1
-    bash "$_NATIVE_PATH_FILE" --persist
+    bash "$_NATIVE_PATH_FILE" --clear-persisted-source
     "$_PYTHON" -S "${_HUANYU_EXAMPLE_DIR}/prepared_env.py" write \
         --snapshot "$HUANYU_PREPARE_SNAPSHOT" --output "$HUANYU_PREPARED_ENV_FILE" \
         --stack-limit "$(ulimit -S -s)"

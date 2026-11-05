@@ -8,8 +8,8 @@ _HUANYU_EXAMPLE_DIR="${PROJECT_ROOT}/examples/qwen3_6_huanyu"
 cd "${PROJECT_ROOT}"
 source "${_HUANYU_EXAMPLE_DIR}/run_output.sh" || exit $?
 
-# The driver and NEW Ray workers must import the same Huanyu-enabled checkout.
-# Exporting PYTHONPATH only in this shell does not establish the Ray job's env.
+# The driver and NEW Ray workers must use the same installed Huanyu package.
+# Forward ext/dependency paths to Ray after removing source overrides.
 source "${_HUANYU_EXAMPLE_DIR}/native_source.sh" || exit $?
 _huanyu_retained_path=""
 IFS=: read -r -a _huanyu_path_entries <<< "${PYTHONPATH:-}"
@@ -25,7 +25,7 @@ for _huanyu_path in "${_huanyu_path_entries[@]}"; do
     esac
     _huanyu_retained_path+="${_huanyu_retained_path:+:}${_huanyu_path}"
 done
-export PYTHONPATH="${HUANYU_VLLM_OMNI_ROOT}:${PWD}${_huanyu_retained_path:+:${_huanyu_retained_path}}"
+export PYTHONPATH="${PWD}${_huanyu_retained_path:+:${_huanyu_retained_path}}"
 python3 -B "${_HUANYU_EXAMPLE_DIR}/check_native_runtime.py" --check
 # JSON quotes are passed as part of ONE argv element for Hydra to parse; no eval.
 _huanyu_ray_pythonpath="$(python3 -c 'import json, os; print(json.dumps(os.environ["PYTHONPATH"]))')"

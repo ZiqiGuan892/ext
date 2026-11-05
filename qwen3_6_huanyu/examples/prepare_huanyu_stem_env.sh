@@ -5,6 +5,7 @@
 # Uses prepare_huanyu_env.sh's mandatory environment checks, optional GCS check
 # with --start-ray, and Ray worker startup policy for all supported card counts.
 # HUANYU_ENV_FILE may select another site env_export script.
+# Uses the installed /vllm-workspace/vllm-omni package; no source PYTHONPATH injection.
 huanyu_prepare_stem_environment() {
     local examples
     examples="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)" || return $?

@@ -1,4 +1,6 @@
-# 主仓库及其他插件训练脚本的显存默认值
+# 主仓库及其他插件脚本补丁
+
+## 训练显存默认值
 
 本分支直接发布 `qwen3_6_huanyu/`。另外 8 个本地训练脚本不在本分支中，
 对应修改保存在 `other-training-memory-defaults.patch`，路径相对于 verl-omni 项目根目录。
@@ -8,3 +10,27 @@
 `git apply --check /path/to/other-training-memory-defaults.patch`，
 检查通过后执行 `git apply /path/to/other-training-memory-defaults.patch`。
 如果该工作区已经应用过本次修改，无需再次应用。
+
+## 使用已安装的 vLLM-Omni
+
+`qwen3_6_huanyu/` 下的 prepare、job 和训练入口已直接包含此次修改。
+另外 5 个历史入口不属于本分支的目录布局，其改动放在
+`installed-vllm-source-policy.patch`，路径相对于 verl-omni 项目根目录：
+
+- `verl_omni_ext/env_export.sh`
+- `verl_omni_ext/env_export_huanyu.sh`
+- `verl_omni_ext/examples/run_huanyu.sh`
+- `verl_omni_ext/examples/run_qwen36_huanyu_32card.sh`
+- `verl_omni_ext/examples/run_qwen36_whisper_32card.sh`
+
+补丁移除这些入口对 vLLM-Omni 的 PYTHONPATH 注入，保留 ext/CANN 等依赖路径；
+默认使用已安装的 `/vllm-workspace/vllm-omni`。在包含上述文件的项目根目录运行：
+
+```bash
+git apply --check /path/to/installed-vllm-source-policy.patch
+git apply /path/to/installed-vllm-source-policy.patch
+```
+
+用下载后的实际补丁路径替换 `/path/to/installed-vllm-source-policy.patch`。
+若这些文件已更新，无需重复应用；仅拉取本分支不会自动修改外部目录中的文件。
+环境更新后重新 prepare，并使用新生成的激活文件；旧 Ray/worker 不会自动切换安装来源。

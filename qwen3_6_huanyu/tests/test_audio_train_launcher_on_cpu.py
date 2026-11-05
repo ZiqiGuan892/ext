@@ -246,6 +246,9 @@ class AudioTrainingLauncherTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         capture = json.loads(self.capture.read_text())
         actual = dict(item.lstrip("+").split("=", 1) for item in capture["argv"])
+        self.assertNotIn("native source", capture["env"]["PYTHONPATH"])
+        self.assertEqual(json.loads(actual["ray_kwargs.ray_init.runtime_env.env_vars.PYTHONPATH"]),
+                         capture["env"]["PYTHONPATH"])
         for key in ("HUANYU_VLLM_SOURCE", "HUANYU_VLLM_OMNI_ROOT"):
             self.assertEqual(Path(capture["env"][key]).resolve(), (self.project / "native source").resolve())
             self.assertEqual(json.loads(actual["ray_kwargs.ray_init.runtime_env.env_vars." + key]),

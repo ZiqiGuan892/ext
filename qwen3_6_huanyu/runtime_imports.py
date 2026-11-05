@@ -21,7 +21,7 @@ NATIVE_MODULE = "vllm_omni.model_executor.models.minicpmo_5_0.huanyu_audio"
 REQUIRED_SYMBOLS = (
     "HuanyuFbankFeatureExtractor", "HuanyuAudioEncoder", "huanyu_project_and_fold",
 )
-DEFAULT_ROOT = "/opt/huawei/dataset/infra_data/code/vllm-omni-xy-dbb-dev"
+DEFAULT_ROOT = "/vllm-workspace/vllm-omni"
 # Generated package-version metadata may be supplied by the installed build
 # while the runtime code comes from PYTHONPATH. Exempt this exact module only;
 # vllm_omni.version and all model/operator/worker modules remain source-checked.
@@ -78,9 +78,10 @@ def _check_origin(module, expected_root):
     origin = _origin(module)
     if origin is None or not origin.is_relative_to(package_root.resolve()):
         raise RuntimeError(
-            "Huanyu vLLM-Omni source mismatch. Start a fresh process with the "
-            "selected checkout first in PYTHONPATH; do not mix imported modules "
-            f"from different checkouts.\n{_details(expected_root)}"
+            "Huanyu vLLM-Omni source mismatch. Check this Python environment's "
+            "installed/editable package and remove stale source-path overrides; "
+            "then start fresh workers. Environment preparation does not inject "
+            f"a vLLM-Omni checkout into PYTHONPATH.\n{_details(expected_root)}"
         )
 
 

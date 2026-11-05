@@ -23,7 +23,7 @@
 # export PROJECT_ROOT=/opt/huawei/dataset/infra_data/code/verl_omni_qwen36_gzq_new
 # export MODEL_PATH=/opt/huawei/dataset/model_gy/downloaded_models/2748
 # export STEM_DATA_DIR=/opt/huawei/dataset/infra_data/data/rl_stem_data
-# export HUANYU_VLLM_SOURCE=/opt/huawei/dataset/infra_data/code/vllm-omni-xy-dbb-dev
+# vLLM-Omni uses the existing /vllm-workspace/vllm-omni installation.
 #
 # 16 cards: one node; platform VC_TASK_INDEX=0, VC_WORKER_NUM=1.
 # TOTAL_NPUS=16 TRAIN_BATCH_SIZE=16 PPO_MINI_BATCH_SIZE=8 ROLLOUT_N=4 \

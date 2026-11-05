@@ -1,0 +1,153 @@
+--- a/verl_omni_ext/env_export.sh
++++ b/verl_omni_ext/env_export.sh
+@@ -30,19 +30,21 @@
+     return 1 2>/dev/null || exit 1
+ fi
+ # source 之前可能已加载旧环境。移除已知的旧仓库和新仓库重复项，避免残留。
+-# 新路径在服务器对应 /opt/huawei/dataset/hfy_guiyang/vllm-omni-xy-qwen-vit。
++# vLLM-Omni 使用现有安装，不再通过 PYTHONPATH 选择源码。
+ _gzq_retained_pythonpath=""
+ IFS=: read -r -a _gzq_python_entries <<< "${PYTHONPATH:-}"
+ for _gzq_path in "${_gzq_python_entries[@]}"; do
+     case "${_gzq_path%/}" in
+-        ""|/opt/huawei/dataset/ccb_data/code/hufenyu/vllm-omni-xy|/vllm-workspace/vllm-omni|/opt/huawei/dataset/hfy_guiyang/vllm-omni-xy-qwen-vit)
++        ""|/vllm-workspace/vllm-omni|/vllm-workspace/vllm-omni/*|\
++        */vllm-omni-xy|*/vllm-omni-xy/*|*/vllm-omni-xy-*)
+             continue ;;
+     esac
++    [[ -f "$_gzq_path/vllm_omni/__init__.py" ]] && continue
+     _gzq_retained_pythonpath="${_gzq_retained_pythonpath:+${_gzq_retained_pythonpath}:}${_gzq_path}"
+ done
+-export PYTHONPATH="${_gzq_vllm_omni_root}:${_gzq_ext_python_root}:/opt/huawei/algorithm/:/opt/huawei/dataset/ccb_data/code/package_install/verl${_gzq_retained_pythonpath:+:${_gzq_retained_pythonpath}}"
++export PYTHONPATH="${_gzq_ext_python_root}:/opt/huawei/algorithm/:/opt/huawei/dataset/ccb_data/code/package_install/verl${_gzq_retained_pythonpath:+:${_gzq_retained_pythonpath}}"
+ echo "[gzq env] ext Python root: ${_gzq_ext_python_root}"
+-echo "[gzq env] vLLM-Omni Python root: ${_gzq_vllm_omni_root}"
++echo "[gzq env] expected installed vLLM-Omni: ${_gzq_vllm_omni_root} (no source PYTHONPATH injection)"
+ unset _gzq_candidate _gzq_ext_python_root _gzq_vllm_omni_root
+ unset _gzq_retained_pythonpath _gzq_python_entries _gzq_path
+
+--- a/verl_omni_ext/env_export_huanyu.sh
++++ b/verl_omni_ext/env_export_huanyu.sh
+@@ -8,6 +8,7 @@
+ # 兼容旧 Huanyu 入口；唯一需要配置的代码根目录是 PROJECT_ROOT。
+ export QWEN36_HUANYU_ROOT="${PROJECT_ROOT}"
+ export HUANYU_VLLM_OMNI_ROOT=/vllm-workspace/vllm-omni
++export HUANYU_VLLM_SOURCE="$HUANYU_VLLM_OMNI_ROOT"
+ unset QWEN36_GZQ_ROOT
+
+ # PYTHONPATH 加入 Python 包的父目录，兼容直接布局及外层插件仓库目录。
+@@ -60,14 +61,16 @@
+         /vllm-workspace/vllm-omni|\
+         /vllm-workspace/vllm-omni/*|\
+         /opt/huawei/dataset/hfy_guiyang/vllm-omni-xy-qwen-vit|\
+-        /opt/huawei/dataset/hfy_guiyang/vllm-omni-xy-qwen-vit/*)
++        /opt/huawei/dataset/hfy_guiyang/vllm-omni-xy-qwen-vit/*|\
++        */vllm-omni-xy|*/vllm-omni-xy/*|*/vllm-omni-xy-*)
+             continue ;;
+     esac
++    [[ -f "$_huanyu_path/vllm_omni/__init__.py" ]] && continue
+     _huanyu_retained_pythonpath="${_huanyu_retained_pythonpath:+${_huanyu_retained_pythonpath}:}${_huanyu_path}"
+ done
+-export PYTHONPATH="${HUANYU_VLLM_OMNI_ROOT}:${_huanyu_ext_python_root}:/opt/huawei/algorithm/:/opt/huawei/dataset/ccb_data/code/package_install/verl${_huanyu_retained_pythonpath:+:${_huanyu_retained_pythonpath}}"
++export PYTHONPATH="${_huanyu_ext_python_root}:/opt/huawei/algorithm/:/opt/huawei/dataset/ccb_data/code/package_install/verl${_huanyu_retained_pythonpath:+:${_huanyu_retained_pythonpath}}"
+ echo "[huanyu env] ext Python root: ${_huanyu_ext_python_root}"
+-echo "[huanyu env] vLLM-Omni Python root: ${HUANYU_VLLM_OMNI_ROOT}"
++echo "[huanyu env] expected installed vLLM-Omni: ${HUANYU_VLLM_OMNI_ROOT} (no source PYTHONPATH injection)"
+ unset _huanyu_candidate _huanyu_ext_python_root
+ unset _huanyu_retained_pythonpath _huanyu_python_entries _huanyu_path
+
+--- a/verl_omni_ext/examples/run_huanyu.sh
++++ b/verl_omni_ext/examples/run_huanyu.sh
+@@ -6,9 +6,10 @@
+ export PROJECT_ROOT="${PROJECT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+ cd "${PROJECT_ROOT}"
+
+-# The driver and NEW Ray workers must import the same Huanyu-enabled checkout.
+-# Exporting PYTHONPATH only in this shell does not establish the Ray job's env.
++# The driver and NEW Ray workers must use the installed Huanyu-enabled package.
++# Only the ext/dependency paths are forwarded to the Ray job.
+ export HUANYU_VLLM_OMNI_ROOT=/vllm-workspace/vllm-omni
++export HUANYU_VLLM_SOURCE="$HUANYU_VLLM_OMNI_ROOT"
+ _huanyu_retained_path=""
+ IFS=: read -r -a _huanyu_path_entries <<< "${PYTHONPATH:-}"
+ for _huanyu_path in "${_huanyu_path_entries[@]}"; do
+@@ -16,11 +17,13 @@
+         ""|"$HUANYU_VLLM_OMNI_ROOT"|"$PWD"|\
+         /opt/huawei/dataset/ccb_data/code/hufenyu/vllm-omni-xy|\
+         /opt/huawei/dataset/ccb/data/code/hufenyu/vllm-omni-xy|\
+-        /opt/huawei/dataset/hfy_guiyang/vllm-omni-xy-qwen-vit) continue ;;
++        /vllm-workspace/vllm-omni/*|\
++        */vllm-omni-xy|*/vllm-omni-xy/*|*/vllm-omni-xy-*) continue ;;
+     esac
++    [[ -f "$_huanyu_path/vllm_omni/__init__.py" ]] && continue
+     _huanyu_retained_path+="${_huanyu_retained_path:+:}${_huanyu_path}"
+ done
+-export PYTHONPATH="${HUANYU_VLLM_OMNI_ROOT}:${PWD}${_huanyu_retained_path:+:${_huanyu_retained_path}}"
++export PYTHONPATH="${PWD}${_huanyu_retained_path:+:${_huanyu_retained_path}}"
+ python3 -B verl_omni_ext/models/qwen3_6_huanyu/runtime_imports.py --check
+ # JSON quotes are passed as part of ONE argv element for Hydra to parse; no eval.
+ _huanyu_ray_pythonpath="$(python3 -c 'import json, os; print(json.dumps(os.environ["PYTHONPATH"]))')"
+--- a/verl_omni_ext/examples/run_qwen36_huanyu_32card.sh
++++ b/verl_omni_ext/examples/run_qwen36_huanyu_32card.sh
+@@ -41,19 +41,25 @@
+     exit 1
+ fi
+
+-# 保留 ext/verl 等路径，清除已知旧版路径和新版本的重复项。
++# 保留 ext/verl 等路径；vLLM-Omni 使用现有安装，不注入源码路径。
+ _huanyu_retained_pythonpath=""
+ IFS=: read -r -a _huanyu_python_entries <<< "${PYTHONPATH:-}"
+ for _huanyu_path in "${_huanyu_python_entries[@]}"; do
+     case "${_huanyu_path%/}" in
+-        ""|/opt/huawei/dataset/ccb_data/code/hufenyu/vllm-omni-xy|/vllm-workspace/vllm-omni|/opt/huawei/dataset/hfy_guiyang/vllm-omni-xy-qwen-vit)
++        ""|/vllm-workspace/vllm-omni|/vllm-workspace/vllm-omni/*|\
++        */vllm-omni-xy|*/vllm-omni-xy/*|*/vllm-omni-xy-*)
+             continue ;;
+     esac
++    [[ -f "$_huanyu_path/vllm_omni/__init__.py" ]] && continue
+     _huanyu_retained_pythonpath="${_huanyu_retained_pythonpath:+${_huanyu_retained_pythonpath}:}${_huanyu_path}"
+ done
+-export PYTHONPATH="${_huanyu_vllm_omni_root}${_huanyu_retained_pythonpath:+:${_huanyu_retained_pythonpath}}"
++if [[ -n "$_huanyu_retained_pythonpath" ]]; then
++    export PYTHONPATH="$_huanyu_retained_pythonpath"
++else
++    unset PYTHONPATH
++fi
+ export FILTER_OVERLONG=false
+-echo "[huanyu config] vLLM-Omni Python root: ${_huanyu_vllm_omni_root}; FILTER_OVERLONG=${FILTER_OVERLONG}"
++echo "[huanyu config] expected installed vLLM-Omni: ${_huanyu_vllm_omni_root}; FILTER_OVERLONG=${FILTER_OVERLONG}"
+ unset _huanyu_vllm_omni_root _huanyu_retained_pythonpath _huanyu_python_entries _huanyu_path
+
+ # ---------------------------------------------------------------- 1) 模型
+--- a/verl_omni_ext/examples/run_qwen36_whisper_32card.sh
++++ b/verl_omni_ext/examples/run_qwen36_whisper_32card.sh
+@@ -40,19 +40,25 @@
+     exit 1
+ fi
+
+-# 保留 ext/verl 等路径，清除已知旧版路径和新版本的重复项。
++# 保留 ext/verl 等路径；vLLM-Omni 使用现有安装，不注入源码路径。
+ _huanyu_retained_pythonpath=""
+ IFS=: read -r -a _huanyu_python_entries <<< "${PYTHONPATH:-}"
+ for _huanyu_path in "${_huanyu_python_entries[@]}"; do
+     case "${_huanyu_path%/}" in
+-        ""|/opt/huawei/dataset/ccb_data/code/hufenyu/vllm-omni-xy|/vllm-workspace/vllm-omni|/opt/huawei/dataset/hfy_guiyang/vllm-omni-xy-qwen-vit)
++        ""|/vllm-workspace/vllm-omni|/vllm-workspace/vllm-omni/*|\
++        */vllm-omni-xy|*/vllm-omni-xy/*|*/vllm-omni-xy-*)
+             continue ;;
+     esac
++    [[ -f "$_huanyu_path/vllm_omni/__init__.py" ]] && continue
+     _huanyu_retained_pythonpath="${_huanyu_retained_pythonpath:+${_huanyu_retained_pythonpath}:}${_huanyu_path}"
+ done
+-export PYTHONPATH="${_huanyu_vllm_omni_root}${_huanyu_retained_pythonpath:+:${_huanyu_retained_pythonpath}}"
++if [[ -n "$_huanyu_retained_pythonpath" ]]; then
++    export PYTHONPATH="$_huanyu_retained_pythonpath"
++else
++    unset PYTHONPATH
++fi
+ export FILTER_OVERLONG=false
+-echo "[huanyu config] vLLM-Omni Python root: ${_huanyu_vllm_omni_root}; FILTER_OVERLONG=${FILTER_OVERLONG}"
++echo "[huanyu config] expected installed vLLM-Omni: ${_huanyu_vllm_omni_root}; FILTER_OVERLONG=${FILTER_OVERLONG}"
+ unset _huanyu_vllm_omni_root _huanyu_retained_pythonpath _huanyu_python_entries _huanyu_path
+
+ # ---------------------------------------------------------------- 1) 模型

@@ -290,7 +290,7 @@ class RuntimeImportsTests(unittest.TestCase):
     def test_missing_native_without_root_reports_default_checkout_candidate(self):
         with self.assertRaises(RuntimeError) as raised:
             runtime_imports.load_huanyu_native()
-        self.assertIn("vllm-omni-xy-dbb-dev", str(raised.exception))
+        self.assertIn(str(Path(runtime_imports.DEFAULT_ROOT).resolve()), str(raised.exception))
         self.assertIn("vllm-omni", str(raised.exception))
         self.assertIn("expected_native_file=", str(raised.exception))
         self.assertIsInstance(raised.exception.__cause__, ModuleNotFoundError)

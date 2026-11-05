@@ -247,7 +247,7 @@ for _huanyu_path in "${_huanyu_entries[@]}"; do
     esac
     _huanyu_retained_path+="${_huanyu_retained_path:+:}${_huanyu_path}"
 done
-export PYTHONPATH="${HUANYU_VLLM_OMNI_ROOT}:${PROJECT_ROOT}${_huanyu_retained_path:+:${_huanyu_retained_path}}"
+export PYTHONPATH="${PROJECT_ROOT}${_huanyu_retained_path:+:${_huanyu_retained_path}}"
 python3 -B "${_HUANYU_EXAMPLE_DIR}/check_native_runtime.py" --check --expected-root "${HUANYU_VLLM_OMNI_ROOT}"
 
 _huanyu_ray_args=()

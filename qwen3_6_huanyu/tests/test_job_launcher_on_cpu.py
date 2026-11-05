@@ -930,6 +930,7 @@ if command not in ("ray", "git", "pip", "flock", "env-source", "sleep"):
             for key in ("HUANYU_VLLM_SOURCE", "HUANYU_VLLM_OMNI_ROOT"):
                 self.assertEqual(Path(event["native_env"][key]).resolve(), self.native_source.resolve())
             self.assertNotIn("/vllm-workspace/vllm-omni", event["native_env"]["PYTHONPATH"])
+            self.assertNotIn("fake vllm source", event["native_env"]["PYTHONPATH"])
             self.assertIn("preserved/dependency", event["native_env"]["PYTHONPATH"].replace("\\", "/"))
         self.assertEqual(before, {str(p.relative_to(self.native_source)): p.read_bytes()
                                   for p in self.native_source.rglob("*.py")})
