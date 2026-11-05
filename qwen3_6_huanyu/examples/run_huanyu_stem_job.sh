@@ -4,7 +4,8 @@
 # CPU math_dapo rule reward, no GenRM. Defaults: BS128, mini128, N16, 2K+10K.
 # Reuses the common job's vLLM-Omni source selection, editable install, site
 # environment, native checks and Ray head/worker startup.
-# Extra Ray readiness probes default off; HUANYU_RAY_READINESS_CHECK=1 opts in.
+# Extra job probes default off; HUANYU_JOB_PREFLIGHT=1 opts in.
+# HUANYU_RAY_READINESS_CHECK remains a fallback alias.
 # Required: VC_TASK_INDEX=0..nodes-1, VC_WORKER_HOSTS=comma-separated host list.
 # If the platform launches one Bash per NPU, the common job elects LOCAL_RANK=0
 # on EACH node; other local ranks exit before setup/Ray and keep all NPUs free.
@@ -62,10 +63,10 @@ fi
 export PROJECT_ROOT="${PROJECT_ROOT:-/opt/huawei/dataset/infra_data/code/verl_omni_qwen36_gzq_new}"
 [[ "$PROJECT_ROOT" == /* ]] || { echo 'FATAL: PROJECT_ROOT must be absolute' >&2; exit 2; }
 _STEM_JOB_EXAMPLES="$PROJECT_ROOT/examples/qwen3_6_huanyu"
-export HUANYU_RAY_READINESS_CHECK="${HUANYU_RAY_READINESS_CHECK:-0}"
+export HUANYU_RAY_READINESS_CHECK="${HUANYU_JOB_PREFLIGHT:-${HUANYU_RAY_READINESS_CHECK:-0}}"
 case "$HUANYU_RAY_READINESS_CHECK" in
     0|1) ;;
-    *) echo 'FATAL: HUANYU_RAY_READINESS_CHECK must be 0 or 1' >&2; exit 2 ;;
+    *) echo 'FATAL: HUANYU_JOB_PREFLIGHT (or HUANYU_RAY_READINESS_CHECK) must be 0 or 1' >&2; exit 2 ;;
 esac
 for _file in run_huanyu_32card_job.sh run_huanyu_stem.sh run_huanyu.sh; do
     [[ -r "$_STEM_JOB_EXAMPLES/$_file" ]] || { echo "FATAL: missing $_STEM_JOB_EXAMPLES/$_file" >&2; exit 2; }
@@ -119,7 +120,7 @@ esac
 export STEM_CONTEXT_SLACK=0 STEM_DYNAMIC_BSZ=false STEM_SYNC_EACH_MICROBATCH=true
 export PPO_MICRO_BATCH_SIZE_PER_GPU=1 ACTOR_MODEL_DTYPE=fp32 REF_MODEL_DTYPE=bfloat16
 export ACTOR_FORWARD_PREFETCH=false ACTIVATION_OFFLOAD=false
-export ROLLOUT_GPU_MEM_UTIL="${ROLLOUT_GPU_MEM_UTIL:-0.5}"
+export ROLLOUT_GPU_MEM_UTIL="${ROLLOUT_GPU_MEM_UTIL:-0.6}"
 export ROLLOUT_NUM_WORKERS="${ROLLOUT_NUM_WORKERS:-128}"
 export HUANYU_PRECISION_PROFILE=full HUANYU_GRAPH_MODE=0
 export HUANYU_FREEZE_AUDIO=true HUANYU_TRAIN_AUDIO_ENCODER=false HUANYU_TRAIN_AUDIO_PROJECTOR=false

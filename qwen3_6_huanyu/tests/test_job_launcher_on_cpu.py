@@ -63,6 +63,10 @@ def record(kind, args, **extra):
     item["native_env"] = {key: os.environ.get(key) for key in (
         "HUANYU_VLLM_SOURCE", "HUANYU_VLLM_OMNI_ROOT", "PYTHONPATH",
     )}
+    item["ray_startup_env"] = {key: os.environ.get(key) for key in (
+        "RAY_worker_maximum_startup_concurrency", "RAY_prestart_worker_first_driver",
+        "RAY_enable_worker_prestart", "HUANYU_JOB_PREFLIGHT", "HUANYU_RAY_READINESS_CHECK",
+    )}
     with Path(os.environ["HUANYU_TEST_EVENTS"]).open("a", encoding="utf-8") as stream:
         stream.write(json.dumps(item) + "\\n")
 """
@@ -137,7 +141,7 @@ keys = (
     "NNODES", "NUM_NPUS", "REWARD_POOL_NPUS", "RM_ENABLE", "RAY_ADDRESS", "LD_PRELOAD",
     "PROJECT_ROOT", "MODEL_PATH", "RM_MODEL_PATH", "TRAIN_FILE", "VAL_FILE",
     "HUANYU_STEM_TEXT_TRAIN", "HUANYU_CLUSTER_NODES", "RM_NNODES", "ROLLOUT_TP",
-    "HUANYU_RAY_READINESS_CHECK",
+    "HUANYU_RAY_READINESS_CHECK", "HUANYU_JOB_PREFLIGHT",
     "STEM_CONTEXT_LENGTH", "STEM_PROMPT_LENGTH", "STEM_DATA_DIR",
     "TRAIN_BATCH_SIZE", "PPO_MINI_BATCH_SIZE", "ROLLOUT_N", "ROLLOUT_MAX_NUM_SEQS",
     "ACTOR_OFFLOAD_POLICY", "ROLLOUT_NUM_WORKERS", "HUANYU_CHECKPOINT_VALIDATION_MODE", "HUANYU_FULL_WEIGHT_AUDIT_DIR",
@@ -411,7 +415,64 @@ if command not in ("ray", "git", "pip", "flock", "env-source", "sleep"):
         self.assertEqual(event["precision"]["MINICPMO_HUANYU_ROLLOUT_TP"], "4", event)
         self.assertEqual(event["precision"]["HUANYU_USE_PRECOMPUTE"], "1", event)
 
+    def test_default_job_skips_extra_probes_and_starts_training(self):
+        result = self.run_launcher({
+            "HUANYU_TEST_RUNTIME_EXIT": "134", "HUANYU_TEST_FAIL_WAIT": "wait-cluster",
+        })
+        self.assert_success(result)
+        self.assertFalse(self.events("runtime"))
+        self.assertFalse(any(e["args"][0] in ("check-devices", "wait-cluster")
+                             for e in self.events("helper")))
+        self.assertEqual(len(self.events("ray")), 1)
+        self.assertEqual(len(self.events("train")), 1)
+        self.assertIn("preflight=0", result.stdout)
+        self.assertIn("not prechecked", result.stdout)
+        self.assertNotIn("nodes registered", result.stdout)
+
+    def test_preflight_and_startup_policy_survive_site_env_on_both_nodes(self):
+        with (self.examples / "env_export_huanyu.sh").open("a", encoding="utf-8") as stream:
+            stream.write(
+                "export HUANYU_JOB_PREFLIGHT=1 HUANYU_RAY_READINESS_CHECK=1\n"
+                "export RAY_worker_maximum_startup_concurrency=99\n"
+                "export RAY_prestart_worker_first_driver=0 RAY_enable_worker_prestart=1\n"
+            )
+        for rank in ("0", "1"):
+            with self.subTest(rank=rank):
+                self.events_file.write_text("", encoding="utf-8")
+                result = self.run_launcher({
+                    "VC_TASK_INDEX": rank, "HUANYU_JOB_PREFLIGHT": "0",
+                    "HUANYU_RAY_READINESS_CHECK": "1", "HUANYU_TEST_RUNTIME_EXIT": "134",
+                    "HUANYU_TEST_FAIL_WAIT": "wait-cluster",
+                })
+                if rank == "0":
+                    self.assert_success(result)
+                else:
+                    self.assert_worker_supervised_until_exit(result)
+                    self.assertTrue(any(e["args"][0] == "wait-head" for e in self.events("helper")))
+                    self.assertFalse(self.events("train"))
+                self.assertFalse(self.events("runtime"))
+                self.assertEqual(len(self.events("ray")), 1)
+                self.assertEqual(self.events("ray")[0]["ray_startup_env"], {
+                    "RAY_worker_maximum_startup_concurrency": "32",
+                    "RAY_prestart_worker_first_driver": "1", "RAY_enable_worker_prestart": "0",
+                    "HUANYU_JOB_PREFLIGHT": "0", "HUANYU_RAY_READINESS_CHECK": "0",
+                })
+
+    def test_default_worker_stops_if_head_never_becomes_available(self):
+        result = self.run_launcher({"VC_TASK_INDEX": "1", "HUANYU_TEST_FAIL_WAIT": "wait-head"})
+        self.assertEqual(result.returncode, 19, result.stdout + result.stderr)
+        self.assertFalse(self.events("ray"))
+        self.assertFalse(self.events("train"))
+        self.assertFalse(self.events("sleep"))
+
+    def test_invalid_preflight_fails_before_setup(self):
+        result = self.run_launcher({"HUANYU_JOB_PREFLIGHT": "yes"})
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("HUANYU_JOB_PREFLIGHT", result.stderr)
+        self.assertFalse(self.events_file.exists())
+
     def test_head_starts_ray_then_waits_before_starting_training_once(self):
+        self.env["HUANYU_JOB_PREFLIGHT"] = "1"
         result = self.run_launcher()
         self.assert_success(result)
         self.assertIn("native import check exited successfully", result.stdout)
@@ -437,6 +498,7 @@ if command not in ("ray", "git", "pip", "flock", "env-source", "sleep"):
                 self.assert_precision_defaults(event)
 
     def test_worker_uses_manual_start_command_and_keeps_job_alive(self):
+        self.env["HUANYU_JOB_PREFLIGHT"] = "1"
         result = self.run_launcher({"VC_TASK_INDEX": "1"})
         self.assert_worker_supervised_until_exit(result)
         ray = self.events("ray")
@@ -526,6 +588,7 @@ if command not in ("ray", "git", "pip", "flock", "env-source", "sleep"):
                     self.assertFalse(self.events(kind), kind)
 
     def test_site_env_cannot_override_precision_defaults_or_explicit_opt_out(self):
+        self.env["HUANYU_JOB_PREFLIGHT"] = "1"
         env_file = self.examples / "env_export_huanyu.sh"
         env_file.write_text(
             env_file.read_text(encoding="utf-8")
@@ -562,6 +625,7 @@ if command not in ("ray", "git", "pip", "flock", "env-source", "sleep"):
             ]), value)
 
     def test_reused_ray_gets_actual_tp_cache_and_late_hccl_as_quoted_runtime_strings(self):
+        self.env["HUANYU_JOB_PREFLIGHT"] = "1"
         env_file = self.examples / "env_export_huanyu.sh"
         env_file.write_text(
             env_file.read_text(encoding="utf-8")
@@ -595,6 +659,7 @@ if command not in ("ray", "git", "pip", "flock", "env-source", "sleep"):
                     self.assertEqual(event["precision"][key], value, event)
 
     def test_full_profile_restores_complete_policy_after_stale_site_environment(self):
+        self.env["HUANYU_JOB_PREFLIGHT"] = "1"
         env_file = self.examples / "env_export_huanyu.sh"
         with env_file.open("a", encoding="utf-8") as stream:
             stream.write(
@@ -618,6 +683,7 @@ if command not in ("ray", "git", "pip", "flock", "env-source", "sleep"):
             self.assertEqual(json.loads(actual["ray_kwargs.ray_init.runtime_env.env_vars." + key]), value)
 
     def test_allocator_precedes_first_python_probe_pip_env_source_and_ray(self):
+        self.env["HUANYU_JOB_PREFLIGHT"] = "1"
         result = self.run_launcher()
         self.assert_success(result)
         expected = shell_path(self.jemalloc)
@@ -638,6 +704,7 @@ if command not in ("ray", "git", "pip", "flock", "env-source", "sleep"):
         ]), expected)
 
     def test_allocator_is_inherited_by_worker_probe_and_ray_start(self):
+        self.env["HUANYU_JOB_PREFLIGHT"] = "1"
         result = self.run_launcher({"VC_TASK_INDEX": "1"})
         self.assert_worker_supervised_until_exit(result)
         for kind in ("helper", "pip", "env-source", "runtime", "ray"):
@@ -648,6 +715,7 @@ if command not in ("ray", "git", "pip", "flock", "env-source", "sleep"):
         self.assertFalse(self.events("train"))
 
     def test_explicit_allocator_wins_and_preserves_other_preloads_without_duplicates(self):
+        self.env["HUANYU_JOB_PREFLIGHT"] = "1"
         other = self.project / "libother.so"
         self.write_preload_fixture(other)
         legacy = self.project / "libjemalloc-legacy.so.2"
@@ -665,6 +733,7 @@ if command not in ("ray", "git", "pip", "flock", "env-source", "sleep"):
                 self.assertEqual(pieces, [chosen, other_path], event)
 
     def test_q36_allocator_override_remains_supported(self):
+        self.env["HUANYU_JOB_PREFLIGHT"] = "1"
         result = self.run_launcher({
             "HUANYU_JEMALLOC_LIBRARY": None,
             "Q36_JEMALLOC_LIBRARY": shell_path(self.jemalloc),
@@ -673,6 +742,7 @@ if command not in ("ray", "git", "pip", "flock", "env-source", "sleep"):
         self.assertEqual(self.events("runtime")[0]["preload"], shell_path(self.jemalloc))
 
     def test_environment_source_cannot_remove_selected_allocator(self):
+        self.env["HUANYU_JOB_PREFLIGHT"] = "1"
         other = self.project / "libafterenv.so"
         self.write_preload_fixture(other)
         env_file = self.examples / "env_export_huanyu.sh"
@@ -712,6 +782,7 @@ if command not in ("ray", "git", "pip", "flock", "env-source", "sleep"):
                     self.assertFalse(self.events(kind), kind)
 
     def test_native_probe_abort_exit_is_not_ignored(self):
+        self.env["HUANYU_JOB_PREFLIGHT"] = "1"
         result = self.run_launcher({"HUANYU_TEST_RUNTIME_EXIT": "134"})
         self.assertEqual(result.returncode, 134, result.stdout + result.stderr)
         self.assertEqual(len(self.events("runtime")), 1)
@@ -728,6 +799,7 @@ if command not in ("ray", "git", "pip", "flock", "env-source", "sleep"):
             self.assertFalse(self.events(kind), kind)
 
     def test_failed_cluster_readiness_never_starts_training(self):
+        self.env["HUANYU_JOB_PREFLIGHT"] = "1"
         result = self.run_launcher({"HUANYU_TEST_FAIL_WAIT": "wait-cluster"})
         self.assertEqual(result.returncode, 19, result.stdout + result.stderr)
         self.assertIn("fixture readiness failure", result.stdout + result.stderr)
@@ -742,7 +814,7 @@ if command not in ("ray", "git", "pip", "flock", "env-source", "sleep"):
                                     "HUANYU_TEST_FAIL_WAIT": "wait-cluster"})
         self.assert_success(result)
         self.assertFalse(any(event["args"][0] == "wait-cluster" for event in self.events("helper")))
-        self.assertIn("membership/resources not verified", result.stdout)
+        self.assertIn("skipping native/device/cluster preflight", result.stdout)
         self.assertNotIn("nodes registered", result.stdout)
         self.assertEqual(len(self.events("train")), 1)
 
@@ -829,6 +901,7 @@ if command not in ("ray", "git", "pip", "flock", "env-source", "sleep"):
             self.assertEqual(capture["env"][key], expected)
 
     def test_existing_ray_uses_source_without_copy_reinstall_or_restart(self):
+        self.env["HUANYU_JOB_PREFLIGHT"] = "1"
         result = self.run_launcher({"HUANYU_TEST_RAY_LIVE": "1"})
         self.assert_success(result)
         self.assertFalse(any(event["args"][0] == "sync" for event in self.events("helper")))
@@ -870,6 +943,7 @@ if command not in ("ray", "git", "pip", "flock", "env-source", "sleep"):
             self.assertFalse(self.events(kind), kind)
 
     def test_existing_worker_checks_membership_and_never_runs_training(self):
+        self.env["HUANYU_JOB_PREFLIGHT"] = "1"
         result = self.run_launcher({
             "VC_TASK_INDEX": "1", "HUANYU_TEST_RAY_LIVE": "once",
         })

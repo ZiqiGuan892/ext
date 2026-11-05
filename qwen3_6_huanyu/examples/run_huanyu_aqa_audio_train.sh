@@ -211,7 +211,7 @@ if [[ "${RM_ENABLE}" == 0 ]]; then
         ++actor_rollout_ref.rollout.engine_kwargs.vllm_omni.additional_config.rl_config.enabled=true
         actor_rollout_ref.rollout.enforce_eager=true
         actor_rollout_ref.rollout.max_num_seqs=64
-        actor_rollout_ref.rollout.gpu_memory_utilization=0.5
+        actor_rollout_ref.rollout.gpu_memory_utilization=${ROLLOUT_GPU_MEM_UTIL:-0.6}
         actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=1024
         "actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=${MAX_TOKEN_LEN_PER_GPU}"
         actor_rollout_ref.ref.entropy_checkpointing=False

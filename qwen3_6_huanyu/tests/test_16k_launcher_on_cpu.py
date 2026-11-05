@@ -168,25 +168,25 @@ class Huanyu16KLauncherTests(unittest.TestCase):
 
     def test_worker_joins_without_running_training(self):
         result = self.fixture.run_launcher({"VC_TASK_INDEX": "1"})
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.fixture.assert_worker_supervised_until_exit(result)
         self.assertFalse(self.fixture.events("train"))
         self.assertFalse(self.fixture.capture_file.exists())
         self.assertEqual(len(self.fixture.events("ray")), 1)
         args = self.fixture.events("ray")[0]["args"]
         self.assertIn("--address=192.0.2.10:6925", args)
-        self.assertIn("--block", args)
+        self.assertNotIn("--block", args)
         self.assertNotIn("--head", args)
 
     def test_24_plus_8_worker_keeps_physical_16_cards_and_only_joins_ray(self):
         result = self.fixture.run_launcher({"VC_TASK_INDEX": "1", "HUANYU_16K_POOL_LAYOUT": "24+8"})
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.fixture.assert_worker_supervised_until_exit(result)
         self.assertFalse(self.fixture.events("train"))
         self.assertFalse(self.fixture.capture_file.exists())
         self.assertEqual(len(self.fixture.events("ray")), 1)
         args = self.fixture.events("ray")[0]["args"]
         self.assertIn('--resources={"NPU": 16}', args)
         self.assertIn("--address=192.0.2.10:6925", args)
-        self.assertIn("--block", args)
+        self.assertNotIn("--block", args)
         self.assertNotIn("--head", args)
 
     def test_external_entry_uses_project_backend_not_adjacent_script(self):
@@ -231,14 +231,10 @@ class Huanyu16KLauncherTests(unittest.TestCase):
         shutil.copyfile(EXAMPLES / mix, examples / mix)
         shutil.copyfile(EXAMPLES / "graph_mode.sh", examples / "graph_mode.sh")
         shutil.copyfile(EXAMPLES / "precision_mode.sh", examples / "precision_mode.sh")
-        source = (EXAMPLES / "run_huanyu.sh").read_text(encoding="utf-8")
-        start = source.index('exec bash "${PROJECT_ROOT}/examples/qwen3_6_huanyu/')
-        # Retain the real Huanyu entry's final protected overrides. The middle
-        # 32-card wrapper only adds path preflights, env defaults and filter=false.
-        terminal_exec = source[start:].replace("run_qwen36_huanyu_32card.sh", mix, 1)
-        (examples / "run_huanyu.sh").write_text(
-            '#!/usr/bin/env bash\nset -euo pipefail\n'
-            '_huanyu_ray_pythonpath=\'"fixture-pythonpath"\'\n' + terminal_exec,
+        for name in ("run_huanyu.sh", "run_output.sh"):
+            shutil.copyfile(EXAMPLES / name, examples / name)
+        (examples / "run_qwen36_huanyu_32card.sh").write_text(
+            f'#!/usr/bin/env bash\nexec bash "$(dirname "$0")/{mix}" "$@"\n',
             encoding="utf-8", newline="\n",
         )
         backend = (EXAMPLES / "run_qwen36_huanyu_gspo_npu.sh").read_text(encoding="utf-8")
@@ -282,7 +278,8 @@ class Huanyu16KLauncherTests(unittest.TestCase):
             "actor_rollout_ref.model.use_remove_padding": "false",
             "actor_rollout_ref.actor.fsdp_config.model_dtype": "fp32",
             "actor_rollout_ref.rollout.tensor_model_parallel_size": "4",
-            "actor_rollout_ref.rollout.gpu_memory_utilization": "0.5",
+            "actor_rollout_ref.rollout.gpu_memory_utilization": "0.6",
+            "reward.reward_model.rollout.gpu_memory_utilization": "0.7",
             "reward.reward_model.rollout.max_model_len": "32768",
             "actor_rollout_ref.rollout.enforce_eager": "true",
             "reward.reward_model.rollout.enforce_eager": "true",

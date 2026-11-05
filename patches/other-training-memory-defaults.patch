@@ -1,0 +1,123 @@
+--- a/examples/gspo_trainer/qwen3_omni/run_qwen3_omni_thinker_gspo_lora_mmk12_v1.sh
++++ b/examples/gspo_trainer/qwen3_omni/run_qwen3_omni_thinker_gspo_lora_mmk12_v1.sh
+@@ -55,7 +55,7 @@
+     actor_rollout_ref.actor.fsdp_config.optimizer_offload=true \
+     actor_rollout_ref.rollout.n=16 \
+     actor_rollout_ref.rollout.tensor_model_parallel_size=2 \
+-    actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
++    actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
+     actor_rollout_ref.rollout.load_format=safetensors \
+     actor_rollout_ref.rollout.prompt_length=4160 \
+     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
+--- a/examples/gspo_trainer/qwen3_omni/run_qwen3_omni_thinker_gspo_lora_mmk12_v1_npu.sh
++++ b/examples/gspo_trainer/qwen3_omni/run_qwen3_omni_thinker_gspo_lora_mmk12_v1_npu.sh
+@@ -58,7 +58,7 @@
+     actor_rollout_ref.rollout.n=16 \
+     actor_rollout_ref.rollout.cudagraph_capture_sizes="[1,2,4,16,64,128,512,1024,2048,3072,4096]" \
+     actor_rollout_ref.rollout.tensor_model_parallel_size=2 \
+-    actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
++    actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
+     actor_rollout_ref.rollout.load_format=safetensors \
+     actor_rollout_ref.rollout.prompt_length=4160 \
+     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
+--- a/examples/gspo_trainer/qwen3_omni/run_qwen3_omni_thinker_gspo_lora_v1.sh
++++ b/examples/gspo_trainer/qwen3_omni/run_qwen3_omni_thinker_gspo_lora_v1.sh
+@@ -46,7 +46,7 @@
+     actor_rollout_ref.actor.fsdp_config.optimizer_offload=true \
+     actor_rollout_ref.rollout.n=16 \
+     actor_rollout_ref.rollout.tensor_model_parallel_size=2 \
+-    actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
++    actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
+     actor_rollout_ref.rollout.load_format=safetensors \
+     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
+     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=20480 \
+--- a/verl_omni_ext/examples/run_minicpmo_thinker_gspo_npu.sh
++++ b/verl_omni_ext/examples/run_minicpmo_thinker_gspo_npu.sh
+@@ -297,10 +297,9 @@
+ #   71.07 GB / TP=4 ≈ 17.8 GB/卡     （与 Qwen3.5-35B-A3B 的 17.56 GB 同量级）
+ # 单卡 total 61.27 GB，故地板占比 ≈ 0.29，低于约 0.35 连权重都放不下。
+ #
+-# 0.85 是同 TP=4 / 同 910B 64GB 上 Qwen3.5-MoE 跑通的值，权重量级一致，直接沿用。
+-# 若 OOM，往【下】退：0.85 -> 0.80 -> 0.70 -> 0.60。
++# Actor rollout 默认使用每卡 60% 的显存，可用 ROLLOUT_GPU_MEM_UTIL 覆盖。
+ # 真要省显存，正确的杠杆是 ROLLOUT_TP 4->8（权重降到约 8.9 GB/卡）。
+-ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.85}
++ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.6}
+
+ # =============================================================================
+ # §4.2 精度开关 —— 改错会「能跑但不学」，是最隐蔽的一个
+@@ -700,7 +699,7 @@
+     actor_rollout_ref.rollout.mode=async \
+     actor_rollout_ref.rollout.n=${ROLLOUT_N:-8} \
+     actor_rollout_ref.rollout.tensor_model_parallel_size=${ROLLOUT_TP:-2} \
+-    actor_rollout_ref.rollout.gpu_memory_utilization=${ROLLOUT_GPU_MEM_UTIL:-0.65} \
++    actor_rollout_ref.rollout.gpu_memory_utilization=${ROLLOUT_GPU_MEM_UTIL:-0.6} \
+     actor_rollout_ref.rollout.max_num_seqs=4 \
+     actor_rollout_ref.rollout.max_model_len=${ROLLOUT_MAX_MODEL_LEN:-4096} \
+     actor_rollout_ref.rollout.prompt_length=${ROLLOUT_PROMPT_LENGTH:-4160} \
+--- a/verl_omni_ext/examples/run_minicpmo_thinker_gspo_npu_omni_mix_genrm.sh
++++ b/verl_omni_ext/examples/run_minicpmo_thinker_gspo_npu_omni_mix_genrm.sh
+@@ -151,7 +151,7 @@
+     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=20480
+     actor_rollout_ref.rollout.enforce_eager=true
+     actor_rollout_ref.rollout.max_num_seqs=64
+-    actor_rollout_ref.rollout.gpu_memory_utilization=0.7
++    actor_rollout_ref.rollout.gpu_memory_utilization=0.6
+     actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=1024
+     actor_rollout_ref.ref.log_prob_use_dynamic_bsz=false
+     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=20480
+--- a/verl_omni_ext/examples/run_qwen36_huanyu_gspo_npu.sh
++++ b/verl_omni_ext/examples/run_qwen36_huanyu_gspo_npu.sh
+@@ -446,7 +446,7 @@
+ #   71.07 GB / TP=4 ≈ 17.8 GB/卡     （与 Qwen3.5-35B-A3B 的 17.56 GB 同量级）
+ # 单卡 total 61.27 GB，故地板占比 ≈ 0.29，低于约 0.35 连权重都放不下。
+ #
+-# Actor rollout 默认使用每卡 90% 的显存，可用 ROLLOUT_GPU_MEM_UTIL 覆盖。
++# Actor rollout 默认使用每卡 60% 的显存，可用 ROLLOUT_GPU_MEM_UTIL 覆盖。
+ # 真要省显存，正确的杠杆是 ROLLOUT_TP 4->8（权重降到约 8.9 GB/卡）。
+
+ # =============================================================================
+@@ -1003,7 +1003,7 @@
+     ++actor_rollout_ref.rollout.engine_kwargs.q36_sampling.frequency_penalty=${ROLLOUT_FREQUENCY_PENALTY:-0.0} \
+     ++actor_rollout_ref.rollout.engine_kwargs.q36_sampling.presence_penalty=${ROLLOUT_PRESENCE_PENALTY:-0.0} \
+     actor_rollout_ref.rollout.tensor_model_parallel_size=${ROLLOUT_TP:-2} \
+-    actor_rollout_ref.rollout.gpu_memory_utilization=${ROLLOUT_GPU_MEM_UTIL:-0.9} \
++    actor_rollout_ref.rollout.gpu_memory_utilization=${ROLLOUT_GPU_MEM_UTIL:-0.6} \
+     actor_rollout_ref.rollout.max_num_seqs=4 \
+     actor_rollout_ref.rollout.max_model_len=${ROLLOUT_MAX_MODEL_LEN:-4096} \
+     actor_rollout_ref.rollout.max_num_batched_tokens=${ROLLOUT_MAX_MODEL_LEN:-4096} \
+--- a/verl_omni_ext/examples/run_qwen36_whisper_gspo_npu.sh
++++ b/verl_omni_ext/examples/run_qwen36_whisper_gspo_npu.sh
+@@ -297,10 +297,9 @@
+ #   71.07 GB / TP=4 ≈ 17.8 GB/卡     （与 Qwen3.5-35B-A3B 的 17.56 GB 同量级）
+ # 单卡 total 61.27 GB，故地板占比 ≈ 0.29，低于约 0.35 连权重都放不下。
+ #
+-# 0.85 是同 TP=4 / 同 910B 64GB 上 Qwen3.5-MoE 跑通的值，权重量级一致，直接沿用。
+-# 若 OOM，往【下】退：0.85 -> 0.80 -> 0.70 -> 0.60。
++# Actor rollout 默认使用每卡 60% 的显存，可用 ROLLOUT_GPU_MEM_UTIL 覆盖。
+ # 真要省显存，正确的杠杆是 ROLLOUT_TP 4->8（权重降到约 8.9 GB/卡）。
+-ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.85}
++ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.6}
+
+ # =============================================================================
+ # §4.2 精度开关 —— 改错会「能跑但不学」，是最隐蔽的一个
+@@ -700,7 +699,7 @@
+     actor_rollout_ref.rollout.mode=async \
+     actor_rollout_ref.rollout.n=${ROLLOUT_N:-8} \
+     actor_rollout_ref.rollout.tensor_model_parallel_size=${ROLLOUT_TP:-2} \
+-    actor_rollout_ref.rollout.gpu_memory_utilization=${ROLLOUT_GPU_MEM_UTIL:-0.65} \
++    actor_rollout_ref.rollout.gpu_memory_utilization=${ROLLOUT_GPU_MEM_UTIL:-0.6} \
+     actor_rollout_ref.rollout.max_num_seqs=4 \
+     actor_rollout_ref.rollout.max_model_len=${ROLLOUT_MAX_MODEL_LEN:-4096} \
+     actor_rollout_ref.rollout.prompt_length=${ROLLOUT_PROMPT_LENGTH:-4160} \
+--- a/verl_omni_ext/examples/run_qwen36_whisper_gspo_npu_omni_mix_genrm.sh
++++ b/verl_omni_ext/examples/run_qwen36_whisper_gspo_npu_omni_mix_genrm.sh
+@@ -215,7 +215,7 @@
+     ++actor_rollout_ref.rollout.engine_kwargs.vllm_omni.additional_config.rl_config.enabled=true
+     actor_rollout_ref.rollout.enforce_eager=true
+     actor_rollout_ref.rollout.max_num_seqs=64
+-    actor_rollout_ref.rollout.gpu_memory_utilization=0.5
++    actor_rollout_ref.rollout.gpu_memory_utilization=0.6
+     actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=1024
+     actor_rollout_ref.ref.log_prob_use_dynamic_bsz=true
+     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=${_TRAIN_TOKEN_BUDGET}

@@ -452,10 +452,9 @@ done
 #   71.07 GB / TP=4 ≈ 17.8 GB/卡     （与 Qwen3.5-35B-A3B 的 17.56 GB 同量级）
 # 单卡 total 61.27 GB，故地板占比 ≈ 0.29，低于约 0.35 连权重都放不下。
 #
-# 0.85 是同 TP=4 / 同 910B 64GB 上 Qwen3.5-MoE 跑通的值，权重量级一致，直接沿用。
-# 若 OOM，往【下】退：0.85 -> 0.80 -> 0.70 -> 0.60。
+# Actor rollout 默认使用每卡 60% 的显存，可用 ROLLOUT_GPU_MEM_UTIL 覆盖。
 # 真要省显存，正确的杠杆是 ROLLOUT_TP 4->8（权重降到约 8.9 GB/卡）。
-ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.85}
+ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.6}
 
 # =============================================================================
 # §4.2 精度开关 —— 改错会「能跑但不学」，是最隐蔽的一个
@@ -1030,7 +1029,7 @@ python3 -m verl_omni.trainer.main_omni \
     ++actor_rollout_ref.rollout.engine_kwargs.q36_sampling.frequency_penalty=${ROLLOUT_FREQUENCY_PENALTY:-0.0} \
     ++actor_rollout_ref.rollout.engine_kwargs.q36_sampling.presence_penalty=${ROLLOUT_PRESENCE_PENALTY:-0.0} \
     actor_rollout_ref.rollout.tensor_model_parallel_size=${ROLLOUT_TP:-2} \
-    actor_rollout_ref.rollout.gpu_memory_utilization=${ROLLOUT_GPU_MEM_UTIL:-0.65} \
+    actor_rollout_ref.rollout.gpu_memory_utilization=${ROLLOUT_GPU_MEM_UTIL:-0.6} \
     actor_rollout_ref.rollout.max_num_seqs=4 \
     actor_rollout_ref.rollout.max_model_len=${ROLLOUT_MAX_MODEL_LEN:-4096} \
     actor_rollout_ref.rollout.max_num_batched_tokens=${ROLLOUT_MAX_MODEL_LEN:-4096} \

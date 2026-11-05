@@ -267,6 +267,7 @@ class AqaJobLauncherTests(unittest.TestCase):
             self.assert_precision_environment(event["env"])
 
     def test_precision_policy_survives_site_env_and_reaches_existing_ray(self):
+        self.fixture.env["HUANYU_JOB_PREFLIGHT"] = "1"
         env_file = self.fixture.examples / "env_export_huanyu.sh"
         with env_file.open("a", encoding="utf-8") as stream:
             stream.write(

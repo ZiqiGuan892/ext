@@ -3,6 +3,9 @@
 # With Ray enabled, set VC_TASK_INDEX and the same ordered VC_WORKER_HOSTS
 # on every node. Rank 0 waits for all nodes; start the scripts concurrently.
 # Usage: source prepare_huanyu_env.sh [--stem] [--start-ray]
+# Preparation always runs native/device checks, even with HUANYU_JOB_PREFLIGHT=0.
+# --start-ray also checks GCS registration; no Dashboard or probe driver needed.
+# Activation exports the shared Ray worker startup policy (32/1/0) for manual starts.
 # Run the job's setup in an isolated shell so env_export's set -ex cannot alter the caller's shell.
 # source applies the resulting environment; bash prints an activation command.
 # Both persist the selected vLLM-Omni source for new interactive Bash shells via ~/.bashrc.

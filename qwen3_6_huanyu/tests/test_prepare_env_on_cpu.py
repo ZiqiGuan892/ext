@@ -198,6 +198,24 @@ exit "$prepare_status"
         self.assertEqual(len(self.activation_files()), 1)
         self.assertTrue(self.activation_files()[0].with_name("prepare.log").is_file())
 
+    def test_preparation_checks_environment_and_exports_ray_policy_with_preflight_off(self):
+        self.append_site_env(
+            "export RAY_worker_maximum_startup_concurrency=99\n"
+            "export RAY_prestart_worker_first_driver=0 RAY_enable_worker_prestart=1\n"
+        )
+        result = self.run_prepare({"HUANYU_JOB_PREFLIGHT": "0"})
+        self.assert_success(result)
+        self.assertEqual(len(self.fixture.events("runtime")), 1)
+        self.assertEqual([e["args"][0] for e in self.fixture.events("helper")], ["check-devices"])
+        for key, value in {
+            "RAY_worker_maximum_startup_concurrency": "32",
+            "RAY_prestart_worker_first_driver": "1", "RAY_enable_worker_prestart": "0",
+            "HUANYU_JOB_PREFLIGHT": "0", "HUANYU_RAY_READINESS_CHECK": "0",
+        }.items():
+            # Windows Python normalizes environment keys to uppercase.
+            env_key = key.upper() if os.name == "nt" else key
+            self.assertEqual(self.prepared()["env"][env_key], value, key)
+
     def test_bash_reports_activation_command_without_starting_ray(self):
         result = self.run_prepare(sourced=False)
         self.assert_success(result)
@@ -234,7 +252,7 @@ exit "$prepare_status"
         self.use_stem_entry()
         result = self.run_prepare(
             {"TOTAL_NPUS": "32", "VC_TASK_INDEX": "0", "VC_WORKER_HOSTS": "head,worker",
-             "RAY_ADDRESS": "auto", "HUANYU_RAY_READINESS_CHECK": "0"},
+             "RAY_ADDRESS": "auto", "HUANYU_JOB_PREFLIGHT": "0", "HUANYU_RAY_READINESS_CHECK": "0"},
             arguments=("--start-ray",),
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

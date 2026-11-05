@@ -105,6 +105,7 @@ class StemMultinodeJobTests(unittest.TestCase):
             "actor_rollout_ref.rollout.max_model_len": "12288",
             "actor_rollout_ref.rollout.max_num_batched_tokens": "12288",
             "actor_rollout_ref.rollout.max_num_seqs": "8",
+            "actor_rollout_ref.rollout.gpu_memory_utilization": "0.6",
             "actor_rollout_ref.rollout.tensor_model_parallel_size": str(tp),
             "actor_rollout_ref.rollout.agent.num_workers": "128",
             "actor_rollout_ref.rollout.data_parallel_size": "1",
@@ -201,7 +202,7 @@ class StemMultinodeJobTests(unittest.TestCase):
         self.assertEqual(capture["env"]["HUANYU_RAY_READINESS_CHECK"], "0")
 
     def test_readiness_opt_in_checks_expected_nodes_and_downstream_status(self):
-        capture, actual = self.launch({"HUANYU_RAY_READINESS_CHECK": "1"})
+        capture, actual = self.launch({"HUANYU_JOB_PREFLIGHT": "1", "HUANYU_RAY_READINESS_CHECK": "0"})
         self.assert_scaled(capture, actual, 128)
         waits = [e for e in self.fixture.events("helper") if e["args"][0] == "wait-cluster"]
         self.assertEqual(len(waits), 1)

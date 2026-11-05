@@ -4,6 +4,34 @@
 
 **冻结 Huanyu、读取 embedding cache：使用 `run_huanyu_32card_job.sh`。AQA 在线训练：使用对应的 `aqa` 入口。** 两类入口都继续训练语言模型；冻结音频不等于冻结整个 Actor。
 
+## Ray 启动设置与训练显存默认值（2026-11-05）
+
+`examples/` 中的 AQA、冻结音频、16K、Whisper 对齐、Projector 和 STEM job 都通过
+`run_huanyu_32card_job.sh` 启动 Ray。普通 job 默认 `HUANYU_JOB_PREFLIGHT=0`，跳过额外的
+native import、设备数量及集群就绪探测；从节点仍先等待 head，再连接集群。
+设置 `HUANYU_JOB_PREFLIGHT=1` 可启用这些探测，失败时终止启动。
+旧变量 `HUANYU_RAY_READINESS_CHECK` 仍可作为回退开关，新变量显式设置时优先。
+这不关闭训练入口自身的数据、配置或资源检查。
+
+`prepare_huanyu_env.sh` 和 `prepare_huanyu_stem_env.sh` 始终验证环境；加 `--start-ray`
+时，主节点通过 GCS 验证全部节点和 NPU 资源，从节点验证自身注册，不依赖 Dashboard，
+也不创建探测用的 Ray driver。各节点需并行执行准备命令。未加 `--start-ray` 时只准备环境。
+
+公共入口在加载站点环境后设置以下参数，并写入 prepare 生成的 `activate.sh`，
+供手动启动 Ray 时继承。这些参数不改变 AgentLoopWorker 的总数量，也不会更新已运行的 Raylet。
+
+```bash
+export RAY_worker_maximum_startup_concurrency=32
+export RAY_prestart_worker_first_driver=1
+export RAY_enable_worker_prestart=0
+```
+
+训练脚本的 Actor rollout 显存预算默认改为 `0.6`，仍可用
+`ROLLOUT_GPU_MEM_UTIL` 覆盖。AB 测试的独立预算及 GenRM 预算不变。
+
+
+本分支以外的 8 个训练脚本默认值修改见 [补丁说明](../../patches/README.md)。
+
 ## 1. 先选最外层入口
 
 一键入口负责环境、vLLM-Omni 同步和 Ray；普通入口要求这些已经准备好，仅在主节点启动一次。
@@ -362,7 +390,7 @@ bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/run_huanyu_aqa_unfreeze_32card_job.s
 | `TRAIN_BATCH_SIZE` / `PPO_MINI_BATCH_SIZE` / `ROLLOUT_N` | 每批prompt、PPO mini-batch prompt、每prompt生成数 |
 | `PPO_MICRO_BATCH_SIZE_PER_GPU` | 静态训练的每卡micro-batch；AQA强制1 |
 | `actor_rollout_ref.rollout.max_num_seqs` | 推理并发，与训练micro-batch不同；冻结16K也支持 `HUANYU_16K_MAX_NUM_SEQS`，AQA可通过Hydra配置 |
-| `actor_rollout_ref.rollout.gpu_memory_utilization` | Actor推理内存比例；GenRM包装层默认0.5会覆盖基础环境默认，最终修改用Hydra；RM可用 `RM_GPU_MEM_UTIL` |
+| `actor_rollout_ref.rollout.gpu_memory_utilization` | Actor推理内存比例默认0.6，可用 `ROLLOUT_GPU_MEM_UTIL` 或最终Hydra参数覆盖；RM仍用 `RM_GPU_MEM_UTIL` |
 
 | 入口 | prompt / response | rollout prompt / engine |
 |---|---|---|
@@ -1145,7 +1173,7 @@ bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/run_huanyu_stem_job.sh"
 
 32 卡训练时，Actor 和 Ref 均使用 `fsdp_size=16`，32 个 rank 组成两个 16 卡分片组。Actor 训练时仍需在两个副本间同步梯度。16、128 和 256 卡作业按各自的全部训练 rank 分片。rollout 默认 TP8，可设为 4、8 或 16。每个推理引擎的 PP 和 DP 均为 1，外层启动的推理副本数为 Actor 卡数除以 rollout TP。[vLLM 并行说明](https://docs.vllm.ai/en/stable/serving/parallelism_scaling/)
 
-默认关闭 Actor、rollout/ref logprob 的 dynamic batching；micro-batch=1，启用逐 micro-batch 梯度同步及梯度检查点。Actor FP32 主参数，参数/优化器 offload 开启；rollout BF16、full精度策略、eager、每引擎 `max_num_seqs=8`、显存预算0.5，权重同步 bucket=512MB。冻结 encoder/projector/vision，纯文本不走音频编码。默认允许 EOS，10K 是上限；不代表每条都生成10K。数学 `math_dapo` 规则使用当前安装的 verl 实现，启动前会用正确/错误 boxed 答案自检并打印源文件和实际分数；它不等于 GenRM，也不能假定支持任意数学表达式的符号等价。
+默认关闭 Actor、rollout/ref logprob 的 dynamic batching；micro-batch=1，启用逐 micro-batch 梯度同步及梯度检查点。Actor FP32 主参数，参数/优化器 offload 开启；rollout BF16、full精度策略、eager、每引擎 `max_num_seqs=8`、显存预算0.6，权重同步 bucket=512MB。冻结 encoder/projector/vision，纯文本不走音频编码。默认允许 EOS，10K 是上限；不代表每条都生成10K。数学 `math_dapo` 规则使用当前安装的 verl 实现，启动前会用正确/错误 boxed 答案自检并打印源文件和实际分数；它不等于 GenRM，也不能假定支持任意数学表达式的符号等价。
 
 完整链路：
 

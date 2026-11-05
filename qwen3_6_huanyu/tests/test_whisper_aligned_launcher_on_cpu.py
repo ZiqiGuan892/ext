@@ -81,7 +81,7 @@ WHISPER_DEFAULTS = {
     "actor_rollout_ref.rollout.engine_kwargs.q36_sampling.frequency_penalty": "0.0",
     "actor_rollout_ref.rollout.engine_kwargs.q36_sampling.presence_penalty": "0.0",
     "actor_rollout_ref.rollout.tensor_model_parallel_size": "2",
-    "actor_rollout_ref.rollout.gpu_memory_utilization": "0.65",
+    "actor_rollout_ref.rollout.gpu_memory_utilization": "0.6",
     "actor_rollout_ref.rollout.max_num_seqs": "4",
     "actor_rollout_ref.rollout.enforce_eager": "true",
     "actor_rollout_ref.rollout.load_format": "safetensors",
@@ -154,13 +154,8 @@ class WhisperAlignedLauncherTests(unittest.TestCase):
             f'_huanyu_vllm_omni_root="{_job.shell_path(native.parent)}"', 1,
         )
         (examples / middle).write_text(source, encoding="utf-8", newline="\n")
-        source = (EXAMPLES / "run_huanyu.sh").read_text(encoding="utf-8")
-        start = source.index('exec bash "${PROJECT_ROOT}/examples/qwen3_6_huanyu/')
-        (examples / "run_huanyu.sh").write_text(
-            '#!/usr/bin/env bash\nset -euo pipefail\n'
-            '_huanyu_ray_pythonpath=\'"fixture-pythonpath"\'\n' + source[start:],
-            encoding="utf-8", newline="\n",
-        )
+        for name in ("run_huanyu.sh", "run_output.sh"):
+            shutil.copyfile(EXAMPLES / name, examples / name)
         source = (EXAMPLES / "run_qwen36_huanyu_gspo_npu.sh").read_text(encoding="utf-8")
         command = re.search(r"^python3 -m verl_omni\.trainer\.main_omni\b", source, re.MULTILINE)
         workers = re.search(r"^ROLLOUT_NUM_WORKERS=.*$", source, re.MULTILINE)
@@ -293,12 +288,12 @@ class WhisperAlignedLauncherTests(unittest.TestCase):
 
     def test_worker_only_joins_cluster(self):
         result = self.fixture.run_launcher({"VC_TASK_INDEX": "1"})
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.fixture.assert_worker_supervised_until_exit(result)
         self.assertFalse(self.fixture.events("train"))
         self.assertFalse(self.fixture.capture_file.exists())
         args = self.fixture.events("ray")[0]["args"]
         self.assertIn("--address=192.0.2.10:6925", args)
-        self.assertIn("--block", args)
+        self.assertNotIn("--block", args)
         self.assertNotIn("--head", args)
 
     def test_external_entry_resolves_backend_from_project_root(self):

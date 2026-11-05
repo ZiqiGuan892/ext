@@ -53,6 +53,14 @@ if (( _HUANYU_HAS_LOCAL_RANK )); then
     for _key in ${!TORCHELASTIC_@}; do unset "$_key"; done
 fi
 
+# Normal jobs opt in to extra native/device/cluster probes. Preparation always
+# validates the environment; --start-ray also verifies registration through GCS.
+# Keep the previous readiness switch as an alias; the new switch takes priority.
+_PREFLIGHT="${HUANYU_JOB_PREFLIGHT:-${HUANYU_RAY_READINESS_CHECK:-0}}"
+case "$_PREFLIGHT" in
+    0|1) ;;
+    *) echo 'FATAL: HUANYU_JOB_PREFLIGHT (or HUANYU_RAY_READINESS_CHECK) must be 0 or 1' >&2; exit 2 ;;
+esac
 _PREPARE_ONLY="${HUANYU_PREPARE_ONLY:-0}"
 case "$_PREPARE_ONLY" in
     0) ;;
@@ -121,13 +129,7 @@ _INTERVAL="${RAY_CLUSTER_POLL_INTERVAL:-5}"
 _PORT="${RAY_PORT:-6925}"
 _DASHBOARD_PORT="${RAY_DASHBOARD_PORT:-8960}"
 _JOB_MODE="${HUANYU_JOB_MODE:-frozen_cache}"
-_READINESS_DEFAULT=1
-if [[ "$_JOB_MODE" == stem ]]; then _READINESS_DEFAULT=0; fi
-_RAY_READINESS_CHECK="${HUANYU_RAY_READINESS_CHECK:-$_READINESS_DEFAULT}"
-case "$_RAY_READINESS_CHECK" in
-    0|1) ;;
-    *) echo 'FATAL: HUANYU_RAY_READINESS_CHECK must be 0 or 1' >&2; exit 2 ;;
-esac
+_RAY_READINESS_CHECK="$_PREFLIGHT"
 _CLUSTER_NODES="${HUANYU_CLUSTER_NODES:-2}"
 if [[ "$_JOB_MODE" == stem ]]; then
     [[ "$_CLUSTER_NODES" == 1 || "$_CLUSTER_NODES" == 2 || "$_CLUSTER_NODES" == 8 || "$_CLUSTER_NODES" == 16 ]] || {
@@ -409,10 +411,17 @@ cd "$PROJECT_ROOT"
 huanyu_preload_allocator
 echo "[huanyu-job] allocator for native check/Ray: LD_PRELOAD=$LD_PRELOAD"
 export RAY_PORT="$_PORT" RAY_DASHBOARD_PORT="$_DASHBOARD_PORT"
+export HUANYU_JOB_PREFLIGHT="$_PREFLIGHT"
 export HUANYU_RAY_READINESS_CHECK="$_RAY_READINESS_CHECK"
 if (( _MANAGE_RAY )); then export RAY_ADDRESS="$_MASTER_IP:$_PORT"; fi
 export HUANYU_JOB_MODE="$_JOB_MODE" HUANYU_CLUSTER_NODES="$_CLUSTER_NODES"
 export RAY_USAGE_STATS_ENABLED=0 PYTHONUNBUFFERED=1 HYDRA_FULL_ERROR=1
+# Apply after site settings, before ray start on every node. These control
+# process startup, not the total AgentLoopWorker count. Existing raylets retain
+# their environment; prepare snapshots also carry these values for manual starts.
+export RAY_worker_maximum_startup_concurrency=32
+export RAY_prestart_worker_first_driver=1
+export RAY_enable_worker_prestart=0
 export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
 export MINICPMO_USE_PRECOMPUTE=0 MINICPMO_TUNE_VISION=0
 export HUANYU_STEM_TEXT_TRAIN=0
@@ -467,18 +476,19 @@ echo "[huanyu-job] inference hooks: ${VLLM_OMNI_EXTERNAL_MODULES}"
 echo "[huanyu-job] mode=$_JOB_MODE freeze_audio=$HUANYU_FREEZE_AUDIO precompute=$HUANYU_USE_PRECOMPUTE train_entry=$_TRAIN_ENTRY"
 echo "[huanyu-job] train_audio_encoder=$HUANYU_TRAIN_AUDIO_ENCODER train_audio_projector=$HUANYU_TRAIN_AUDIO_PROJECTOR"
 echo "[huanyu-job] physical=16x${_CLUSTER_NODES} actor=${NUM_NPUS}x${NNODES} rollout_TP=$ROLLOUT_TP RM=${RM_N_GPUS_PER_NODE}x${RM_NNODES} RM_TP=$RM_TP requested=$((NUM_NPUS * NNODES + REWARD_POOL_NPUS))"
-"$_PYTHON" -B "${_HUANYU_EXAMPLE_DIR}/check_native_runtime.py" \
-    --check --expected-root "$_VLLM_SOURCE"
-echo '[huanyu-job] native import check exited successfully'
-"$_PYTHON" -B "$_HELPER" check-devices
+if (( _PREFLIGHT || _PREPARE_ONLY )); then
+    "$_PYTHON" -B "${_HUANYU_EXAMPLE_DIR}/check_native_runtime.py" \
+        --check --expected-root "$_VLLM_SOURCE" || exit $?
+    echo '[huanyu-job] native import check exited successfully'
+    "$_PYTHON" -B "$_HELPER" check-devices || exit $?
+else
+    echo '[huanyu-job] skipping native/device/cluster preflight (HUANYU_JOB_PREFLIGHT=0)'
+fi
 
 wait_for_cluster() {
     local -a options=()
     if (( _PREPARE_RAY )); then
         options+=(--gcs)
-    elif [[ "$_RAY_READINESS_CHECK" == 0 ]]; then
-        echo "[huanyu-job] Ray readiness probe disabled (HUANYU_RAY_READINESS_CHECK=0 mode=$1); no extra ray.init, membership/resources not verified"
-        return 0
     fi
     local status=0
     timeout --foreground "${_WAIT}s" "$_PYTHON" -B "$_HELPER" wait-cluster \
@@ -498,15 +508,15 @@ if (( _MANAGE_RAY )); then
                 --dashboard-host=0.0.0.0 --dashboard-port="$RAY_DASHBOARD_PORT" \
                 --resources='{"NPU": 16}' 9>&-
         fi
-        wait_for_cluster all
+        if (( _PREFLIGHT || _PREPARE_RAY )); then wait_for_cluster all || exit $?; fi
     else
         timeout --foreground "${_WAIT}s" "$_PYTHON" -B "$_HELPER" wait-head \
-            --address "$RAY_ADDRESS" --timeout "$_WAIT" --interval "$_INTERVAL"
+            --address "$RAY_ADDRESS" --timeout "$_WAIT" --interval "$_INTERVAL" || exit $?
         if (( ! _LIVE_RAY )); then
             echo '[huanyu-job] joining as worker; no training on this node'
             ray start --address="$RAY_ADDRESS" --resources='{"NPU": 16}' 9>&-
         fi
-        if (( _PREPARE_RAY || _LIVE_RAY )); then wait_for_cluster local; fi
+        if (( _PREPARE_RAY || (_PREFLIGHT && _LIVE_RAY) )); then wait_for_cluster local || exit $?; fi
     fi
 fi
 
@@ -536,9 +546,9 @@ if (( _RANK == 0 )); then
         _RUNTIME_ARGS+=("++ray_kwargs.ray_init.runtime_env.env_vars.${_key}=${_value}")
     done
     if [[ "$_RAY_READINESS_CHECK" == 1 ]]; then
-        echo "[huanyu-job] all $_CLUSTER_NODES nodes registered ($((_CLUSTER_NODES * 16)) NPU); head starting $_JOB_MODE Huanyu training"
+        echo "[huanyu-job] all $_CLUSTER_NODES nodes registered ($((_CLUSTER_NODES * 16)) NPU); head starting $_JOB_MODE Huanyu training (preflight=$_PREFLIGHT)"
     else
-        echo "[huanyu-job] head submitting $_JOB_MODE training to $RAY_ADDRESS; expected capacity=$((_CLUSTER_NODES * 16)) NPU, not prechecked"
+        echo "[huanyu-job] head submitting $_JOB_MODE training to $RAY_ADDRESS (preflight=$_PREFLIGHT); expected capacity=$((_CLUSTER_NODES * 16)) NPU, not prechecked"
     fi
     bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/$_TRAIN_ENTRY" \
         "${_TRAIN_ARGS[@]}" \
