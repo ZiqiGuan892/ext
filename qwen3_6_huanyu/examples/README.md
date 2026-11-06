@@ -43,7 +43,7 @@ export RAY_enable_worker_prestart=0
 | 冻结 Huanyu、OmniMix/通用多模态数据、缓存训练 | `run_huanyu_32card_job.sh` | 两节点各执行一次 | `frozen_cache`，encoder/projector 都冻结，Actor16 + RM16，prompt3072 + response2048 |
 | 冻结缓存训练，16K | `run_huanyu_32card_16k_job.sh` | 两节点 | prompt14336 + response2048，SDPA，默认16+16 |
 | 冻结缓存训练，对照 Whisper 启动参数 | `run_huanyu_32card_whisper_aligned_job.sh` | 两节点 | 保留 Huanyu 接口；Actor BF16、rollout TP2、RM TP4，5K |
-| AQA 在线训练，encoder/projector 可分别开关 | `run_huanyu_aqa_unfreeze_32card_job.sh` | 两节点 | 默认二者都训练，关闭缓存，16+16，5K |
+| AQA 在线训练，encoder/projector 可分别开关 | `run_huanyu_aqa_unfreeze_32card_job.sh` | 两节点 | 默认二者都训练，关闭缓存，16+16；BS16/mini16/n8，2048+3072，dynamic batching |
 | AQA 冻结encoder/projector，开启确定性计算 | `run_huanyu_aqa_frozen_deterministic_32card_job.sh` | 两节点 | 固定两者冻结、在线编码；Actor16 + RM16，BS4/mini4/N4，5K，关闭batch invariance |
 | AQA 默认冻结encoder、训练projector，bs32 | `run_huanyu_aqa_projector_5k_bs32_job.sh` | 两节点 | 音频开关可配置；3072+2048，train/mini batch=32，n=4，Actor16 + RM16，关闭缓存 |
 | AQA 一键启动，自定义长度/同步 | `HUANYU_JOB_MODE=aqa_unfreeze bash run_huanyu_32card_job.sh` | 两节点 | 直接转入共用AQA入口，长度、精度和同步由参数配置 |
@@ -219,7 +219,26 @@ run_huanyu_aqa_audio_train.sh
        → python3 -m verl_omni.trainer.main_omni
 ```
 
-AQA 入口限定音频数据，在线编码，关闭 embedding cache；两个音频组件都冻结也不会自动切换为缓存读取。它默认静态 batching，允许通过命令行开启 Actor、rollout/ref log-prob 的 dynamic batching；静态模式固定 micro-batch=1，并保留 FSDP2、sequence parallel=1、视觉塔冻结及 Huanyu 适配参数。
+AQA 入口限定音频数据，在线编码，关闭 embedding cache；两个音频组件都冻结也不会自动切换为缓存读取。共用 `run_huanyu_aqa_audio_train.sh` 默认静态 batching；`run_huanyu_aqa_unfreeze_32card_job.sh` 默认开启 Actor、rollout/ref log-prob 的 dynamic batching。静态模式固定 micro-batch=1，并保留 FSDP2、sequence parallel=1、视觉塔冻结及 Huanyu 适配参数。
+
+unfreeze job 通过共用 job 顺序完成环境安装和站点环境加载、启动或复用 Ray、主节点提交训练；从节点加入 Ray 后保持监控，不提交训练。在两节点设置各自的 `VC_TASK_INDEX`（0/1）和相同的 `VC_WORKER_HOSTS` 后执行同一命令。默认配置及环境变量如下（长度使用整数 token 数，1K=1024）：
+
+| 环境变量 | 默认值 |
+|---|---|
+| `TRAIN_BATCH_SIZE` / `PPO_MINI_BATCH_SIZE` / `ROLLOUT_N` | `16` / `16` / `8`，每步128条轨迹 |
+| `MAX_PROMPT_LENGTH` / `MAX_RESPONSE_LENGTH` | `2048` / `3072` |
+| `AQA_DYNAMIC_BSZ` | `true`，同时控制 Actor、rollout/ref log-prob；`false` 关闭 |
+| `ROLLOUT_PROMPT_LENGTH` / `MINICPMO_MM_PROMPT_BUDGET` | 分别跟随输入长度 / rollout 输入预算 |
+| `ROLLOUT_MAX_MODEL_LEN` | rollout 输入预算 + 回复长度 + 128，默认 `5248` |
+| `ROLLOUT_MAX_NUM_BATCHED_TOKENS` / `MAX_TOKEN_LEN_PER_GPU` | 分别为 rollout 调度预算 / 训练和 log-prob 动态分批预算，默认都跟随引擎长度 |
+
+```bash
+TRAIN_BATCH_SIZE=16 PPO_MINI_BATCH_SIZE=16 ROLLOUT_N=8 \
+MAX_PROMPT_LENGTH=2048 MAX_RESPONSE_LENGTH=3072 AQA_DYNAMIC_BSZ=true \
+bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/run_huanyu_aqa_unfreeze_32card_job.sh"
+```
+
+这些变量可提前 `export`，也可像上例放在命令前；两节点保持一致。已导出的预算变量也会保留；若想让预算随新长度重新推导，先取消旧的预算变量。末尾 Hydra 参数可分别覆盖长度、token预算及三个阶段的 dynamic batching；batch 数量仍由上述环境变量和共用入口的整除检查决定。
 
 `run_huanyu_aqa_projector_5k_bs32_job.sh` 从环境读取 `HUANYU_TRAIN_AUDIO_ENCODER` / `HUANYU_TRAIN_AUDIO_PROJECTOR`，未设置时分别默认 `false` / `true`（true为训练，false为冻结），两节点需设置相同值。固定train/mini batch=32、n=4及16+16卡池；默认full精度，prompt3072+response2048，engine预算5248。两节点设置各自 `VC_TASK_INDEX` 和相同 `VC_WORKER_HOSTS` 后执行该脚本。数据可用 `HUANYU_AQA_TRAIN_FILE` / `HUANYU_AQA_VAL_FILE` 覆盖；默认训练前验证，`VAL_BEFORE_TRAIN=false` 可跳过。日志搜索 `[huanyu-aqa-projector-job]` 查看入口配置，搜索 `[huanyu-audio-train]` 查看实际模型的开关，默认 `train_encoder=False train_projector=True`。
 
@@ -402,8 +421,8 @@ bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/run_huanyu_aqa_audio_train.sh"
 |---|---|
 | 冻结一键入口 | 固定冻结两个音频组件、启用缓存和 RM；默认full，可显式选custom。路径、卡池、音频和精度值在加载环境文件后恢复 |
 | 冻结16K / Whisper 对照 | 默认长度等 Hydra 参数在用户参数前；改长度仍需对齐 Shell 预算、rollout 预算和媒体预算 |
-| AQA 共用入口 | 数据、组件、batch、TP、micro=1、dynamic=false等在用户参数后追加；通过对应环境变量调整可配置项 |
-| AQA unfreeze 5K包装 | Shell长度设置为3072/2048；自定义长度直接调用共用AQA入口，或设置mode=aqa_unfreeze调用通用job |
+| AQA 共用入口 | 数据、组件、batch、TP、micro=1等在用户参数后追加；dynamic=false默认值在用户参数前，允许显式覆盖 |
+| AQA unfreeze 5K包装 | 默认BS16/mini16/n8、2048/3072、dynamic=true；支持上述环境变量，长度和dynamic默认值放在用户Hydra参数前 |
 | 通用job的AQA模式 | 保留显式长度、batch、精度、输出目录和总步数，加载站点环境后恢复，再转入共用AQA入口 |
 | 最底层后端 | 用户参数后再次追加graph和precision参数；应使用 `HUANYU_GRAPH_MODE`、`HUANYU_PRECISION_PROFILE` 控制 |
 
@@ -449,11 +468,11 @@ bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/run_huanyu_aqa_unfreeze_32card_job.s
 |---|---|---|
 | 冻结通用、Whisper对照 | 3072 / 2048 | 3104 / 5248 |
 | AQA共用、16卡规则 | 4096 / 2048 | 4096 / 6272 |
-| AQA unfreeze一键 | 3072 / 2048 | 3072 / 5248 |
+| AQA unfreeze一键 | 2048 / 3072 | 2048 / 5248 |
 | 冻结16K | 14336 / 2048 | 14368 / 16512 |
 | AQA 16K命令行示例 | 14336 / 2048 | 14336 / 16512 |
 
-AQA共用入口要求 `PPO_MINI_BATCH_SIZE × ROLLOUT_N` 能被Actor总卡数整除、`ROLLOUT_N >= 2`、mini-batch能被rollout副本数整除、train batch能被mini-batch整除。16+16默认 `4×4=16`，每个Actor rank每次mini-batch一条序列。也支持 `TRAIN_BATCH_SIZE=16 PPO_MINI_BATCH_SIZE=16 ROLLOUT_N=4`：每步64条轨迹，每个rank分到4条，实际micro-batch仍由动态token预算或静态micro-batch配置决定；关闭逐micro-batch同步时，梯度累积可能增加峰值显存。冻结通用默认train32/mini32/n4，Whisper对照为32/16/8，仍需分别核对配置。
+AQA共用入口要求 `PPO_MINI_BATCH_SIZE × ROLLOUT_N` 能被Actor总卡数整除、`ROLLOUT_N >= 2`、mini-batch能被rollout副本数整除、train batch能被mini-batch整除。直接调用共用入口默认 `4×4=16`，每个Actor rank每次mini-batch一条序列。unfreeze一键入口默认 `16×8=128`，每个Actor rank分到8条，实际micro-batch由动态token预算控制。也支持 `TRAIN_BATCH_SIZE=16 PPO_MINI_BATCH_SIZE=16 ROLLOUT_N=4`：每步64条轨迹，每个rank分到4条；关闭逐micro-batch同步时，梯度累积可能增加峰值显存。冻结通用默认train32/mini32/n4，Whisper对照为32/16/8，仍需分别核对配置。
 
 例如，已准备环境与Ray时，使用 **2K输入 + 10K输出**：
 

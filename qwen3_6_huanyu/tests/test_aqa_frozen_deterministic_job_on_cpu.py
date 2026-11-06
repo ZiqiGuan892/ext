@@ -58,6 +58,10 @@ class FrozenDeterministicJobTests(unittest.TestCase):
             "actor_rollout_ref.rollout.engine_kwargs.vllm_omni.additional_config.rl_config.enabled": "true",
             "data.train_batch_size": "4", "actor_rollout_ref.actor.ppo_mini_batch_size": "4",
             "actor_rollout_ref.rollout.n": "4", "actor_rollout_ref.rollout.max_model_len": "5248",
+            "data.max_prompt_length": "3072", "data.max_response_length": "2048",
+            "actor_rollout_ref.actor.use_dynamic_bsz": "false",
+            "actor_rollout_ref.rollout.log_prob_use_dynamic_bsz": "false",
+            "actor_rollout_ref.ref.log_prob_use_dynamic_bsz": "false",
         }.items():
             self.assertEqual(actual[key], value, key)
         self.assertEqual(capture["env"]["EXPERIMENT_NAME"], "huanyu_aqa_frozen_deterministic_5k_32card")

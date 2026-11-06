@@ -4,9 +4,13 @@
 #   encoder/projector training: independent flags, both true by default
 #   HUANYU_USE_PRECOMPUTE: 1 -> 0 (raw audio, no cache manifest required)
 #   dataset: migrated AQA under /opt/huawei/dataset/infra_data/data/aqa_dataset
-#   train/mini batch: 32/32 -> 4/4; rollout.n stays 4 (16 actor sequences)
-#   dynamic batches -> static microbatch=1; SP=1; prefetch=off in AQA entry
-#   length: prompt=3072 + response=2048 = 5120; engine/token budget=5248
+#   defaults: train/mini batch=16/16; rollout.n=8 (128 actor sequences)
+#   dynamic batching for actor and rollout/ref log-prob; SP=1; prefetch=off
+#   length: prompt=2048 + response=3072 = 5120; engine/token budget=5248
+# Override TRAIN_BATCH_SIZE, PPO_MINI_BATCH_SIZE, ROLLOUT_N,
+# MAX_PROMPT_LENGTH, MAX_RESPONSE_LENGTH and AQA_DYNAMIC_BSZ in the environment.
+# Derived budgets also accept ROLLOUT_PROMPT_LENGTH, ROLLOUT_MAX_MODEL_LEN,
+# ROLLOUT_MAX_NUM_BATCHED_TOKENS, MAX_TOKEN_LEN_PER_GPU and MINICPMO_MM_PROMPT_BUDGET.
 # Precision policy (shared with the frozen job, applied before native imports):
 #   training GDN: FP32 recurrence with autocast disabled (padded HF API)
 #   rollout GDN: slot-local FP32 state; IPC: layerwise reload including audio
@@ -19,7 +23,8 @@
 #
 # Run this SAME command on both nodes. VC_TASK_INDEX=0 starts Ray head and
 # training; VC_TASK_INDEX=1 only joins Ray. Actor/rollout uses 16 NPUs and
-# GenRM uses another 16 NPUs. The original job owns setup and readiness checks.
+# GenRM uses another 16 NPUs. The shared job prepares the environment, starts
+# or reuses Ray, then submits training on the head and supervises the worker.
 # PROJECT_ROOT defaults to the shared Huanyu deployment; an override must be
 # absolute. This wrapper may be stored outside it.
 # Deploy the supporting scripts to PROJECT_ROOT/examples/qwen3_6_huanyu/.
@@ -67,11 +72,30 @@ if [[ "${VAL_FILE:-}" == /opt/huawei/dataset/infra_data/data/validation.parquet 
 fi
 export TRAIN_FILE="${HUANYU_AQA_TRAIN_FILE:-${TRAIN_FILE:-/opt/huawei/dataset/infra_data/data/aqa_dataset/train.parquet}}"
 export VAL_FILE="${HUANYU_AQA_VAL_FILE:-${VAL_FILE:-/opt/huawei/dataset/infra_data/data/aqa_dataset/validation.parquet}}"
-export TRAIN_BATCH_SIZE=4 PPO_MINI_BATCH_SIZE=4 ROLLOUT_N=4
+export TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-16}"
+export PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-16}"
+export ROLLOUT_N="${ROLLOUT_N:-8}"
 export PPO_MICRO_BATCH_SIZE_PER_GPU=1
-export MAX_PROMPT_LENGTH=3072 MAX_RESPONSE_LENGTH=2048
-export ROLLOUT_PROMPT_LENGTH=3072 ROLLOUT_MAX_MODEL_LEN=5248
-export MAX_TOKEN_LEN_PER_GPU=5248 MINICPMO_MM_PROMPT_BUDGET=3072
+export MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-2048}"
+export MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-3072}"
+export ROLLOUT_PROMPT_LENGTH="${ROLLOUT_PROMPT_LENGTH:-$MAX_PROMPT_LENGTH}"
+# Validate before shell arithmetic and before the shared job installs/starts anything.
+for _HUANYU_AQA_KEY in TRAIN_BATCH_SIZE PPO_MINI_BATCH_SIZE ROLLOUT_N \
+    MAX_PROMPT_LENGTH MAX_RESPONSE_LENGTH ROLLOUT_PROMPT_LENGTH; do
+    [[ "${!_HUANYU_AQA_KEY}" =~ ^[1-9][0-9]{0,8}$ ]] || {
+        echo "FATAL: $_HUANYU_AQA_KEY must be a positive integer (tokens use decimal counts)" >&2
+        exit 2
+    }
+done
+export ROLLOUT_MAX_MODEL_LEN="${ROLLOUT_MAX_MODEL_LEN:-$((ROLLOUT_PROMPT_LENGTH + MAX_RESPONSE_LENGTH + 128))}"
+export ROLLOUT_MAX_NUM_BATCHED_TOKENS="${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-$ROLLOUT_MAX_MODEL_LEN}"
+export MAX_TOKEN_LEN_PER_GPU="${MAX_TOKEN_LEN_PER_GPU:-$ROLLOUT_MAX_MODEL_LEN}"
+export MINICPMO_MM_PROMPT_BUDGET="${MINICPMO_MM_PROMPT_BUDGET:-$ROLLOUT_PROMPT_LENGTH}"
+export AQA_DYNAMIC_BSZ="${AQA_DYNAMIC_BSZ:-true}"
+case "${AQA_DYNAMIC_BSZ,,}" in
+    true|false) export AQA_DYNAMIC_BSZ="${AQA_DYNAMIC_BSZ,,}" ;;
+    *) echo 'FATAL: AQA_DYNAMIC_BSZ must be true or false' >&2; exit 2 ;;
+esac
 export PROJECT_NAME="${PROJECT_NAME:-huanyu_aqa}"
 export EXPERIMENT_NAME="${EXPERIMENT_NAME:-huanyu_aqa_unfreeze_5k_32card}"
 
@@ -86,27 +110,31 @@ _HUANYU_AQA_VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-true}"
 # well, rather than validating an inherited frozen-profile TP which is ignored.
 source "$_HUANYU_AQA_PRECISION" "$@" actor_rollout_ref.rollout.tensor_model_parallel_size=4 || exit $?
 echo "[huanyu-aqa-job] train=$TRAIN_FILE validation=$VAL_FILE"
-echo "[huanyu-aqa-job] freeze_audio=$HUANYU_FREEZE_AUDIO train_audio_encoder=$HUANYU_TRAIN_AUDIO_ENCODER train_audio_projector=$HUANYU_TRAIN_AUDIO_PROJECTOR cache=off actor=16NPU GenRM=16NPU prompt=3072 response=2048"
+echo "[huanyu-aqa-job] freeze_audio=$HUANYU_FREEZE_AUDIO train_audio_encoder=$HUANYU_TRAIN_AUDIO_ENCODER train_audio_projector=$HUANYU_TRAIN_AUDIO_PROJECTOR cache=off actor=16NPU GenRM=16NPU prompt=$MAX_PROMPT_LENGTH response=$MAX_RESPONSE_LENGTH"
+echo "[huanyu-aqa-job] BS=$TRAIN_BATCH_SIZE mini=$PPO_MINI_BATCH_SIZE N=$ROLLOUT_N dynamic_bsz=$AQA_DYNAMIC_BSZ engine=$ROLLOUT_MAX_MODEL_LEN max_num_batched_tokens=$ROLLOUT_MAX_NUM_BATCHED_TOKENS token_budget=$MAX_TOKEN_LEN_PER_GPU"
 echo "[huanyu-aqa-job] precision train_GDN=$MINICPMO_HUANYU_GDN_FP32_TRAINING rollout_GDN=$MINICPMO_GDN_FP32_REFERENCE reload=$MINICPMO_HUANYU_LAYERWISE_RELOAD KV_zero=$MINICPMO_HYBRID_BLOCK_ZERO_REFERENCE hooks=$VLLM_OMNI_EXTERNAL_MODULES"
 echo "[huanyu-aqa-job] dump defaults: rollout_dump and validation_dump beside genrm_dump in the training run directory; test_freq=$_HUANYU_AQA_TEST_FREQ val_before_train=$_HUANYU_AQA_VAL_BEFORE_TRAIN (explicit directories and trailing trainer overrides take precedence)"
 
-# Length/attention defaults precede caller Hydra overrides. AQA's checked
+# Length/dynamic/attention defaults precede caller Hydra overrides. AQA's checked
 # dataset, audio component modes and synchronized microbatch settings are enforced
 # by run_huanyu_aqa_audio_train.sh after caller arguments. TOTAL_TRAINING_STEPS
 # is its supported run-length control. Logs and dumps share a unique run folder.
 exec bash "$_HUANYU_AQA_JOB" \
     "trainer.test_freq=$_HUANYU_AQA_TEST_FREQ" \
     "trainer.val_before_train=$_HUANYU_AQA_VAL_BEFORE_TRAIN" \
-    data.max_prompt_length=3072 \
-    data.max_response_length=2048 \
-    actor_rollout_ref.rollout.prompt_length=3072 \
-    actor_rollout_ref.rollout.response_length=2048 \
-    actor_rollout_ref.rollout.max_model_len=5248 \
-    actor_rollout_ref.rollout.max_num_batched_tokens=5248 \
-    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=5248 \
-    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=5248 \
-    actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=5248 \
+    "data.max_prompt_length=$MAX_PROMPT_LENGTH" \
+    "data.max_response_length=$MAX_RESPONSE_LENGTH" \
+    "actor_rollout_ref.rollout.prompt_length=$ROLLOUT_PROMPT_LENGTH" \
+    "actor_rollout_ref.rollout.response_length=$MAX_RESPONSE_LENGTH" \
+    "actor_rollout_ref.rollout.max_model_len=$ROLLOUT_MAX_MODEL_LEN" \
+    "actor_rollout_ref.rollout.max_num_batched_tokens=$ROLLOUT_MAX_NUM_BATCHED_TOKENS" \
+    "actor_rollout_ref.actor.ppo_max_token_len_per_gpu=$MAX_TOKEN_LEN_PER_GPU" \
+    "actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=$MAX_TOKEN_LEN_PER_GPU" \
+    "actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=$MAX_TOKEN_LEN_PER_GPU" \
+    "actor_rollout_ref.actor.use_dynamic_bsz=$AQA_DYNAMIC_BSZ" \
+    "actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=$AQA_DYNAMIC_BSZ" \
+    "actor_rollout_ref.ref.log_prob_use_dynamic_bsz=$AQA_DYNAMIC_BSZ" \
     actor_rollout_ref.model.override_config.attn_implementation=eager \
-    '++ray_kwargs.ray_init.runtime_env.env_vars.MINICPMO_MM_PROMPT_BUDGET="3072"' \
+    "++ray_kwargs.ray_init.runtime_env.env_vars.MINICPMO_MM_PROMPT_BUDGET=\"$MINICPMO_MM_PROMPT_BUDGET\"" \
     "$@" \
     actor_rollout_ref.rollout.tensor_model_parallel_size=4
