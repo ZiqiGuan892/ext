@@ -110,6 +110,18 @@ huanyu_configure_precision_mode() {
         *) echo '[huanyu-precision] FATAL: HUANYU_JOB_DETERMINISM must be 0 or 1' >&2; return 2 ;;
     esac
     HUANYU_PRECISION_KEYS+=(HUANYU_JOB_DETERMINISM)
+    # Preserve optional timing through site setup and existing Ray clusters.
+    export HUANYU_GEN_TIMING="${HUANYU_GEN_TIMING:-0}"
+    export HUANYU_GEN_TIMING_ENGINE_EVERY="${HUANYU_GEN_TIMING_ENGINE_EVERY:-100}"
+    case "$HUANYU_GEN_TIMING" in
+        0|1) ;;
+        *) echo '[huanyu-timing] FATAL: HUANYU_GEN_TIMING must be 0 or 1' >&2; return 2 ;;
+    esac
+    if [[ ! "$HUANYU_GEN_TIMING_ENGINE_EVERY" =~ ^[1-9][0-9]*$ ]]; then
+        echo '[huanyu-timing] FATAL: HUANYU_GEN_TIMING_ENGINE_EVERY must be a positive integer' >&2
+        return 2
+    fi
+    HUANYU_PRECISION_KEYS+=(HUANYU_GEN_TIMING HUANYU_GEN_TIMING_ENGINE_EVERY)
     if [[ "$HUANYU_JOB_DETERMINISM" == 1 ]]; then
         export HCCL_DETERMINISTIC=strict ASCEND_LAUNCH_BLOCKING=1 NCCL_DETERMINISTIC=1
         export LCCL_DETERMINISTIC=1 VLLM_BATCH_INVARIANT=0

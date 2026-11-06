@@ -1,0 +1,28 @@
+diff --git a/verl_omni_ext/__init__.py b/verl_omni_ext/__init__.py
+--- a/verl_omni_ext/__init__.py
++++ b/verl_omni_ext/__init__.py
+@@ -113,6 +113,12 @@
+     from . import features  # noqa: F401
+     from . import trainer  # noqa: F401
+
++    # Timing is opt-in and installed in each Ray process, not only the driver.
++    if os.environ.get("HUANYU_GEN_TIMING") == "1":
++        from .models.qwen3_6_huanyu.gen_timing import install as install_gen_timing
++
++        install_gen_timing()
++
+     # Diagnostic hooks belong to this test copy of ext; shared dependencies on
+     # disk remain unchanged. Disabled by default and never required for training.
+     if os.environ.get("MINICPMO_ROLLOUT_DIAG") == "1":
+diff --git a/verl_omni_ext/trainer/__init__.py b/verl_omni_ext/trainer/__init__.py
+--- a/verl_omni_ext/trainer/__init__.py
++++ b/verl_omni_ext/trainer/__init__.py
+@@ -53,6 +53,8 @@
+         # allocator for model-inspection subprocesses, which otherwise SIGABRT
+         # on the Qwen3.5-MoE import in this image. Preserve other requested libs.
+         "LD_PRELOAD",
++        "HUANYU_GEN_TIMING",
++        "HUANYU_GEN_TIMING_ENGINE_EVERY",
+     }
+
+     def _patched_get_ppo_ray_runtime_env(config=None):

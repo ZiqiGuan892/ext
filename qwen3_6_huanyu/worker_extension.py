@@ -40,6 +40,9 @@ if os.environ.get("HUANYU_SERVE_REPEAT_DETERMINISM") == "1":
 install_huanyu_processor_compat()
 install_huanyu_rollout_precision()
 install_huanyu_cache_precision()
+from .gen_timing_engine import install_engine as _install_gen_timing_engine
+
+_install_gen_timing_engine()
 if os.environ.get("HUANYU_EMBEDDING_AB_DIR", "").strip():
     from .prompt_embedding_probe import install_runtime_probe
     install_runtime_probe()

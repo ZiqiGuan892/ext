@@ -1,5 +1,23 @@
 # 主仓库及其他插件脚本补丁
 
+## gen 阶段计时（profile 分支）
+
+`qwen3_6_huanyu/` 包含计时模块、引擎接入、启动变量透传及测试。
+ext 包根目录和 trainer 不在本仓库布局内，两处接入作为
+`gen-timing-integration.patch` 一并发布。部署时将 `qwen3_6_huanyu/`
+更新到 `verl_omni_ext/models/qwen3_6_huanyu/`，再在训练项目根目录运行：
+
+```bash
+git apply --check /path/to/gen-timing-integration.patch
+git apply /path/to/gen-timing-integration.patch
+```
+
+用本仓库 `patches/gen-timing-integration.patch` 的实际路径替换上述路径。
+补丁让 ext 激活时安装 trainer/agent/server 计时，并透传两个计时环境变量。
+若目标文件已包含该接入，无需再次应用；不能仅复制计时模块而遗漏接入。
+启用方式、日志汇总和 host_wall 测量范围见
+[gen_timing.md](../qwen3_6_huanyu/examples/gen_timing.md)。
+
 ## 训练显存默认值
 
 本分支直接发布 `qwen3_6_huanyu/`。另外 8 个本地训练脚本不在本分支中，

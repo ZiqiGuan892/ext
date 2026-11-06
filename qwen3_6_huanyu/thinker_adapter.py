@@ -93,6 +93,10 @@ class Qwen36HuanyuThinkerAdapter(OmniModelBase):
         install_huanyu_rollout_inputs()
         install_huanyu_aqa_position_ids()
         install_text_ab_capture()
+        # Retry after plugin discovery: early imports can see partial modules.
+        from .gen_timing import install as install_gen_timing
+
+        install_gen_timing()
         return processor
 
     @classmethod

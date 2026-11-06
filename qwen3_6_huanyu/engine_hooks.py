@@ -22,6 +22,10 @@ install_huanyu_cache_precision()
 # that worker factory import is the mandatory, non-skippable binding point.
 install_huanyu_weight_reload()
 
+from .gen_timing_engine import install_engine as _install_gen_timing_engine
+
+_install_gen_timing_engine()
+
 # Selected only by the text/embedding A/B launcher, before runner construction.
 import os as _os
 if _os.environ.get("HUANYU_EMBEDDING_AB_DIR", "").strip():

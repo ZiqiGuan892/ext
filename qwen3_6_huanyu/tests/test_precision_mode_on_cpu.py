@@ -45,7 +45,8 @@ class PrecisionModeTests(unittest.TestCase):
                                    "MINICPMO_HUANYU_ROLLOUT_TP", "VLLM_OMNI_EXTERNAL_MODULES",
                                    "HUANYU_USE_PRECOMPUTE", "HCCL_OP_EXPANSION_MODE", "HCCL_DETERMINISTIC", "ROLLOUT_TP",
                                    "HUANYU_JOB_DETERMINISM", "ASCEND_LAUNCH_BLOCKING", "NCCL_DETERMINISTIC",
-                                   "LCCL_DETERMINISTIC", "VLLM_BATCH_INVARIANT")
+                                   "LCCL_DETERMINISTIC", "VLLM_BATCH_INVARIANT",
+                                   "HUANYU_GEN_TIMING", "HUANYU_GEN_TIMING_ENGINE_EVERY")
         self.fixture.capture_script.write_text(
             "import json, os, pathlib, sys\n"
             + "keys = " + repr(keys) + "\n"
@@ -79,6 +80,13 @@ class PrecisionModeTests(unittest.TestCase):
             self.assertIsInstance(decoded, str, key)
             expected = capture["env"][key.removeprefix(PREFIX)] or ""
             self.assertEqual(decoded, expected, key)
+
+    def test_gen_timing_is_explicitly_forwarded_to_existing_ray_clusters(self):
+        capture = self.capture(updates={"HUANYU_GEN_TIMING": "1", "HUANYU_GEN_TIMING_ENGINE_EVERY": "25"})
+        overrides = self.overrides(capture)
+        for key, expected in (("HUANYU_GEN_TIMING", "1"), ("HUANYU_GEN_TIMING_ENGINE_EVERY", "25")):
+            self.assertEqual(capture["env"][key], expected)
+            self.assertEqual(json.loads(overrides[PREFIX + key]), expected)
 
     def test_explicit_optout_and_optional_switches_survive_repeated_source(self):
         updates = {"HUANYU_PRECISION_PROFILE": "custom", CORE[0]: "0",
