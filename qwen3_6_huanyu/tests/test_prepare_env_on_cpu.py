@@ -111,15 +111,15 @@ exit "$prepare_status"
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assert_no_ray_or_training()
 
-    def use_stem_entry(self):
-        for name in ("prepare_huanyu_stem_env.sh", "run_huanyu_stem_job.sh"):
-            shutil.copyfile(EXAMPLES / name, self.fixture.examples / name)
-        self.fixture.env["HUANYU_TEST_PREPARE_ENTRY"] = job_fixture.shell_path(
-            self.fixture.examples / "prepare_huanyu_stem_env.sh"
-        )
+    def use_stem_mode(self):
+        # The shared entry still accepts existing mode selections; no separate
+        # STEM prepare script is needed.
+        name = "run_huanyu_stem_job.sh"
+        shutil.copyfile(EXAMPLES / name, self.fixture.examples / name)
+        self.fixture.env["HUANYU_JOB_MODE"] = "stem"
 
     def test_stem_source_prepares_all_card_counts_without_node_metadata_or_ray(self):
-        self.use_stem_entry()
+        self.use_stem_mode()
         self.fixture.bin.joinpath("ray").unlink()
         self.append_site_env(
             "export HUANYU_TEST_SITE_VALUE=stem-source-worked\n"
@@ -145,7 +145,7 @@ exit "$prepare_status"
                 self.fixture.events_file.write_text("", encoding="utf-8")
 
     def test_stem_bash_activation_replays_256_card_and_eos_settings(self):
-        self.use_stem_entry()
+        self.use_stem_mode()
         exclusions = self.fixture.env.get("MSYS2_ENV_CONV_EXCL", "") + ";PATH"
         result = self.run_prepare({"TOTAL_NPUS": "256", "STEM_IGNORE_EOS": "true",
                                    "MSYS2_ENV_CONV_EXCL": exclusions}, sourced=False)
@@ -167,7 +167,7 @@ exit "$prepare_status"
             self.assertEqual(env[key], value, key)
 
     def test_stem_failed_preparation_does_not_activate_partial_profile(self):
-        self.use_stem_entry()
+        self.use_stem_mode()
         result = self.run_prepare({"HUANYU_TEST_RUNTIME_EXIT": "19"})
         self.assertEqual(result.returncode, 19, result.stdout + result.stderr)
         self.assert_no_ray_or_training()
@@ -225,13 +225,31 @@ exit "$prepare_status"
         self.assertFalse(self.capture.exists())
         self.assertEqual(len(self.activation_files()), 1)
 
-    def test_prepare_does_not_create_shell_startup_override(self):
+    def test_prepare_persists_proxy_python_prelude_once_and_preserves_bashrc(self):
         rc = self.user_dir / ".bashrc"
         original = b'export PYTHONPATH="/user/path"'
         rc.write_bytes(original)
+        proxies = {"HTTP_PROXY": "http://invalid:3128", "HTTPS_PROXY": "http://invalid:3128"}
+        result = self.run_prepare(proxies, prefix="hash -p /missing-python3 python3")
+        self.assert_success(result)
+        for key in proxies:
+            self.assertNotIn(key, self.prepared()["env"])
+        persisted = rc.read_bytes()
+        self.assertTrue(persisted.startswith(original + b"\n"))
         self.assert_success(self.run_prepare(sourced=False))
-        self.assertEqual(rc.read_bytes(), original)
+        self.assertEqual(rc.read_bytes(), persisted)
         self.assertFalse((self.user_dir / ".huanyu-vllm-source.sh").exists())
+        result = subprocess.run(
+            [job_fixture.find_bash(), "--noprofile", "--norc", "-c",
+             'hash -p /missing-python3 python3; source "$HOME/.bashrc" && '
+             '[[ ! -v HTTP_PROXY && ! -v HTTPS_PROXY ]] && '
+             '[[ "$PATH" == /usr/local/python3.12.13/bin:* ]] && '
+             '[[ "$(command -v python3)" != /missing-python3 ]] && '
+             '[[ "$PYTHONPATH" == /user/path ]]'],
+            env=dict(self.fixture.env, **proxies), capture_output=True,
+            text=True, encoding="utf-8", timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_prepare_retires_only_owned_hook_and_keeps_backup(self):
         rc = self.user_dir / ".bashrc"
@@ -249,7 +267,7 @@ exit "$prepare_status"
         profile.write_bytes(old_profile)
         self.assert_success(self.run_prepare())
         self.assert_success(self.run_prepare())
-        self.assertEqual(rc.read_bytes(), original_rc)
+        self.assertTrue(rc.read_bytes().startswith(original_rc))
         self.assertFalse(profile.exists())
         backups = list(self.user_dir.glob(".huanyu-vllm-source.sh.disabled.*"))
         self.assertEqual(len(backups), 1)
@@ -265,7 +283,7 @@ exit "$prepare_status"
             env=env, capture_output=True, text=True, encoding="utf-8", timeout=30,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.splitlines(), ["", "", "/user/path", "unset"])
+        self.assertEqual(result.stdout.splitlines()[-4:], ["", "", "/user/path", "unset"])
 
     def test_prepare_leaves_unrecognized_startup_file_untouched(self):
         profile = self.user_dir / ".huanyu-vllm-source.sh"
@@ -343,7 +361,7 @@ exit "$prepare_status"
                 self.assertIsNone(record["path"])
 
     def test_stem_prepare_starts_head_and_checks_all_nodes_before_activation(self):
-        self.use_stem_entry()
+        self.use_stem_mode()
         result = self.run_prepare(
             {"TOTAL_NPUS": "32", "VC_TASK_INDEX": "0", "VC_WORKER_HOSTS": "head,worker",
              "RAY_ADDRESS": "auto", "HUANYU_JOB_PREFLIGHT": "0", "HUANYU_RAY_READINESS_CHECK": "0"},
@@ -398,6 +416,7 @@ exit "$prepare_status"
         result = self.run_prepare({**expected, "MSYS2_ENV_CONV_EXCL": exclusions}, sourced=False)
         self.assert_success(result)
         replay = dict(self.fixture.env, MSYS2_ENV_CONV_EXCL="*",
+                      HTTP_PROXY="http://invalid:3128", HTTPS_PROXY="http://invalid:3128",
                       TEST_ACTIVATION=job_fixture.shell_path(self.activation_files()[0]))
         # These assignments belonged only to the `bash prepare...` process;
         # the shell sourcing its activation has no original runtime settings.
@@ -412,6 +431,8 @@ exit "$prepare_status"
         )
         self.assert_success(result)
         actual = self.prepared()
+        self.assertNotIn("HTTP_PROXY", actual["env"])
+        self.assertNotIn("HTTPS_PROXY", actual["env"])
         for key, value in expected.items():
             self.assertEqual(actual["env"][key], value, key)
         self.assertEqual(Path(actual["env"]["PROJECT_ROOT"]).resolve(), self.fixture.project.resolve())
@@ -450,7 +471,7 @@ exit "$prepare_status"
         self.assertEqual(result.returncode, 134, result.stdout + result.stderr)
         self.assert_no_ray_or_training()
         self.assertFalse(self.activation_files())
-        self.assertFalse((self.user_dir / ".bashrc").exists())
+        self.assertTrue((self.user_dir / ".bashrc").is_file())
         self.assertFalse(any(event["args"][0] == "check-devices" for event in self.fixture.events("helper")))
 
     def test_existing_ray_is_not_started_reinstalled_or_waited_on(self):

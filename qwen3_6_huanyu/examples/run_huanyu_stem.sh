@@ -14,7 +14,9 @@
 # MODEL_PATH / RM_MODEL_PATH override checkpoints; other Hydra args are accepted.
 # This entry owns data, length, pools, media freeze and microbatch settings;
 # change those through the variables above, not conflicting Hydra overrides.
-# Dynamic batching and sync_each_microbatch defaults accept Hydra overrides.
+# Rollout max_num_batched_tokens, dynamic batching and sync_each_microbatch
+# defaults accept Hydra overrides. The rollout token budget defaults to the
+# engine context length; e.g. actor_rollout_ref.rollout.max_num_batched_tokens=16384.
 set -euo pipefail
 
 export PROJECT_ROOT="${PROJECT_ROOT:-/opt/huawei/dataset/infra_data/verl_omni_qwen36_gzq_new}"
@@ -228,6 +230,7 @@ exec bash "$_STEM_EXAMPLES/run_huanyu.sh" \
     "actor_rollout_ref.actor.use_dynamic_bsz=$_STEM_DYNAMIC" \
     "actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=$_STEM_DYNAMIC" \
     "actor_rollout_ref.ref.log_prob_use_dynamic_bsz=$_STEM_DYNAMIC" \
+    "actor_rollout_ref.rollout.max_num_batched_tokens=$ROLLOUT_MAX_MODEL_LEN" \
     "++actor_rollout_ref.model.override_config.huanyu_sync_each_microbatch=$_STEM_SYNC" \
     "trainer.rollout_data_dir=${ROLLOUT_DATA_DIR:-$HUANYU_RUN_DIR/rollout_dump}" \
     "trainer.validation_data_dir=${VALIDATION_DATA_DIR:-$HUANYU_RUN_DIR/validation_dump}" "$@" \
@@ -237,7 +240,6 @@ exec bash "$_STEM_EXAMPLES/run_huanyu.sh" \
     "actor_rollout_ref.rollout.prompt_length=$MAX_PROMPT_LENGTH" \
     "actor_rollout_ref.rollout.response_length=$MAX_RESPONSE_LENGTH" \
     "actor_rollout_ref.rollout.max_model_len=$ROLLOUT_MAX_MODEL_LEN" \
-    "actor_rollout_ref.rollout.max_num_batched_tokens=$ROLLOUT_MAX_MODEL_LEN" \
     "actor_rollout_ref.actor.ppo_max_token_len_per_gpu=$MAX_TOKEN_LEN_PER_GPU" \
     "actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=$MAX_TOKEN_LEN_PER_GPU" \
     "actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=$MAX_TOKEN_LEN_PER_GPU" \

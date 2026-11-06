@@ -16,7 +16,7 @@
 # 10K is an output LIMIT; ignoring EOS does not disable other stop conditions.
 # Example for a length stress test:
 # TOTAL_TRAINING_STEPS=2 STEM_IGNORE_EOS=true bash .../run_huanyu_stem_job.sh
-# --train-only: on VC_TASK_INDEX=0 after prepare_huanyu_stem_env.sh and manual
+# --train-only: on VC_TASK_INDEX=0 after prepare_huanyu_env.sh and
 # Ray startup. Keeps this profile but skips ALL common job setup/Ray startup.
 #
 # Launch commands (choose ONE size; run the same command on every job node):

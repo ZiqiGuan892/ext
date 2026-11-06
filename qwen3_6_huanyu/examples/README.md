@@ -13,7 +13,7 @@ native import、设备数量及集群就绪探测；从节点仍先等待 head�
 旧变量 `HUANYU_RAY_READINESS_CHECK` 仍可作为回退开关，新变量显式设置时优先。
 这不关闭训练入口自身的数据、配置或资源检查。
 
-`prepare_huanyu_env.sh` 和 `prepare_huanyu_stem_env.sh` 始终验证环境；加 `--start-ray`
+环境统一使用 `prepare_huanyu_env.sh` 准备，STEM 可复用已准备的环境。此入口始终验证环境；加 `--start-ray`
 时，主节点通过 GCS 验证全部节点和 NPU 资源，从节点验证自身注册，不依赖 Dashboard，
 也不创建探测用的 Ray driver。各节点需并行执行准备命令。未加 `--start-ray` 时只准备环境。
 
@@ -299,7 +299,7 @@ export HUANYU_EMBED_CACHE_DIR=/opt/huawei/dataset/ccb_data/data/omni/embed_cache
 source "$PROJECT_ROOT/examples/qwen3_6_huanyu/prepare_huanyu_env.sh"
 ```
 
-它会设置jemalloc，清理 vLLM-Omni 源码路径覆盖，安装当前项目插件，加载 `env_export_huanyu.sh`，恢复音频/精度配置，并检查已有 vLLM-Omni 安装的实际来源和至少16张可见NPU。env文件还包含mathruler/zarr安装、CANN/ATB环境加载、日志目录与诊断文件准备。调用链为：
+它首先执行 `unset HTTP_PROXY HTTPS_PROXY`，将 `/usr/local/python3.12.13/bin` 放到 `PATH` 最前面，执行 `hash -r` 和 `command -v python3`，并将这四条命令幂等追加到当前用户的 `~/.bashrc`。随后设置jemalloc，清理 vLLM-Omni 源码路径覆盖，安装当前项目插件，加载 `env_export_huanyu.sh`，恢复音频/精度配置，并检查已有 vLLM-Omni 安装的实际来源和至少16张可见NPU。env文件还包含mathruler/zarr安装、CANN/ATB环境加载、日志目录与诊断文件准备。调用链为：
 
 ```text
 source prepare_huanyu_env.sh
@@ -331,15 +331,15 @@ export HUANYU_TRAIN_AUDIO_ENCODER=true HUANYU_TRAIN_AUDIO_PROJECTOR=true
 source "$PROJECT_ROOT/examples/qwen3_6_huanyu/prepare_huanyu_env.sh"
 ```
 
-可选 `frozen_cache`、`aqa_unfreeze` 或 `--stem` 对应的 STEM 环境。AQA 准备使用在线音频及 AQA 的 train/validation 路径。环境和 Ray 就绪后，在主节点运行 `run_huanyu_aqa_audio_train.sh`。
+可选 `frozen_cache`、`aqa_unfreeze`。AQA 准备使用在线音频及 AQA 的 train/validation 路径。环境和 Ray 就绪后，在主节点运行 `run_huanyu_aqa_audio_train.sh`。STEM 复用同一环境，无需另行准备；训练配置由 `run_huanyu_stem_job.sh` 设置。
 
 默认环境文件是本目录的 `env_export_huanyu.sh`。如站点文件叫 `source_env_export.sh`，在准备前 `export HUANYU_ENV_FILE=/绝对路径/source_env_export.sh`。项目/模型/数据路径、显式的输出目录与缓存路径会在source后恢复。不要用一个会主动启动Ray或训练的文件作为环境文件。
 
-`source` 会将成功准备的环境应用到当前终端，保留原有shell选项。若用 `bash prepare_huanyu_env.sh`，准备完成后须执行它打印的 `source .../activate.sh`；子进程不能直接修改父终端环境。准备子进程失败不会生成可用的新激活文件，也不会应用部分环境到父终端；已完成的复制/安装不会因此撤销。激活文件保留受管理的运行配置及其他环境变化，包含unset，并用私有权限保存。
+`source` 会将成功准备的环境应用到当前终端，保留原有shell选项。若用 `bash prepare_huanyu_env.sh`，准备完成后须执行它打印的 `source .../activate.sh`；子进程不能直接修改父终端环境。准备子进程失败不会生成可用的新激活文件，也不会应用子进程的部分环境到父终端；开头已完成的代理/PATH设置、`.bashrc`追加及复制/安装不会因此撤销。激活文件保留受管理的运行配置及其他环境变化，包含代理unset和命令缓存刷新，并用私有权限保存。
 
 每个节点的准备日志 `prepare.log` 和激活文件 `activate.sh` 位于 `$PROJECT_ROOT/runs/environment/prepare_<时间>_<随机串>/`。可通过 `HUANYU_PREPARE_LOG_ROOT` 指定根目录。已有 raylet 时跳过 editable 安装，继续检查源码及环境。重用的进程保留启动时继承的环境。
 
-普通和 STEM prepare 不再写入 `~/.bashrc`，也不生成源码路径 hook。检查通过后会停用旧版脚本自动生成的 `~/.huanyu-vllm-source.sh`，保留为同目录的 `.disabled.*` 备份；用户自行维护的文件或符号链接不改动。原 `.bashrc` 的条件加载行保留，目标不存在时不执行。旧的 `activate.sh` 仍保存旧环境，请重新 prepare 后使用新生成的激活文件。
+统一 prepare 入口只向 `~/.bashrc` 追加一次上述四条代理/Python命令，保留原有内容，不生成源码路径 hook。检查通过后会停用旧版脚本自动生成的 `~/.huanyu-vllm-source.sh`，保留为同目录的 `.disabled.*` 备份；用户自行维护的该hook文件或符号链接不改动。原 `.bashrc` 的条件加载行保留，目标不存在时不执行。旧的 `activate.sh` 仍保存旧环境，请重新 prepare 后使用新生成的激活文件。
 
 已完成准备的节点可单独停用上述旧 hook，并检查新进程的实际导入位置，期望为 `/vllm-workspace/vllm-omni/vllm_omni/__init__.py`（解析符号链接后）：
 
@@ -506,6 +506,8 @@ bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/run_huanyu_stem.sh"
 数据目录默认 `/opt/huawei/dataset/infra_data/data/rl_stem_data`，可用 `STEM_DATA_DIR` 改目录，或 `STEM_TRAIN_FILE` / `STEM_VAL_FILE` 改文件。默认读取train.parquet与val.parquet，后者不存在时尝试validation.parquet。启动时为GenRM在本次运行目录写入带 `extra_info.question` 的parquet副本，源数据保持不变；该运行目录必须能被所有节点读取。
 
 更长测试使用 `STEM_CONTEXT_LENGTH=16k STEM_PROMPT_LENGTH=4096` 等组合；默认遇到EOS可以提前结束，`STEM_IGNORE_EOS=true` 可用于长度压力测试。长度不保证显存可容纳，GenRM的 `RM_MAX_MODEL_LEN` 预算独立配置。默认跳过训练前验证，初始化完成后进入训练；仍每10步验证，保存rollout和validation dump。可用 `VAL_BEFORE_TRAIN` / `TEST_FREQ` 调整，显式设置 `VAL_BEFORE_TRAIN=true` 会恢复初始验证。dynamic batching、逐micro同步和验证配置均可用末尾Hydra参数覆盖。
+
+Rollout 的 `actor_rollout_ref.rollout.max_num_batched_tokens` 默认等于引擎上下文长度，可用同名 Hydra 参数单独覆盖，例如 `actor_rollout_ref.rollout.max_num_batched_tokens=16384`；这不会改变单条序列的 `max_model_len` 或训练/log-prob 的 token 预算。通过 `run_huanyu_stem_job.sh` 启动时，将 `--train-only` 放在脚本名后、所有 Hydra 参数前。
 
 ## 6. 全部辅助脚本说明
 
@@ -1268,30 +1270,28 @@ bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/run_huanyu_stem_job.sh"
 
 也可以拆为“各节点准备环境 → 手动启动 Ray → 主节点提交训练”。这是排查 Ray 启动/注册阻塞时的独立入口；不会把已有的 raylet 注册问题自动修好。以下步骤在普通 Bash 终端执行，不要用每卡一个进程的 torchrun 包装。
 
-每个节点先准备环境，所有节点使用相同的模型、数据和 TOTAL_NPUS：
+STEM 复用通用环境，已准备的节点无需再次 prepare。首次准备时，各节点执行：
 
 ```bash
 export PROJECT_ROOT=/opt/huawei/dataset/infra_data/code/verl_omni_qwen36_gzq_new
 export MODEL_PATH=/opt/huawei/dataset/model_gy/downloaded_models/2748
 export HUANYU_VLLM_SOURCE=/vllm-workspace/vllm-omni
 export HUANYU_ENV_FILE="$PROJECT_ROOT/examples/qwen3_6_huanyu/env_export_huanyu.sh"
-export STEM_DATA_DIR=/opt/huawei/dataset/infra_data/data/rl_stem_data
-export TOTAL_NPUS=128   # 支持16/32/128/256；所有节点设置相同值
-export STEM_IGNORE_EOS=false
-source "$PROJECT_ROOT/examples/qwen3_6_huanyu/prepare_huanyu_stem_env.sh"
+source "$PROJECT_ROOT/examples/qwen3_6_huanyu/prepare_huanyu_env.sh"
 ```
 
-若由 prepare 启动并检查 Ray，设置好 `VC_TASK_INDEX`、`VC_WORKER_HOSTS`，将最后一行改为 `source "$PROJECT_ROOT/examples/qwen3_6_huanyu/prepare_huanyu_stem_env.sh" --start-ray`。在所有节点并行执行，等待主节点打印 `RAY_READY mode=all` 后直接进入下方的 `--train-only` 步骤。32 卡时设置 `TOTAL_NPUS=32`，主节点应报告 `nodes=2 total_NPU=32`。
+环境已就绪但 Ray 尚未启动时，设置好 `VC_TASK_INDEX`、`VC_WORKER_HOSTS`，在所有节点并行执行 `bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/start_huanyu_ray.sh" --check`。此入口按主机列表识别节点数；主节点检查通过后直接进入下方的 `--train-only` 步骤。32 卡应报告2个节点、总计32张NPU。
 
 每个节点出现 `[huanyu-env] environment activated` 后，当前 shell 已加载本次配置。默认模式只选定 `HUANYU_VLLM_SOURCE`、准备插件和站点环境、检查原生导入与 16 卡可见性。使用自定义 `export_export.sh` 时，把 `HUANYU_ENV_FILE` 指向该文件。
 
-若用 `bash prepare_huanyu_stem_env.sh`，子进程无法修改父 shell，必须执行其打印的 `source .../activate.sh`。新终端也需 source **该节点**本次生成的激活文件；日志与激活文件位于 `$PROJECT_ROOT/runs/environment/prepare_<时间戳>_<随机后缀>/`。
+若用 `bash prepare_huanyu_env.sh`，子进程无法修改父 shell，必须执行其打印的 `source .../activate.sh`。新终端也需 source **该节点**本次生成的激活文件；日志与激活文件位于 `$PROJECT_ROOT/runs/environment/prepare_<时间戳>_<随机后缀>/`。
 
-随后在已激活环境的各节点手动确定地址（`VC_TASK_INDEX`、`VC_WORKER_HOSTS` 由平台提供；16/32/128/256卡分别为1/2/8/16个主机）：
+也可在已激活环境的各节点手动确定地址并启动 Ray（`VC_TASK_INDEX`、`VC_WORKER_HOSTS` 由平台提供；16/32/128/256卡分别为1/2/8/16个主机）：
 
 ```bash
+export TOTAL_NPUS=128   # 按实际卡数设置16/32/128/256，所有节点保持一致
 HUANYU_IPS="$(python3 -B "$PROJECT_ROOT/examples/qwen3_6_huanyu/job_bootstrap.py" \
-  resolve "${VC_WORKER_HOSTS:?请设置所有节点的主机列表}" --expected-nodes "$NNODES")"
+  resolve "${VC_WORKER_HOSTS:?请设置所有节点的主机列表}" --expected-nodes "$((TOTAL_NPUS / 16))")"
 IFS=, read -r -a HUANYU_NODE_IPS <<< "$HUANYU_IPS"
 export HEAD_IP="${HUANYU_NODE_IPS[0]}"
 export RAY_ADDRESS="$HEAD_IP:6925"
@@ -1313,7 +1313,8 @@ ray start --address="$RAY_ADDRESS" --resources='{"NPU":16}'
 主节点确认 `ray status --address="$RAY_ADDRESS"` 显示预期的1/2/8/16个节点、总计16/32/128/256张NPU后，只在主节点执行：
 
 ```bash
-TOTAL_TRAINING_STEPS=2 \
+TOTAL_NPUS=128 TRAIN_BATCH_SIZE=128 PPO_MINI_BATCH_SIZE=128 ROLLOUT_N=16 \
+ROLLOUT_TP=8 STEM_IGNORE_EOS=false TOTAL_TRAINING_STEPS=2 \
 bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/run_huanyu_stem_job.sh" --train-only
 ```
 
