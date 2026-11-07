@@ -71,6 +71,7 @@ else
     prepare_status=$?
 fi
 export HUANYU_TEST_OPTIONS_AFTER="$-"
+export HUANYU_TEST_PYTHON_AFTER="$(command -v python3)"
 export HUANYU_TEST_PREPARE_STATUS="$prepare_status"
 "$HUANYU_TEST_PYTHON" "$HUANYU_TEST_PREPARE_CAPTURE_SCRIPT"
 exit "$prepare_status"
@@ -225,31 +226,27 @@ exit "$prepare_status"
         self.assertFalse(self.capture.exists())
         self.assertEqual(len(self.activation_files()), 1)
 
-    def test_prepare_persists_proxy_python_prelude_once_and_preserves_bashrc(self):
+    def test_prepare_preserves_proxies_python_selection_and_bashrc(self):
         rc = self.user_dir / ".bashrc"
         original = b'export PYTHONPATH="/user/path"'
         rc.write_bytes(original)
-        proxies = {"HTTP_PROXY": "http://invalid:3128", "HTTPS_PROXY": "http://invalid:3128"}
-        result = self.run_prepare(proxies, prefix="hash -p /missing-python3 python3")
-        self.assert_success(result)
-        for key in proxies:
-            self.assertNotIn(key, self.prepared()["env"])
-        persisted = rc.read_bytes()
-        self.assertTrue(persisted.startswith(original + b"\n"))
-        self.assert_success(self.run_prepare(sourced=False))
-        self.assertEqual(rc.read_bytes(), persisted)
-        self.assertFalse((self.user_dir / ".huanyu-vllm-source.sh").exists())
-        result = subprocess.run(
-            [job_fixture.find_bash(), "--noprofile", "--norc", "-c",
-             'hash -p /missing-python3 python3; source "$HOME/.bashrc" && '
-             '[[ ! -v HTTP_PROXY && ! -v HTTPS_PROXY ]] && '
-             '[[ "$PATH" == /usr/local/python3.12.13/bin:* ]] && '
-             '[[ "$(command -v python3)" != /missing-python3 ]] && '
-             '[[ "$PYTHONPATH" == /user/path ]]'],
-            env=dict(self.fixture.env, **proxies), capture_output=True,
-            text=True, encoding="utf-8", timeout=30,
+        settings = {"HTTP_PROXY": "http://invalid:3128", "HTTPS_PROXY": "http://invalid:3128",
+                    "PYTHON_BIN": "caller-selected-python"}
+        result = self.run_prepare(
+            settings, prefix='export HUANYU_TEST_PYTHON_BEFORE="$(command -v python3)"',
         )
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_success(result)
+        actual = self.prepared()["env"]
+        for key, value in settings.items():
+            self.assertEqual(actual[key], value, key)
+        # Native Windows Python serializes PATH with semicolons, so its replay
+        # cannot resolve Bash commands. Check executable lookup on Linux.
+        if os.name != "nt":
+            self.assertEqual(actual["HUANYU_TEST_PYTHON_BEFORE"], actual["HUANYU_TEST_PYTHON_AFTER"])
+        self.assertEqual(rc.read_bytes(), original)
+        self.assert_success(self.run_prepare(sourced=False))
+        self.assertEqual(rc.read_bytes(), original)
+        self.assertFalse((self.user_dir / ".huanyu-vllm-source.sh").exists())
 
     def test_prepare_retires_only_owned_hook_and_keeps_backup(self):
         rc = self.user_dir / ".bashrc"
@@ -362,8 +359,10 @@ exit "$prepare_status"
 
     def test_stem_prepare_starts_head_and_checks_all_nodes_before_activation(self):
         self.use_stem_mode()
+        self.append_site_env("export HCCL_LOGIC_SUPERPOD_ID=site-superpod\n")
         result = self.run_prepare(
             {"TOTAL_NPUS": "32", "VC_TASK_INDEX": "0", "VC_WORKER_HOSTS": "head,worker",
+             "HCCL_LOGIC_SUPERPOD_ID": "scheduler-superpod",
              "RAY_ADDRESS": "auto", "HUANYU_JOB_PREFLIGHT": "0", "HUANYU_RAY_READINESS_CHECK": "0"},
             arguments=("--start-ray",),
         )
@@ -378,9 +377,12 @@ exit "$prepare_status"
         self.assertEqual(check[check.index("--mode") + 1], "all")
         self.assertEqual(check[check.index("--expected-ips") + 1], "192.0.2.10,192.0.2.11")
         self.assertEqual(self.prepared()["env"]["RAY_ADDRESS"], "192.0.2.10:6925")
+        self.assertIsNone(self.fixture.events("ray")[0]["hccl_logic_superpod_id"])
+        self.assertNotIn("HCCL_LOGIC_SUPERPOD_ID", self.prepared()["env"])
         self.assertFalse(self.fixture.events("train"))
 
     def test_prepare_worker_checks_its_own_registration_and_returns(self):
+        self.append_site_env("export HCCL_LOGIC_SUPERPOD_ID=site-superpod\n")
         result = self.run_prepare(
             {"VC_TASK_INDEX": "1", "VC_WORKER_HOSTS": "head,worker", "RAY_PORT": "7001"},
             arguments=("--start-ray",), sourced=False,
@@ -395,6 +397,7 @@ exit "$prepare_status"
         self.assertEqual(operations[-1][operations[-1].index("--mode") + 1], "local")
         self.assertEqual(operations[-1][operations[-1].index("--local-ip") + 1], "192.0.2.11")
         self.assertTrue(self.activation_files())
+        self.assertIsNone(self.fixture.events("ray")[0]["hccl_logic_superpod_id"])
         self.assertFalse(self.fixture.events("train"))
 
     def test_existing_ray_must_pass_check_before_activation(self):
@@ -413,10 +416,12 @@ exit "$prepare_status"
             "TRAIN_FILE": "temporary-train.parquet", "VAL_FILE": "temporary-validation.parquet",
         }
         exclusions = self.fixture.env.get("MSYS2_ENV_CONV_EXCL", "") + ";PATH"
-        result = self.run_prepare({**expected, "MSYS2_ENV_CONV_EXCL": exclusions}, sourced=False)
+        result = self.run_prepare({**expected, "MSYS2_ENV_CONV_EXCL": exclusions,
+                                   "PYTHON_BIN": "prepare-shell-python"}, sourced=False)
         self.assert_success(result)
         replay = dict(self.fixture.env, MSYS2_ENV_CONV_EXCL="*",
                       HTTP_PROXY="http://invalid:3128", HTTPS_PROXY="http://invalid:3128",
+                      PYTHON_BIN="activation-shell-python",
                       TEST_ACTIVATION=job_fixture.shell_path(self.activation_files()[0]))
         # These assignments belonged only to the `bash prepare...` process;
         # the shell sourcing its activation has no original runtime settings.
@@ -431,8 +436,9 @@ exit "$prepare_status"
         )
         self.assert_success(result)
         actual = self.prepared()
-        self.assertNotIn("HTTP_PROXY", actual["env"])
-        self.assertNotIn("HTTPS_PROXY", actual["env"])
+        self.assertEqual(actual["env"]["HTTP_PROXY"], replay["HTTP_PROXY"])
+        self.assertEqual(actual["env"]["HTTPS_PROXY"], replay["HTTPS_PROXY"])
+        self.assertEqual(actual["env"]["PYTHON_BIN"], replay["PYTHON_BIN"])
         for key, value in expected.items():
             self.assertEqual(actual["env"][key], value, key)
         self.assertEqual(Path(actual["env"]["PROJECT_ROOT"]).resolve(), self.fixture.project.resolve())
@@ -471,7 +477,7 @@ exit "$prepare_status"
         self.assertEqual(result.returncode, 134, result.stdout + result.stderr)
         self.assert_no_ray_or_training()
         self.assertFalse(self.activation_files())
-        self.assertTrue((self.user_dir / ".bashrc").is_file())
+        self.assertFalse((self.user_dir / ".bashrc").exists())
         self.assertFalse(any(event["args"][0] == "check-devices" for event in self.fixture.events("helper")))
 
     def test_existing_ray_is_not_started_reinstalled_or_waited_on(self):

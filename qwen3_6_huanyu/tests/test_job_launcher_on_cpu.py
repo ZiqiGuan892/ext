@@ -56,6 +56,7 @@ def record(kind, args, **extra):
     )
     item = dict(kind=kind, args=args, preload=os.environ.get("LD_PRELOAD"),
                 precision={key: os.environ.get(key) for key in precision_names}, **extra)
+    item["hccl_logic_superpod_id"] = os.environ.get("HCCL_LOGIC_SUPERPOD_ID")
     item["launcher_env"] = {key: os.environ[key] for key in (
         "LOCAL_RANK", "RANK", "WORLD_SIZE", "LOCAL_WORLD_SIZE", "GROUP_RANK",
         "GROUP_WORLD_SIZE", "ROLE_RANK", "ROLE_WORLD_SIZE", "TORCHELASTIC_RUN_ID",

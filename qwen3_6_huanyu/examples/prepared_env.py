@@ -82,10 +82,6 @@ def write_activation(snapshot_path, output, stack_limit):
         if key in _MANAGED_NAMES or key.startswith(_MANAGED_PREFIXES) or before.get(key) != _digest(value):
             lines.append(f"export {key}={shlex.quote(value)} || return $?")
     lines += [
-        # prepare clears proxies before taking its snapshot, so the diff alone
-        # cannot replay these unsets in the parent of `bash prepare...`.
-        "unset HTTP_PROXY HTTPS_PROXY || return $?",
-        "hash -r",
         f"export HUANYU_PREPARED_ENV_FILE={shlex.quote(str(output))} || return $?",
         "echo '[huanyu-env] environment activated'",
     ]

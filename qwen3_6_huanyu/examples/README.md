@@ -318,7 +318,7 @@ export HUANYU_EMBED_CACHE_DIR=/opt/huawei/dataset/ccb_data/data/omni/embed_cache
 source "$PROJECT_ROOT/examples/qwen3_6_huanyu/prepare_huanyu_env.sh"
 ```
 
-它首先执行 `unset HTTP_PROXY HTTPS_PROXY`，将 `/usr/local/python3.12.13/bin` 放到 `PATH` 最前面，执行 `hash -r` 和 `command -v python3`，并将这四条命令幂等追加到当前用户的 `~/.bashrc`。随后设置jemalloc，清理 vLLM-Omni 源码路径覆盖，安装当前项目插件，加载 `env_export_huanyu.sh`，恢复音频/精度配置，并检查已有 vLLM-Omni 安装的实际来源和至少16张可见NPU。env文件还包含mathruler/zarr安装、CANN/ATB环境加载、日志目录与诊断文件准备。调用链为：
+准备入口沿用当前终端的代理与 Python 设置，不清除 `HTTP_PROXY` / `HTTPS_PROXY`、不覆盖 `PYTHON_BIN`，也不再将 `/usr/local/python3.12.13/bin` 强制放到 `PATH` 前面。执行前需自行选好可运行训练依赖的 `python3`。脚本设置jemalloc，清理 vLLM-Omni 源码路径覆盖，安装当前项目插件，加载 `env_export_huanyu.sh`，恢复音频/精度配置，并检查已有 vLLM-Omni 安装的实际来源和至少16张可见NPU。env文件还包含mathruler/zarr安装、CANN/ATB环境加载、日志目录与诊断文件准备。调用链为：
 
 ```text
 source prepare_huanyu_env.sh
@@ -338,7 +338,7 @@ export VC_TASK_INDEX=0   # 主节点填 0，从节点填 1
 source "$PROJECT_ROOT/examples/qwen3_6_huanyu/prepare_huanyu_env.sh" --start-ray
 ```
 
-以默认端口为例，主节点执行 `ray start --head --port=6925 --dashboard-host=0.0.0.0 --dashboard-port=8960 --resources='{"NPU": 16}'`。从节点等主节点端口可连接后执行 `ray start --address="${VC_WORKER_HOSTS%%,*}:6925" --resources='{"NPU": 16}'`（脚本会先把主机名解析为 IPv4）。端口分别可通过 `RAY_PORT` 和 `RAY_DASHBOARD_PORT` 设置。若检测到本地已有 raylet，直接检查它在目标集群的注册。
+以默认端口为例，主节点执行 `ray start --head --port=6925 --dashboard-host=0.0.0.0 --dashboard-port=8960 --resources='{"NPU": 16}'`。从节点等主节点端口可连接后执行 `ray start --address="${VC_WORKER_HOSTS%%,*}:6925" --resources='{"NPU": 16}'`（脚本会先把主机名解析为 IPv4）。`start_huanyu_ray.sh` 与共用的 job / prepare 启动流程均在启动 Ray 前执行 `unset HCCL_LOGIC_SUPERPOD_ID`，覆盖主、从节点；复用已有 Ray 时无法改变其已继承的环境。端口分别可通过 `RAY_PORT` 和 `RAY_DASHBOARD_PORT` 设置。若检测到本地已有 raylet，直接检查它在目标集群的注册。
 
 prepare 直接向主节点的 GCS 查询 ALIVE 节点和各节点注册的 NPU 总数。即使 Dashboard 无法启动，也能完成检查。主节点核对清单中的每个 IP 恰好注册一次、每节点恰好 16 张 NPU。从节点只等待自身 IP 注册 16 张。默认每 5 秒轮询，单个等待阶段最多 900 秒，可设置 `RAY_CLUSTER_POLL_INTERVAL` 和 `RAY_CLUSTER_WAIT_TIMEOUT`。成功后主节点日志有 `[huanyu-env] RAY_READY mode=all`，从节点有 `mode=local`。此时可在主节点运行训练，激活环境已包含本次集群的 `RAY_ADDRESS`。检查超时会返回非零，已启动的 Ray 保留供排查。
 
@@ -354,11 +354,11 @@ source "$PROJECT_ROOT/examples/qwen3_6_huanyu/prepare_huanyu_env.sh"
 
 默认环境文件是本目录的 `env_export_huanyu.sh`。如站点文件叫 `source_env_export.sh`，在准备前 `export HUANYU_ENV_FILE=/绝对路径/source_env_export.sh`。项目/模型/数据路径、显式的输出目录与缓存路径会在source后恢复。不要用一个会主动启动Ray或训练的文件作为环境文件。
 
-`source` 会将成功准备的环境应用到当前终端，保留原有shell选项。若用 `bash prepare_huanyu_env.sh`，准备完成后须执行它打印的 `source .../activate.sh`；子进程不能直接修改父终端环境。准备子进程失败不会生成可用的新激活文件，也不会应用子进程的部分环境到父终端；开头已完成的代理/PATH设置、`.bashrc`追加及复制/安装不会因此撤销。激活文件保留受管理的运行配置及其他环境变化，包含代理unset和命令缓存刷新，并用私有权限保存。
+`source` 会将成功准备的环境应用到当前终端，保留原有shell选项。若用 `bash prepare_huanyu_env.sh`，准备完成后须执行它打印的 `source .../activate.sh`；子进程不能直接修改父终端环境。准备子进程失败不会生成可用的新激活文件，也不会应用子进程的部分环境到父终端；已完成的复制/安装不会因此撤销。激活文件保留受管理的运行配置及其他环境变化，并用私有权限保存，不再额外清除代理或执行 `hash -r`。
 
 每个节点的准备日志 `prepare.log` 和激活文件 `activate.sh` 位于 `$PROJECT_ROOT/runs/environment/prepare_<时间>_<随机串>/`。可通过 `HUANYU_PREPARE_LOG_ROOT` 指定根目录。已有 raylet 时跳过 editable 安装，继续检查源码及环境。重用的进程保留启动时继承的环境。
 
-统一 prepare 入口只向 `~/.bashrc` 追加一次上述四条代理/Python命令，保留原有内容，不生成源码路径 hook。检查通过后会停用旧版脚本自动生成的 `~/.huanyu-vllm-source.sh`，保留为同目录的 `.disabled.*` 备份；用户自行维护的该hook文件或符号链接不改动。原 `.bashrc` 的条件加载行保留，目标不存在时不执行。旧的 `activate.sh` 仍保存旧环境，请重新 prepare 后使用新生成的激活文件。
+统一 prepare 入口不再写入 `~/.bashrc`，也不生成源码路径 hook。若此前运行过写入代理/Python配置的版本，请自行删除 `.bashrc` 中 `# >>> huanyu prepare proxy/python >>>` 至 `# <<< huanyu prepare proxy/python <<<` 的旧块，否则新终端仍会执行它。检查通过后会停用旧版脚本自动生成的 `~/.huanyu-vllm-source.sh`，保留为同目录的 `.disabled.*` 备份；用户自行维护的该hook文件或符号链接不改动。原 `.bashrc` 的条件加载行保留，目标不存在时不执行。旧的 `activate.sh` 仍保存旧环境，请重新 prepare 后使用新生成的激活文件。
 
 已完成准备的节点可单独停用上述旧 hook，并检查新进程的实际导入位置，期望为 `/vllm-workspace/vllm-omni/vllm_omni/__init__.py`（解析符号链接后）：
 

@@ -8,30 +8,9 @@
 # Activation exports the shared Ray worker startup policy (32/1/0) for manual starts.
 # Run the job's setup in an isolated shell so env_export's set -ex cannot alter the caller's shell.
 # source applies the resulting environment; bash prints an activation command.
-# Persists the proxy/Python prelude to .bashrc; no vLLM-Omni PYTHONPATH hook.
+# Inherit the caller's proxy/Python settings; do not write a .bashrc prelude.
 # Preparation retires the old generated source hook and checks the installed package.
 huanyu_prepare_environment() {
-    # Run before the first Python command, including the environment snapshot.
-    unset HTTP_PROXY HTTPS_PROXY || return $?
-    export PATH="/usr/local/python3.12.13/bin:$PATH" || return $?
-    hash -r
-    command -v python3 || return $?
-
-    # Keep existing shell customizations and append this block only once.
-    # Quoted heredoc preserves $PATH for expansion in each new shell.
-    local bashrc="${HOME:?}/.bashrc"
-    if [[ ! -f "$bashrc" ]] || ! grep -Fqx '# >>> huanyu prepare proxy/python >>>' "$bashrc"; then
-        cat >> "$bashrc" <<'HUANYU_SHELL_ENV' || return $?
-
-# >>> huanyu prepare proxy/python >>>
-unset HTTP_PROXY HTTPS_PROXY
-export PATH="/usr/local/python3.12.13/bin:$PATH"
-hash -r
-command -v python3
-# <<< huanyu prepare proxy/python <<<
-HUANYU_SHELL_ENV
-    fi
-
     local mode="${HUANYU_JOB_MODE:-frozen_cache}" setup_entry=run_huanyu_32card_job.sh
     local start_ray=0 arg
     local -a setup_args=()

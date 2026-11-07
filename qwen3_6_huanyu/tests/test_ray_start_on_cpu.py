@@ -54,10 +54,12 @@ class HuanyuRayStartTests(unittest.TestCase):
             "RAY_worker_maximum_startup_concurrency": "99",
             "RAY_prestart_worker_first_driver": "0", "RAY_enable_worker_prestart": "1",
             "RAY_ADDRESS": "stale-head:1234", "HUANYU_TEST_FAIL_WAIT": "wait-cluster",
+            "HCCL_LOGIC_SUPERPOD_ID": "scheduler-superpod",
         })
         self.fixture.assert_success(result)
         ray = self.fixture.events("ray")
         self.assertEqual(len(ray), 1)
+        self.assertIsNone(ray[0]["hccl_logic_superpod_id"])
         self.assertEqual(ray[0]["args"], [
             "start", "--head", "--port=6925", "--dashboard-host=0.0.0.0",
             "--dashboard-port=8960", '--resources={"NPU": 16}',
@@ -72,8 +74,9 @@ class HuanyuRayStartTests(unittest.TestCase):
         self.assertIn("export RAY_ADDRESS=192.0.2.10:6925", result.stdout)
 
     def test_worker_waits_for_head_then_starts_and_returns(self):
-        result = self.run_start({"VC_TASK_INDEX": "1"})
+        result = self.run_start({"VC_TASK_INDEX": "1", "HCCL_LOGIC_SUPERPOD_ID": "scheduler-superpod"})
         self.fixture.assert_success(result)
+        self.assertIsNone(self.fixture.events("ray")[0]["hccl_logic_superpod_id"])
         self.assertEqual(self.fixture.events("ray")[0]["args"], [
             "start", "--address=192.0.2.10:6925", '--resources={"NPU": 16}',
         ])
