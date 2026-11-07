@@ -18,6 +18,7 @@ import sys
 
 
 _ACTIVE = ContextVar("huanyu_gen_timing_engine", default=None)
+_CALL_COUNTS = ContextVar("huanyu_gen_timing_engine_counts", default=None)
 _NOTICES = set()
 _MARKER = "_huanyu_gen_timing_engine"
 _ITERATION_ATTR = "_huanyu_gen_timing_iteration"
@@ -108,8 +109,11 @@ def _bind_nested(cls, name, phase, *, outside_execute=False):
             context = getattr(self, _LAST_ATTR, None)
         if context is None:
             return original(self, *args, **kwargs)
+        counts = _module()._CALL_COUNTS.get()
+        if counts is not None:
+            counts[phase] = counts.get(phase, 0) + 1
         _notice("engine_hook_executed", target=target, phase=phase, clock="host_wall")
-        with _core().span(phase, **context, measurement="host_call"):
+        with _core().span(phase, **context, measurement="host_call", target=target):
             return original(self, *args, **kwargs)
 
     setattr(measured, _MARKER, True)
@@ -123,9 +127,11 @@ def _bind_model(runner):
     if model is None:
         _notice("engine_hook_unavailable", target=type(runner).__name__ + ".model", phase="engine.forward")
         return
-    # The actual top-level callable is measured, rather than every transformer
-    # layer. Sampling remains controlled by execute_model's context.
-    _bind_nested(type(model), "forward", "engine.forward")
+    # Current NPUARModelRunner dispatches via _model_forward (also covering
+    # compiled/captured calls). Class-level model.forward hooks can be bypassed.
+    # Retain a fallback for older runners which call model.forward directly.
+    if not callable(getattr(runner, "_model_forward", None)):
+        _bind_nested(type(model), "forward", "engine.forward")
     _bind_nested(type(model), "compute_logits", "engine.compute_logits")
 
 
@@ -149,8 +155,12 @@ def bind_runner_class(cls):
         return False
 
     for method, phase in (
+        ("_model_forward", "engine.forward"),
+        ("_update_states", "engine.update_states"),
+        ("_prepare_inputs", "engine.prepare_inputs"),
         ("_preprocess", "engine.preprocess"),
         ("_execute_mm_encoder", "engine.mm_encoder"),
+        ("_gather_mm_embeddings", "engine.gather_mm_embeddings"),
     ):
         _bind_nested(cls, method, phase)
     _bind_nested(cls, "sample_tokens", "engine.sample_tokens", outside_execute=True)
@@ -175,15 +185,23 @@ def bind_runner_class(cls):
         _bind_model(self)
         setattr(self, _LAST_ATTR, context)
         token = _module()._ACTIVE.set(context)
+        counts = {}
+        count_token = _module()._CALL_COUNTS.set(counts)
         _notice("engine_hook_executed", target=target, phase="engine.execute_model", clock="host_wall")
         try:
-            with _core().span("engine.execute_model", **context, measurement="host_call"):
-                return original(self, *args, **kwargs)
+            with _core().span("engine.execute_model", **context, measurement="host_call") as record:
+                try:
+                    return original(self, *args, **kwargs)
+                finally:
+                    # Compare with received child spans to detect truncated or
+                    # Ray-deduplicated logs before reporting exclusive fractions.
+                    record["nested_span_counts"] = dict(counts)
         except BaseException:
             # A failed execute must not label a later sampler as its success.
             setattr(self, _LAST_ATTR, None)
             raise
         finally:
+            _module()._CALL_COUNTS.reset(count_token)
             _module()._ACTIVE.reset(token)
 
     setattr(measured, _MARKER, True)

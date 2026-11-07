@@ -503,6 +503,7 @@ wait_for_cluster() {
 if (( _MANAGE_RAY )); then
     # Apply after site setup, matching the standalone Ray launcher on every node.
     unset HCCL_LOGIC_SUPERPOD_ID
+    "$_PYTHON" -B "$_HELPER" clear-superpod-bashrc "${HOME:?HOME must be set}/.bashrc"
     echo "[huanyu-job] Ray rank=$_RANK address=$RAY_ADDRESS local_ip=$_NODE_IP"
     if (( _RANK == 0 )); then
         if (( ! _LIVE_RAY )); then

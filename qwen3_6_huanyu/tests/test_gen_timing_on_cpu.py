@@ -92,6 +92,7 @@ class TimingTests(unittest.TestCase):
         child, parent = records(output)
         self.assertEqual(child["elapsed_s"], 2.0)
         self.assertEqual(parent["elapsed_s"], 5.0)
+        self.assertEqual((child["start_monotonic_s"], child["end_monotonic_s"]), (101.0, 103.0))
         self.assertEqual(child["uid"], "a")
         self.assertEqual(child["parent_span_id"], parent["span_id"])
         self.assertIsNone(parent["parent_span_id"])
@@ -380,12 +381,113 @@ class EngineTimingTests(unittest.TestCase):
             selected = [item for item in spans if item["phase"] == phase]
             self.assertEqual([item["engine_iteration"] for item in selected], [1, 3], phase)
         roots = {item["span_id"]: item for item in spans if item["phase"] == "engine.execute_model"}
+        for root in roots.values():
+            self.assertEqual(root["nested_span_counts"], {
+                "engine.preprocess": 1, "engine.mm_encoder": 1,
+                "engine.forward": 1, "engine.compute_logits": 1,
+            })
         for item in spans:
             self.assertEqual(item["clock"], "host_wall")
             self.assertNotIn("step", item)
             if item["phase"] == "engine.forward":
                 self.assertIn(item["parent_span_id"], roots)
         self.assertIsNone(engine._ACTIVE.get())
+
+    def test_actual_runner_forward_boundary_covers_bypassed_model_forward_and_logits_retry(self):
+        result = object()
+
+        class Model:
+            def forward(self, *args):
+                raise AssertionError("compiled dispatch bypasses this method")
+
+            def compute_logits(self, value):
+                return value
+
+        class Runner:
+            def __init__(self):
+                self.model = Model()
+
+            def _update_states(self, scheduler_output):
+                return None
+
+            def _prepare_inputs(self, scheduler_output):
+                return None
+
+            def _execute_mm_encoder(self, scheduler_output):
+                return None
+
+            def _gather_mm_embeddings(self, scheduler_output):
+                return None
+
+            def _preprocess(self, scheduler_output):
+                self._execute_mm_encoder(scheduler_output)
+                self._gather_mm_embeddings(scheduler_output)
+
+            def _model_forward(self):
+                return result
+
+            def execute_model(self, scheduler_output):
+                self._update_states(scheduler_output)
+                self._prepare_inputs(scheduler_output)
+                self._preprocess(scheduler_output)
+                value = self._model_forward()
+                try:
+                    return self.model.compute_logits(value, sampling_metadata=None)
+                except TypeError:
+                    return self.model.compute_logits(value)
+
+        with redirect_stdout(io.StringIO()) as output:
+            engine.bind_runner_class(Runner)
+            self.assertIs(Runner().execute_model(self.scheduler), result)
+        spans = [r for r in records(output) if r["event"] == "span"]
+        forward, = [r for r in spans if r["phase"] == "engine.forward"]
+        self.assertTrue(forward["target"].endswith("Runner._model_forward"))
+        logits = [r for r in spans if r["phase"] == "engine.compute_logits"]
+        self.assertEqual([(r["status"], r["error_type"]) for r in logits],
+                         [("error", "TypeError"), ("ok", None)])
+        root, = [r for r in spans if r["phase"] == "engine.execute_model"]
+        self.assertEqual(root["status"], "ok")
+        self.assertEqual(root["nested_span_counts"]["engine.compute_logits"], 2)
+        self.assertEqual(sum(root["nested_span_counts"].values()), len(spans) - 1)
+        self.assertIsNone(engine._CALL_COUNTS.get())
+
+    def test_runner_forward_exception_keeps_identity_and_child_count_evidence(self):
+        failure = ValueError("original forward error")
+
+        class Runner:
+            model = None
+
+            def _model_forward(self):
+                raise failure
+
+            def execute_model(self, scheduler_output):
+                return self._model_forward()
+
+        with redirect_stdout(io.StringIO()) as output:
+            engine.bind_runner_class(Runner)
+            with self.assertRaises(ValueError) as raised:
+                Runner().execute_model(self.scheduler)
+        self.assertIs(raised.exception, failure)
+        spans = [r for r in records(output) if r["event"] == "span"]
+        self.assertEqual(spans[-1]["nested_span_counts"], {"engine.forward": 1})
+        self.assertEqual(spans[0]["status"], "error")
+        self.assertIsNone(engine._CALL_COUNTS.get())
+
+    def test_engine_wrapper_cloudpickle_does_not_capture_counter_contextvar(self):
+        try:
+            import cloudpickle
+        except ImportError:
+            self.skipTest("cloudpickle not installed")
+        cls, expected = make_runner()
+        with redirect_stdout(io.StringIO()) as output:
+            engine.bind_runner_class(cls)
+            restored = cloudpickle.loads(cloudpickle.dumps(cls.execute_model))
+            runner = cls()
+            restored(runner, self.scheduler)
+        roots = [r for r in records(output) if r.get("phase") == "engine.execute_model" and r["event"] == "span"]
+        self.assertEqual(len(roots), 1)
+        self.assertEqual(roots[0]["nested_span_counts"]["engine.forward"], 1)
+        self.assertIsNone(engine._CALL_COUNTS.get())
 
     def test_disabled_engine_does_not_import_backend_or_add_iteration_state(self):
         cls, result = make_runner()

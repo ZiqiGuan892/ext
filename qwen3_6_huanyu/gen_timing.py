@@ -61,14 +61,16 @@ def span(phase, **fields):
     started = time.perf_counter()
     error_type = None
     try:
-        yield
+        yield context
     except BaseException as exc:
         error_type = type(exc).__name__
         raise
     finally:
-        elapsed = time.perf_counter() - started
+        ended = time.perf_counter()
+        elapsed = ended - started
         state._context.reset(token)
         record = {**context, "start_unix_ns": started_ns, "end_unix_ns": time.time_ns(),
+                  "start_monotonic_s": started, "end_monotonic_s": ended,
                   "elapsed_s": elapsed, "clock": "host_wall", "inclusive": True,
                   "status": "error" if error_type else "ok", "error_type": error_type}
         record.pop("event", None)
@@ -244,7 +246,24 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Summarize inclusive wall spans; never sum phases as gen time.")
     parser.add_argument("log")
     parser.add_argument("--step", type=int)
+    parser.add_argument("--engine-breakdown", action="store_true",
+                        help="Pair engine spans per process/iteration and subtract nested calls.")
+    parser.add_argument("--model", help="Filter engine model paths by substring.")
+    parser.add_argument("--host", help="Filter engine records by host.")
+    parser.add_argument("--pid", type=int, help="Filter engine records by process ID.")
     args = parser.parse_args()
+    if args.engine_breakdown:
+        if args.step is not None:
+            parser.error("Engine iterations have no reliable training step; use --model/--host/--pid.")
+        if __package__:
+            from .gen_timing_report import engine_breakdown, print_engine_breakdown
+        else:
+            from gen_timing_report import engine_breakdown, print_engine_breakdown
+        with open(args.log, encoding="utf-8", errors="replace") as stream:
+            print_engine_breakdown(engine_breakdown(stream, model=args.model, host=args.host, pid=args.pid))
+        raise SystemExit(0)
+    if args.model or args.host or args.pid is not None:
+        parser.error("--model/--host/--pid require --engine-breakdown")
     with open(args.log, encoding="utf-8", errors="replace") as stream:
         groups = summarize(stream, args.step)
     print("phase\tclock\tstatus\tcalls\tmean_s\tmax_s\twork_s (overlapping, not gen wall time)")

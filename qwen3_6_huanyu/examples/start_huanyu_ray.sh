@@ -110,6 +110,7 @@ export PYTHONUNBUFFERED=1
 
 # Ray workers must not inherit the scheduler's logical superpod ID.
 unset HCCL_LOGIC_SUPERPOD_ID
+python3 -B "$_HELPER" clear-superpod-bashrc "${HOME:?HOME must be set}/.bashrc"
 echo "[huanyu-ray] rank=$_RANK nodes=$_NODES NPU_per_node=16 address=$RAY_ADDRESS check=$_CHECK startup=32/1/0"
 _LIVE_RAY=0
 if pgrep -x raylet >/dev/null; then _LIVE_RAY=1; fi

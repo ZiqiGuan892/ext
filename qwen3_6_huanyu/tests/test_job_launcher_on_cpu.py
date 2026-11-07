@@ -57,6 +57,8 @@ def record(kind, args, **extra):
     item = dict(kind=kind, args=args, preload=os.environ.get("LD_PRELOAD"),
                 precision={key: os.environ.get(key) for key in precision_names}, **extra)
     item["hccl_logic_superpod_id"] = os.environ.get("HCCL_LOGIC_SUPERPOD_ID")
+    bashrc = Path(os.environ["HUANYU_TEST_BASHRC"])
+    item["bashrc"] = bashrc.read_text(encoding="utf-8") if bashrc.exists() else None
     item["launcher_env"] = {key: os.environ[key] for key in (
         "LOCAL_RANK", "RANK", "WORLD_SIZE", "LOCAL_WORLD_SIZE", "GROUP_RANK",
         "GROUP_WORLD_SIZE", "ROLE_RANK", "ROLE_WORLD_SIZE", "TORCHELASTIC_RUN_ID",
@@ -82,6 +84,9 @@ class HuanyuJobLauncherTests(unittest.TestCase):
         )
         self.addCleanup(temporary.cleanup)
         self.project = Path(temporary.name)
+        self.home = self.project / "test user"
+        self.home.mkdir()
+        self.bashrc = self.home / ".bashrc"
         self.examples = self.project / "examples/qwen3_6_huanyu"
         self.examples.mkdir(parents=True)
         self.entry = self.examples / LAUNCHER.name
@@ -107,11 +112,16 @@ class HuanyuJobLauncherTests(unittest.TestCase):
             'python3 "$HUANYU_TEST_COMMAND_STUB" env-source\n'
             'export HUANYU_TEST_ENV_SOURCED=1\n', encoding="utf-8",
         )
+        real_bootstrap = self.project / "real_job_bootstrap.py"
+        shutil.copyfile(EXAMPLES / "job_bootstrap.py", real_bootstrap)
         (self.examples / "job_bootstrap.py").write_text(
             RECORDER + """
 operation = sys.argv[1]
 record("helper", sys.argv[1:])
-if operation == "resolve":
+if operation == "clear-superpod-bashrc":
+    import runpy
+    runpy.run_path(os.environ["HUANYU_TEST_REAL_BOOTSTRAP"], run_name="__main__")
+elif operation == "resolve":
     count = int(sys.argv[sys.argv.index("--expected-nodes") + 1]) if "--expected-nodes" in sys.argv else 2
     print(",".join("192.0.2.%d" % (10 + i) for i in range(count)))
 elif operation in ("wait-cluster", "wait-head"):
@@ -234,6 +244,7 @@ if command not in ("ray", "git", "pip", "flock", "env-source", "sleep"):
                 self.env.pop(key)
         self.env.update(
             PATH=str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
+            HOME=shell_path(self.home),
             PROJECT_ROOT=shell_path(self.project),
             VC_TASK_INDEX="0",
             VC_WORKER_NUM="2",
@@ -243,6 +254,8 @@ if command not in ("ray", "git", "pip", "flock", "env-source", "sleep"):
             HUANYU_TEST_TRAIN_CAPTURE=str(train_capture),
             HUANYU_TEST_CAPTURE=str(self.capture_file),
             HUANYU_TEST_EVENTS=str(self.events_file),
+            HUANYU_TEST_BASHRC=str(self.bashrc),
+            HUANYU_TEST_REAL_BOOTSTRAP=str(real_bootstrap),
             HUANYU_EMBED_CACHE_DIR=shell_path(self.cache),
             HUANYU_JEMALLOC_LIBRARY=shell_path(self.jemalloc),
             HUANYU_VLLM_SOURCE=shell_path(self.project / "fake vllm source"),
@@ -329,6 +342,29 @@ if command not in ("ray", "git", "pip", "flock", "env-source", "sleep"):
 
     def assert_success(self, result):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def seed_superpod_bashrc(self):
+        before = b'export USER_SETTING="keep me"\n'
+        after = (
+            b'# HCCL_LOGIC_SUPERPOD_ID is documented here\n'
+            b'alias huanyu_status="echo ready"\n'
+        )
+        self.original_bashrc = before + b'export HCCL_LOGIC_SUPERPOD_ID=0\n' + after
+        self.cleaned_bashrc = before + b':\n' + after
+        self.bashrc.write_bytes(self.original_bashrc)
+
+    def assert_superpod_bashrc_cleaned(self):
+        self.assertEqual(self.bashrc.read_bytes(), self.cleaned_bashrc)
+        backups = list(self.home.glob(".bashrc.huanyu-superpod-backup-*"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_bytes(), self.original_bashrc)
+        # Capture the persistent file at command execution, proving cleanup
+        # precedes both new Ray startup and readiness checks for reused Ray.
+        commands = self.events("ray") + [
+            event for event in self.events("helper") if event["args"][0] == "wait-cluster"
+        ]
+        for event in commands:
+            self.assertEqual(event["bashrc"], self.cleaned_bashrc.decode("utf-8"), event)
 
     def assert_worker_supervised_until_exit(self, result):
         # The fixture's raylet disappears after one sleep; a node job must
@@ -473,9 +509,11 @@ if command not in ("ray", "git", "pip", "flock", "env-source", "sleep"):
         self.assertFalse(self.events_file.exists())
 
     def test_head_starts_ray_then_waits_before_starting_training_once(self):
+        self.seed_superpod_bashrc()
         self.env["HUANYU_JOB_PREFLIGHT"] = "1"
         result = self.run_launcher()
         self.assert_success(result)
+        self.assert_superpod_bashrc_cleaned()
         self.assertIn("native import check exited successfully", result.stdout)
         ray = self.events("ray")
         self.assertEqual(len(ray), 1)
@@ -499,9 +537,11 @@ if command not in ("ray", "git", "pip", "flock", "env-source", "sleep"):
                 self.assert_precision_defaults(event)
 
     def test_worker_uses_manual_start_command_and_keeps_job_alive(self):
+        self.seed_superpod_bashrc()
         self.env["HUANYU_JOB_PREFLIGHT"] = "1"
         result = self.run_launcher({"VC_TASK_INDEX": "1"})
         self.assert_worker_supervised_until_exit(result)
+        self.assert_superpod_bashrc_cleaned()
         ray = self.events("ray")
         self.assertEqual(len(ray), 1)
         self.assertIn("--address=192.0.2.10:6925", ray[0]["args"])
@@ -902,9 +942,11 @@ if command not in ("ray", "git", "pip", "flock", "env-source", "sleep"):
             self.assertEqual(capture["env"][key], expected)
 
     def test_existing_ray_uses_source_without_copy_reinstall_or_restart(self):
+        self.seed_superpod_bashrc()
         self.env["HUANYU_JOB_PREFLIGHT"] = "1"
         result = self.run_launcher({"HUANYU_TEST_RAY_LIVE": "1"})
         self.assert_success(result)
+        self.assert_superpod_bashrc_cleaned()
         self.assertFalse(any(event["args"][0] == "sync" for event in self.events("helper")))
         self.assertIn("existing workers keep their loaded code", result.stdout)
         self.assertFalse(self.events("pip"))
@@ -914,6 +956,8 @@ if command not in ("ray", "git", "pip", "flock", "env-source", "sleep"):
         self.assertTrue(any(
             event["args"][0] == "wait-cluster" for event in self.events("helper")
         ))
+        self.assert_success(self.run_launcher({"HUANYU_TEST_RAY_LIVE": "1"}))
+        self.assert_superpod_bashrc_cleaned()
 
     def test_selected_source_survives_old_site_environment(self):
         with (self.examples / "env_export_huanyu.sh").open("a", encoding="utf-8") as stream:

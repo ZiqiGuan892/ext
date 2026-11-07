@@ -338,7 +338,7 @@ export VC_TASK_INDEX=0   # 主节点填 0，从节点填 1
 source "$PROJECT_ROOT/examples/qwen3_6_huanyu/prepare_huanyu_env.sh" --start-ray
 ```
 
-以默认端口为例，主节点执行 `ray start --head --port=6925 --dashboard-host=0.0.0.0 --dashboard-port=8960 --resources='{"NPU": 16}'`。从节点等主节点端口可连接后执行 `ray start --address="${VC_WORKER_HOSTS%%,*}:6925" --resources='{"NPU": 16}'`（脚本会先把主机名解析为 IPv4）。`start_huanyu_ray.sh` 与共用的 job / prepare 启动流程均在启动 Ray 前执行 `unset HCCL_LOGIC_SUPERPOD_ID`，覆盖主、从节点；复用已有 Ray 时无法改变其已继承的环境。端口分别可通过 `RAY_PORT` 和 `RAY_DASHBOARD_PORT` 设置。若检测到本地已有 raylet，直接检查它在目标集群的注册。
+以默认端口为例，主节点执行 `ray start --head --port=6925 --dashboard-host=0.0.0.0 --dashboard-port=8960 --resources='{"NPU": 16}'`。从节点等主节点端口可连接后执行 `ray start --address="${VC_WORKER_HOSTS%%,*}:6925" --resources='{"NPU": 16}'`（脚本会先把主机名解析为 IPv4）。`start_huanyu_ray.sh` 与共用的 job / prepare 启动流程均在启动 Ray 前执行 `unset HCCL_LOGIC_SUPERPOD_ID`，并清理当前用户 `~/.bashrc` 中该变量的持久设置，覆盖主、从节点。修改前保留 `.bashrc.huanyu-superpod-backup-*` 备份；其他变量和命令保留，重复执行不会重复备份，无该文件则不创建。独立赋值会替换为无操作命令 `:`，以保留条件分支语法；混合 export 只移除该变量。遇到无法安全改写的复杂设置会报出行号并停止，原文件不改动。脚本须与同版本 `job_bootstrap.py` 一起部署。复用已有 Ray 时仍清理 `.bashrc`，但无法改变现有进程已继承的环境。端口分别可通过 `RAY_PORT` 和 `RAY_DASHBOARD_PORT` 设置。若检测到本地已有 raylet，直接检查它在目标集群的注册。
 
 prepare 直接向主节点的 GCS 查询 ALIVE 节点和各节点注册的 NPU 总数。即使 Dashboard 无法启动，也能完成检查。主节点核对清单中的每个 IP 恰好注册一次、每节点恰好 16 张 NPU。从节点只等待自身 IP 注册 16 张。默认每 5 秒轮询，单个等待阶段最多 900 秒，可设置 `RAY_CLUSTER_POLL_INTERVAL` 和 `RAY_CLUSTER_WAIT_TIMEOUT`。成功后主节点日志有 `[huanyu-env] RAY_READY mode=all`，从节点有 `mode=local`。此时可在主节点运行训练，激活环境已包含本次集群的 `RAY_ADDRESS`。检查超时会返回非零，已启动的 Ray 保留供排查。
 
@@ -358,7 +358,7 @@ source "$PROJECT_ROOT/examples/qwen3_6_huanyu/prepare_huanyu_env.sh"
 
 每个节点的准备日志 `prepare.log` 和激活文件 `activate.sh` 位于 `$PROJECT_ROOT/runs/environment/prepare_<时间>_<随机串>/`。可通过 `HUANYU_PREPARE_LOG_ROOT` 指定根目录。已有 raylet 时跳过 editable 安装，继续检查源码及环境。重用的进程保留启动时继承的环境。
 
-统一 prepare 入口不再写入 `~/.bashrc`，也不生成源码路径 hook。若此前运行过写入代理/Python配置的版本，请自行删除 `.bashrc` 中 `# >>> huanyu prepare proxy/python >>>` 至 `# <<< huanyu prepare proxy/python <<<` 的旧块，否则新终端仍会执行它。检查通过后会停用旧版脚本自动生成的 `~/.huanyu-vllm-source.sh`，保留为同目录的 `.disabled.*` 备份；用户自行维护的该hook文件或符号链接不改动。原 `.bashrc` 的条件加载行保留，目标不存在时不执行。旧的 `activate.sh` 仍保存旧环境，请重新 prepare 后使用新生成的激活文件。
+统一 prepare 入口不再向 `~/.bashrc` 写入代理或 Python 配置，也不生成源码路径 hook；仅在 `--start-ray` 时执行上述 superpod 设置清理。若此前运行过写入代理/Python配置的版本，请自行删除 `.bashrc` 中 `# >>> huanyu prepare proxy/python >>>` 至 `# <<< huanyu prepare proxy/python <<<` 的旧块，否则新终端仍会执行它。检查通过后会停用旧版脚本自动生成的 `~/.huanyu-vllm-source.sh`，保留为同目录的 `.disabled.*` 备份；用户自行维护的该hook文件或符号链接不改动。原 `.bashrc` 的条件加载行保留，目标不存在时不执行。旧的 `activate.sh` 仍保存旧环境，请重新 prepare 后使用新生成的激活文件。
 
 已完成准备的节点可单独停用上述旧 hook，并检查新进程的实际导入位置，期望为 `/vllm-workspace/vllm-omni/vllm_omni/__init__.py`（解析符号链接后）：
 

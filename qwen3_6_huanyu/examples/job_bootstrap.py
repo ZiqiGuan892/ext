@@ -10,6 +10,7 @@ import hashlib
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import socket
 import tempfile
@@ -21,6 +22,138 @@ REQUIRED_FILES = (
     "vllm_omni/model_executor/models/minicpmo_5_0/huanyu_audio.py",
     "vllm_omni/model_executor/models/minicpmo_5_0/minicpmo_5_0_omni_llm.py",
 )
+
+
+_SUPERPOD = "HCCL_LOGIC_SUPERPOD_ID"
+_BASHRC_TOKEN = re.compile(
+    r"(?P<space>[ \t\r]+)|(?P<comment>\#[^\n]*)|(?P<separator>\n|&&|\|\||;)"
+    r"|(?P<operator><<-?|[&|()<>])"
+    r'''|(?P<word>(?:[^\s;&|()<>'"\\]+|'[^']*'|"(?:\\[\s\S]|[^"\\])*"|\\[\s\S])+)'''
+)
+
+
+def _bashrc_commands(text):
+    """Locate simple commands without interpreting expansions or heredoc data."""
+    position, command, heredocs = 0, [], []
+    delimiter = None
+    while position < len(text):
+        token = _BASHRC_TOKEN.match(text, position)
+        if token is None:
+            raise ValueError("Cannot safely scan .bashrc quoting; edit HCCL_LOGIC_SUPERPOD_ID manually")
+        raw, kind = token.group(), token.lastgroup
+        position = token.end()
+        if kind == "separator":
+            yield command
+            command = []
+            if raw == "\n":
+                for marker, strip_tabs in heredocs:
+                    while position < len(text):
+                        end = text.find("\n", position)
+                        end = len(text) if end == -1 else end + 1
+                        line = text[position:end].rstrip("\r\n")
+                        position = end
+                        if (line.lstrip("\t") if strip_tabs else line) == marker:
+                            break
+                    else:
+                        raise ValueError("Unterminated .bashrc heredoc; edit HCCL_LOGIC_SUPERPOD_ID manually")
+                heredocs = []
+        elif kind not in ("space", "comment"):
+            command.append((raw, token.start(), token.end()))
+            if delimiter is not None:
+                if kind != "word":
+                    raise ValueError("Unsupported .bashrc heredoc delimiter; edit HCCL_LOGIC_SUPERPOD_ID manually")
+                heredocs.append((shlex.split(raw)[0], delimiter == "<<-"))
+                delimiter = None
+            elif raw in ("<<", "<<-"):
+                delimiter = raw
+    yield command
+
+
+def _without_superpod(text):
+    edits = []
+    for words in _bashrc_commands(text):
+        # Keep conditional bodies syntactically valid by replacing an otherwise
+        # empty setting command with ':', including `then export ...; fi`.
+        while words and words[0][0] in ("if", "then", "elif", "else", "do", "while", "until", "!", "{"):
+            words = words[1:]
+        if not words:
+            continue
+        exporting = words[0][0] == "export"
+        selected = []
+        for word in words:
+            plain = word[0].replace("\\\r\n", "").replace("\\\n", "")
+            if exporting:
+                plain = (shlex.split(plain) or [""])[0]
+            if plain.startswith(_SUPERPOD + "=") or (exporting and plain == _SUPERPOD):
+                selected.append(word)
+        if not selected:
+            continue
+        raw_command = text[words[0][1]:words[-1][2]]
+        values = words[1:] if exporting else words
+        if exporting and values and values[0][0] == "--":
+            values = values[1:]
+        valid = all(re.match(r"^[A-Za-z_][A-Za-z_0-9]*(?:=|$)", shlex.split(word[0])[0] if exporting else word[0])
+                    for word in values)
+        if not exporting:
+            valid = valid and all("=" in word[0] for word in values)
+        if not valid or "\n" in raw_command or "$" in raw_command or "`" in raw_command:
+            line = text.count("\n", 0, words[0][1]) + 1
+            raise ValueError(
+                f"Cannot safely remove {_SUPERPOD} at .bashrc line {line}; "
+                "use a standalone literal assignment/export and rerun (file unchanged)"
+            )
+        if len(selected) == len(values):
+            edits.append((words[0][1], words[-1][2], ":"))
+        else:
+            edits.extend((start, end, "") for _, start, end in selected)
+    for start, end, replacement in reversed(edits):
+        text = text[:start] + replacement + text[end:]
+    return text
+
+
+def clear_superpod_bashrc(path):
+    """Remove literal SuperPod assignments, returning the backup path or None.
+
+    Supports simple assignments and exports, including multiple variables and
+    commands separated by ';', '&&', or '||'. Comments, quoted strings, heredoc
+    bodies, bytes, and line endings are preserved. Unsupported target commands
+    (e.g. declare, redirects, expansions, or multiline assignments) fail before
+    any write. This is deliberately not a Bash interpreter: dynamically generated
+    settings (eval, sourced files, or embedded substitutions) need manual removal.
+    The file is never sourced. A unique sibling backup retains the original bytes
+    and mode; replacement is atomic and follows an existing .bashrc symlink.
+    """
+    requested = Path(path).expanduser()
+    if not requested.exists():
+        return None
+    target = requested.resolve(strict=True)
+    original = target.read_bytes()
+    text = original.decode("utf-8", errors="surrogateescape")
+    if _SUPERPOD not in text:
+        return None
+    updated = _without_superpod(text).encode("utf-8", errors="surrogateescape")
+    if updated == original:
+        return None
+    with tempfile.NamedTemporaryFile(
+        prefix=f"{requested.name}.huanyu-superpod-backup-", dir=target.parent, delete=False
+    ) as handle:
+        backup = Path(handle.name)
+        handle.write(original)
+    shutil.copymode(target, backup)
+    staged = None
+    try:
+        with tempfile.NamedTemporaryFile(prefix=f".{target.name}.stage-", dir=target.parent, delete=False) as handle:
+            staged = Path(handle.name)
+            handle.write(updated)
+        shutil.copymode(target, staged)
+        if target.read_bytes() != original:
+            raise RuntimeError(f"{requested} changed during cleanup; not replaced. Backup: {backup}")
+        os.replace(staged, target)
+    finally:
+        if staged is not None and staged.exists():
+            staged.unlink()
+    print(f"[huanyu-job] removed {_SUPERPOD} from {requested}; backup={backup}", flush=True)
+    return backup
 
 
 def check_checkout(root):
@@ -282,6 +415,8 @@ def wait_cluster(address, expected_ips, local_ip, mode, timeout, interval):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
+    clear = sub.add_parser("clear-superpod-bashrc", help="remove persistent HCCL_LOGIC_SUPERPOD_ID assignments")
+    clear.add_argument("path")
     sync = sub.add_parser("sync")
     sync.add_argument("source")
     sync.add_argument("target")
@@ -301,7 +436,9 @@ def main():
             wait.add_argument("--local-ip", required=True)
             wait.add_argument("--mode", choices=("all", "local"), required=True)
     args = parser.parse_args()
-    if args.command == "sync":
+    if args.command == "clear-superpod-bashrc":
+        clear_superpod_bashrc(args.path)
+    elif args.command == "sync":
         sync_checkout(args.source, args.target, args.ray_running)
     elif args.command == "resolve":
         print(",".join(resolve_hosts(args.hosts, args.expected_nodes)))

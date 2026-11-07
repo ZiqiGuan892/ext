@@ -50,6 +50,7 @@ class HuanyuRayStartTests(unittest.TestCase):
         self.fixture.events_file.write_text("", encoding="utf-8")
 
     def test_head_starts_with_policy_and_no_extra_probes(self):
+        self.fixture.seed_superpod_bashrc()
         result = self.run_start({
             "RAY_worker_maximum_startup_concurrency": "99",
             "RAY_prestart_worker_first_driver": "0", "RAY_enable_worker_prestart": "1",
@@ -57,6 +58,7 @@ class HuanyuRayStartTests(unittest.TestCase):
             "HCCL_LOGIC_SUPERPOD_ID": "scheduler-superpod",
         })
         self.fixture.assert_success(result)
+        self.fixture.assert_superpod_bashrc_cleaned()
         ray = self.fixture.events("ray")
         self.assertEqual(len(ray), 1)
         self.assertIsNone(ray[0]["hccl_logic_superpod_id"])
@@ -69,13 +71,16 @@ class HuanyuRayStartTests(unittest.TestCase):
             "RAY_prestart_worker_first_driver": "1", "RAY_enable_worker_prestart": "0",
             "HUANYU_JOB_PREFLIGHT": "0", "HUANYU_RAY_READINESS_CHECK": "0",
         })
-        self.assertEqual([e["args"][0] for e in self.fixture.events("helper")], ["resolve"])
+        self.assertEqual([e["args"][0] for e in self.fixture.events("helper")],
+                         ["resolve", "clear-superpod-bashrc"])
         self.assertIn("not checked", result.stdout)
         self.assertIn("export RAY_ADDRESS=192.0.2.10:6925", result.stdout)
 
     def test_worker_waits_for_head_then_starts_and_returns(self):
+        self.fixture.seed_superpod_bashrc()
         result = self.run_start({"VC_TASK_INDEX": "1", "HCCL_LOGIC_SUPERPOD_ID": "scheduler-superpod"})
         self.fixture.assert_success(result)
+        self.fixture.assert_superpod_bashrc_cleaned()
         self.assertIsNone(self.fixture.events("ray")[0]["hccl_logic_superpod_id"])
         self.assertEqual(self.fixture.events("ray")[0]["args"], [
             "start", "--address=192.0.2.10:6925", '--resources={"NPU": 16}',
@@ -134,11 +139,15 @@ class HuanyuRayStartTests(unittest.TestCase):
                 self.assertEqual("READY:" in result.stdout, checked)
 
     def test_existing_ray_is_reused_and_checked_without_restart(self):
+        self.fixture.seed_superpod_bashrc()
         result = self.run_start({"HUANYU_TEST_RAY_LIVE": "1"}, ("--check",))
         self.fixture.assert_success(result)
+        self.fixture.assert_superpod_bashrc_cleaned()
         self.assertFalse(self.fixture.events("ray"))
         self.assertIn("inherited startup settings are unchanged", result.stdout)
         self.assertIn("READY:", result.stdout)
+        self.fixture.assert_success(self.run_start({"HUANYU_TEST_RAY_LIVE": "1"}, ("--check",)))
+        self.fixture.assert_superpod_bashrc_cleaned()
 
     def test_failed_gcs_check_is_not_reported_as_ready(self):
         result = self.run_start({"HUANYU_TEST_FAIL_WAIT": "wait-cluster"}, ("--check",))

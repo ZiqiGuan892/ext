@@ -28,9 +28,7 @@ class HuanyuPrepareEnvironmentTests(unittest.TestCase):
         self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
         fixture = self.fixture
-        self.user_dir = fixture.project / "test user"
-        self.user_dir.mkdir()
-        fixture.env["HOME"] = job_fixture.shell_path(self.user_dir)
+        self.user_dir = fixture.home
         for name in ("prepare_huanyu_env.sh", "prepared_env.py", "graph_mode.sh"):
             shutil.copyfile(EXAMPLES / name, fixture.examples / name)
         self.entry = fixture.examples / "prepare_huanyu_env.sh"
@@ -228,7 +226,7 @@ exit "$prepare_status"
 
     def test_prepare_preserves_proxies_python_selection_and_bashrc(self):
         rc = self.user_dir / ".bashrc"
-        original = b'export PYTHONPATH="/user/path"'
+        original = b'export PYTHONPATH="/user/path"\nexport HCCL_LOGIC_SUPERPOD_ID=0'
         rc.write_bytes(original)
         settings = {"HTTP_PROXY": "http://invalid:3128", "HTTPS_PROXY": "http://invalid:3128",
                     "PYTHON_BIN": "caller-selected-python"}
@@ -246,6 +244,9 @@ exit "$prepare_status"
         self.assertEqual(rc.read_bytes(), original)
         self.assert_success(self.run_prepare(sourced=False))
         self.assertEqual(rc.read_bytes(), original)
+        self.assertFalse(list(self.user_dir.glob(".bashrc.huanyu-superpod-backup-*")))
+        self.assertFalse(any(event["args"][0] == "clear-superpod-bashrc"
+                             for event in self.fixture.events("helper")))
         self.assertFalse((self.user_dir / ".huanyu-vllm-source.sh").exists())
 
     def test_prepare_retires_only_owned_hook_and_keeps_backup(self):
@@ -358,6 +359,7 @@ exit "$prepare_status"
                 self.assertIsNone(record["path"])
 
     def test_stem_prepare_starts_head_and_checks_all_nodes_before_activation(self):
+        self.fixture.seed_superpod_bashrc()
         self.use_stem_mode()
         self.append_site_env("export HCCL_LOGIC_SUPERPOD_ID=site-superpod\n")
         result = self.run_prepare(
@@ -367,6 +369,7 @@ exit "$prepare_status"
             arguments=("--start-ray",),
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.fixture.assert_superpod_bashrc_cleaned()
         self.assertEqual([e["args"] for e in self.fixture.events("ray")], [
             ["start", "--head", "--port=6925", "--dashboard-host=0.0.0.0",
              "--dashboard-port=8960", '--resources={"NPU": 16}'],
@@ -382,12 +385,14 @@ exit "$prepare_status"
         self.assertFalse(self.fixture.events("train"))
 
     def test_prepare_worker_checks_its_own_registration_and_returns(self):
+        self.fixture.seed_superpod_bashrc()
         self.append_site_env("export HCCL_LOGIC_SUPERPOD_ID=site-superpod\n")
         result = self.run_prepare(
             {"VC_TASK_INDEX": "1", "VC_WORKER_HOSTS": "head,worker", "RAY_PORT": "7001"},
             arguments=("--start-ray",), sourced=False,
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.fixture.assert_superpod_bashrc_cleaned()
         self.assertEqual([e["args"] for e in self.fixture.events("ray")], [
             ["start", "--address=192.0.2.10:7001", '--resources={"NPU": 16}'],
         ])
@@ -401,11 +406,13 @@ exit "$prepare_status"
         self.assertFalse(self.fixture.events("train"))
 
     def test_existing_ray_must_pass_check_before_activation(self):
+        self.fixture.seed_superpod_bashrc()
         result = self.run_prepare(
             {"VC_TASK_INDEX": "1", "VC_WORKER_HOSTS": "head,worker", "HUANYU_TEST_RAY_LIVE": "1",
              "HUANYU_TEST_FAIL_WAIT": "wait-cluster"}, arguments=("--start-ray",),
         )
         self.assertEqual(result.returncode, 19, result.stdout + result.stderr)
+        self.fixture.assert_superpod_bashrc_cleaned()
         self.assertFalse(self.fixture.events("ray"))
         self.assertFalse(self.activation_files())
         self.assertFalse(self.fixture.events("train"))
