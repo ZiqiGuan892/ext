@@ -93,6 +93,8 @@ python3 -u /opt/huawei/dataset/ccb_data/code/hufenyu/verl_omni_qwen36_gzq/verl_o
 
 ### 视频相邻帧配对
 
+视频文件解码由本目录自带的 `video_decode.py` 提供，训练数据集和离线预计算共用同一抽帧实现；部署 Huanyu 不需要安装 `verl_omni_ext.models.minicpmo_5_0` 包。同步代码时必须包含该文件。Parquet 视频条目中的 `fps`、`max_frames`、`max_pixels` 优先于环境变量默认值。
+
 Huanyu 视频不再展开成独立图片。`temporal_patch_size=2` 时，`[A,B,C]` 编码为 `[A,B]`、`[C,C]`，只补最后一个不完整时间组；不同视频不会相互配对。预处理复用 checkpoint 图像处理器的 resize、归一化和空间 patch 顺序，在像素层重排时间槽，不拼接或平均已有 embedding。每段视频内所有帧必须有相同的 resize 后网格，否则明确报错。
 
 训练、离线预计算和 rollout 共用 `video_frontend.py`。每段视频保留一个 `video_grid_thw`，每个时间组对应一个 `<|vision_start|><|video_pad|>…<|vision_end|>` span。`video_rollout.py` 同步更新原生前端、placeholder、M-RoPE 和启动预算，仅作用于 Huanyu；沿用当前简化协议，不新增时间戳。更新在 `engine_hooks.py` 和显式 worker extension 中安装，需重启使用旧代码的训练/serve 进程。

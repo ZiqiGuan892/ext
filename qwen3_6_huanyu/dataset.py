@@ -10,8 +10,8 @@ from verl.utils.dataset.rl_dataset import RLHFDataset
 def _video_helpers():
     # Media decoding is independent of the audio encoder. Keep the exact same
     # frame sampler for message expansion and actual frame extraction.
-    from verl_omni_ext.models.minicpmo_5_0 import minicpmo_5_0_video
-    return minicpmo_5_0_video
+    from . import video_decode
+    return video_decode
 
 
 def video_prompt_parts(item, sampling_rate):

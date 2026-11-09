@@ -1,0 +1,46 @@
+--- a/verl_omni_ext/examples/run_minicpmo_thinker_gspo_npu.sh
++++ b/verl_omni_ext/examples/run_minicpmo_thinker_gspo_npu.sh
+@@ -192,6 +192,12 @@
+ # =============================================================================
+ # [MiniCPM 改动 1/6] 模型路径
+ MODEL_PATH=${MODEL_PATH:-"/opt/huawei/dataset/downloaded_models/MiniCPM-O/MiniCPM-o-5_0_RL"}
++
++# o5 rollout 的外部视觉权重来源。显式导出并传入 Ray runtime_env，
++# 不依赖已启动 raylet 的旧环境或插件的环境变量透传补丁。
++# 用法：Q36_CKPT_DIR=/path/to/vision/checkpoint bash 本脚本 [Hydra 参数...]
++export Q36_CKPT_DIR="${Q36_CKPT_DIR:-/opt/huawei/dataset/downloaded_models/Qwen3.6-35B-A3B-whisper-0814-rl}"
++echo "[o5] Q36_CKPT_DIR=${Q36_CKPT_DIR} (exported; forwarded to Ray runtime_env)"
+
+ # [MiniCPM 改动 2/6] 数据集：**先用纯文本**，不要一上来就用带图的 geo3k。
+ #
+@@ -653,6 +659,7 @@
+ # 要让这些参数可开可关，只能把分支放到命令外面。
+ python3 -m verl_omni.trainer.main_omni \
+     trainer.device=npu \
++    "++ray_kwargs.ray_init.runtime_env.env_vars.Q36_CKPT_DIR=\"${Q36_CKPT_DIR}\"" \
+     \
+     data.train_files="${TRAIN_FILE}" \
+     data.val_files="${VAL_FILE}" \
+--- a/verl_omni_ext/examples/run_minicpmo_thinker_gspo_npu_avqa.sh
++++ b/verl_omni_ext/examples/run_minicpmo_thinker_gspo_npu_avqa.sh
+@@ -192,6 +192,12 @@
+ # =============================================================================
+ # [MiniCPM 改动 1/6] 模型路径
+ MODEL_PATH=${MODEL_PATH:-"/opt/huawei/dataset/downloaded_models/MiniCPM-O/MiniCPM-o-5_0_RL"}
++
++# o5 rollout 的外部视觉权重来源。显式导出并传入 Ray runtime_env，
++# 不依赖已启动 raylet 的旧环境或插件的环境变量透传补丁。
++# 用法：Q36_CKPT_DIR=/path/to/vision/checkpoint bash 本脚本 [Hydra 参数...]
++export Q36_CKPT_DIR="${Q36_CKPT_DIR:-/opt/huawei/dataset/downloaded_models/Qwen3.6-35B-A3B-whisper-0814-rl}"
++echo "[o5] Q36_CKPT_DIR=${Q36_CKPT_DIR} (exported; forwarded to Ray runtime_env)"
+
+ # [MiniCPM 改动 2/6] 数据集：**先用纯文本**，不要一上来就用带图的 geo3k。
+ #
+@@ -653,6 +659,7 @@
+ # 要让这些参数可开可关，只能把分支放到命令外面。
+ python3 -m verl_omni.trainer.main_omni \
+     trainer.device=npu \
++    "++ray_kwargs.ray_init.runtime_env.env_vars.Q36_CKPT_DIR=\"${Q36_CKPT_DIR}\"" \
+     \
+     data.train_files="${TRAIN_FILE}" \
+     data.val_files="${VAL_FILE}" \

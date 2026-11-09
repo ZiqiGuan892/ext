@@ -1,5 +1,26 @@
 # 主仓库及其他插件脚本补丁
 
+## o5 视觉 checkpoint 环境变量
+
+`o5-q36-checkpoint-env.patch` 修改两个 o5 基础启动脚本：
+
+- `verl_omni_ext/examples/run_minicpmo_thinker_gspo_npu.sh`
+- `verl_omni_ext/examples/run_minicpmo_thinker_gspo_npu_avqa.sh`
+
+两者显式导出 `Q36_CKPT_DIR` 并写入 Ray `runtime_env.env_vars`，保留调用者
+传入的值，启动时打印实际路径。GenRM 和 OPD 包装入口调用基础脚本，自动继承。
+这两个脚本不在本分支的源码布局内，仅拉取 profile 不会修改服务器上的脚本。
+在包含上述文件的训练项目根目录执行（替换为下载后的实际补丁路径）：
+
+```bash
+git apply --check /path/to/o5-q36-checkpoint-env.patch
+git apply /path/to/o5-q36-checkpoint-env.patch
+```
+
+若脚本已经包含修改，无需重复应用。启动时使用
+`Q36_CKPT_DIR=/path/to/vision/checkpoint bash <o5启动脚本>`；各 worker 节点
+需要能读取该目录。此补丁保证变量显式传递，不验证 checkpoint 的视觉权重内容。
+
 ## gen 阶段计时（profile 分支）
 
 `qwen3_6_huanyu/` 包含计时模块、引擎接入、启动变量透传及测试。
