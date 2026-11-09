@@ -17,6 +17,7 @@ from .rollout_precision import install_huanyu_rollout_precision
 from .weight_reload import bind_huanyu_weight_reload
 from .precision_policy import report_policy
 from .runtime_imports import report_native_source
+from .video_rollout import install_huanyu_video_rollout
 
 
 class HuanyuColocateWorkerExtension(vLLMOmniColocateWorkerExtension):
@@ -38,6 +39,7 @@ if os.environ.get("HUANYU_SERVE_REPEAT_DETERMINISM") == "1":
 # the spawned worker. The explicit worker factory must install these too,
 # before it constructs the model. Installation errors propagate to startup.
 install_huanyu_processor_compat()
+install_huanyu_video_rollout()
 install_huanyu_rollout_precision()
 install_huanyu_cache_precision()
 from .gen_timing_engine import install_engine as _install_gen_timing_engine

@@ -80,6 +80,33 @@ def mixed_inputs():
     return ids, kwargs
 
 
+def video_inputs():
+    rows = [
+        [9, 10],
+        [5, 6, 6, 7, 2, 4, 4, 3, 20, 5, 8, 7, 21, 5, 8, 7, 22, 5, 8, 8, 7],
+        [23, 5, 8, 7],
+    ]
+    ids = torch.tensor([[0] * (21 - len(row)) + row for row in rows])
+    kwargs = {
+        "huanyu_cache_enabled": [1, 1, 1],
+        "huanyu_cached_audio_embeds": [[], [torch.full((2, 4), 7., dtype=torch.bfloat16)], []],
+        "huanyu_audio_lengths": [[], [16], []],
+        "huanyu_audio_chunk_counts": [0, 1, 0],
+        "huanyu_cached_vision_embeds": [[], [torch.full((2, 4), 9., dtype=torch.bfloat16)], []],
+        "huanyu_cached_image_counts": [0, 1, 0],
+        "image_grid_thw": [[], torch.tensor([[1, 2, 4]]), []],
+        "huanyu_cached_video_embeds": [[], [
+            torch.tensor([[10.] * 4, [11.] * 4], dtype=torch.bfloat16),
+            torch.tensor([[12.] * 4, [13.] * 4], dtype=torch.bfloat16),
+        ], [torch.full((1, 4), 14., dtype=torch.bfloat16)]],
+        "huanyu_cached_video_counts": [0, 2, 1],
+        "video_grid_thw": [[], torch.tensor([[2, 2, 2], [1, 2, 4]]), torch.tensor([[1, 2, 2]])],
+        "position_ids": torch.arange(189).reshape(3, 3, 21),
+        "attention_mask": ids.ne(0).long(),
+    }
+    return ids, kwargs
+
+
 class CachedForwardTests(unittest.TestCase):
     def make_model(self, *, recompute=False, use_precompute=True):
         torch.manual_seed(12)
@@ -90,10 +117,94 @@ class CachedForwardTests(unittest.TestCase):
 
         forward.install_huanyu_forward(
             model, start_token_id=2, end_token_id=3, placeholder_token_id=4,
-            image_token_id=6, spatial_merge_size=2, use_precompute=use_precompute,
+            image_token_id=6, video_token_id=8, spatial_merge_size=2, use_precompute=use_precompute,
             encode_audio=forbidden_encoder,
         )
         return model
+
+    def test_video_temporal_spans_preserve_timestamps_and_mixed_media(self):
+        model = self.make_model()
+        ids, kwargs = video_inputs()
+        expected = torch.nn.functional.embedding(ids, model.embedding.weight).detach().clone()
+        expected[1, 1:3] = 9
+        expected[1, 5:7] = 7
+        expected[1, 10] = 10
+        expected[1, 14] = 11
+        expected[1, 18] = 12
+        expected[1, 19] = 13
+        expected[2, 19] = 14
+        result = model(ids, video_bound=torch.tensor([[0, 1]]), **kwargs)
+        torch.testing.assert_close(result, expected)
+        self.assertIs(model.seen[1]["position_ids"], kwargs["position_ids"])
+        torch.testing.assert_close(model.seen[1]["video_grid_thw"], torch.tensor([[2, 2, 2], [1, 2, 4], [1, 2, 2]]))
+        self.assertNotIn("video_bound", model.seen[1])
+        self.assertFalse(any(key.startswith("huanyu_cached") for key in model.seen[1]))
+
+    def test_video_counts_cannot_move_between_samples(self):
+        model = self.make_model()
+        ids, kwargs = video_inputs()
+        kwargs["huanyu_cached_video_counts"] = [1, 1, 1]
+        with self.assertRaisesRegex(ValueError, "per-sample temporal grids"):
+            model(ids, **kwargs)
+        self.assertEqual(model.forward_calls, 0)
+
+    def test_video_checkpoint_backward_keeps_cache_frozen_and_text_trainable(self):
+        model = self.make_model(recompute=True)
+        ids, kwargs = video_inputs()
+        recompute_guard = getattr(checkpoint_module, "_run_fn_with_dynamo_disabled", None)
+        guard_context = (patch.object(checkpoint_module, "_run_fn_with_dynamo_disabled",
+                                      inspect.unwrap(recompute_guard))
+                         if recompute_guard is not None else nullcontext())
+        with guard_context:
+            model(ids, **kwargs).square().sum().backward()
+        self.assertGreaterEqual(model.decoder_calls, 2)
+        self.assertEqual(model.embedding_calls, 1)
+        torch.testing.assert_close(model.embedding.weight.grad[8], torch.zeros(4))
+        self.assertGreater(model.embedding.weight.grad[20].abs().sum().item(), 0)
+        for sample in kwargs["huanyu_cached_video_embeds"]:
+            for tensor in sample:
+                self.assertIsNone(tensor.grad)
+
+    def test_video_temporal_lengths_cannot_redistribute_even_if_total_matches(self):
+        model = self.make_model()
+        # Expected group sizes [1, 1, 2]; observed [2, 1, 1].
+        ids = torch.tensor([[5, 8, 8, 7, 20, 5, 8, 7, 21, 5, 8, 7]])
+        with self.assertRaisesRegex(ValueError, "video span/grid/embedding"):
+            model(ids, huanyu_cache_enabled=[1], huanyu_cached_audio_embeds=[],
+                  huanyu_audio_lengths=[], huanyu_audio_chunk_counts=[0],
+                  huanyu_cached_vision_embeds=[], huanyu_cached_image_counts=[0],
+                  huanyu_cached_video_embeds=[torch.ones(2, 4, dtype=torch.bfloat16)] * 2,
+                  huanyu_cached_video_counts=[2], video_grid_thw=torch.tensor([[2, 2, 2], [1, 2, 4]]),
+                  position_ids=torch.arange(36).reshape(3, 1, 12))
+        self.assertEqual(model.forward_calls, 0)
+
+    def test_video_cache_validates_grid_tensor_and_embedding_lengths(self):
+        for change in ("missing_grid", "fractional_grid", "spatial_merge", "embedding_length", "missing_counts"):
+            with self.subTest(change=change):
+                model = self.make_model()
+                ids, kwargs = video_inputs()
+                if change == "missing_grid":
+                    kwargs.pop("video_grid_thw")
+                elif change == "fractional_grid":
+                    kwargs["video_grid_thw"][1] = kwargs["video_grid_thw"][1].float()
+                elif change == "spatial_merge":
+                    kwargs["video_grid_thw"][1][0] = torch.tensor([2, 1, 4])
+                elif change == "embedding_length":
+                    kwargs["huanyu_cached_video_embeds"][1][0] = torch.ones(1, 4, dtype=torch.bfloat16)
+                else:
+                    kwargs.pop("huanyu_cached_video_counts")
+                with self.assertRaises(ValueError):
+                    model(ids, **kwargs)
+                self.assertEqual(model.forward_calls, 0)
+
+    def test_video_cache_requires_multimodal_positions_without_any_images(self):
+        model = self.make_model()
+        ids, kwargs = video_inputs()
+        kwargs.pop("position_ids")
+        kwargs.pop("image_grid_thw")
+        with self.assertRaisesRegex(ValueError, "multimodal position_ids"):
+            model(ids, **kwargs)
+        self.assertEqual(model.forward_calls, 0)
 
     def test_mixed_padded_batch_matches_manual_scatter_and_keeps_positions(self):
         model = self.make_model()

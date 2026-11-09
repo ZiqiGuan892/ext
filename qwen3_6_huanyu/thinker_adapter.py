@@ -169,6 +169,7 @@ class Qwen36HuanyuThinkerAdapter(OmniModelBase):
         cache_args = {}
         if use_cache:
             cache_args = dict(use_precompute=True, image_token_id=_value(module.config, "image_token_id"),
+                              video_token_id=_value(module.config, "video_token_id"),
                               spatial_merge_size=_value(vision_config, "spatial_merge_size", 2))
         if not freeze_audio:
             cache_args = dict(encode_audio=encode_trainable_huanyu_audio, require_audio_only=True)

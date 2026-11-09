@@ -211,8 +211,9 @@ def process_row(row, processor, cache, encoders=None, *, verify_only=False, samp
     """Populate/verify one parquet row with exactly the training media decoder."""
     from .dataset import decode_huanyu_media
 
-    images, audios = decode_huanyu_media(row, sampling_rate=sampling_rate)
+    images, videos, audios = decode_huanyu_media(row, sampling_rate=sampling_rate)
     vision = processor._vision(images)
+    video = processor._video(videos)
     features, lengths, _ = processor._audio(audios, sampling_rate)
     hidden = int(_field(_field(processor.config, "text_config"), "hidden_size"))
     counts = {"audio": 0, "vision": 0, "created": 0, "reused": 0}
@@ -220,8 +221,15 @@ def process_row(row, processor, cache, encoders=None, *, verify_only=False, samp
     for feature, length in zip(features, lengths.tolist(), strict=True):
         tokens = ((length + 3) // 4) // 2
         items.append(("audio", audio_key(feature, length), tokens, feature, length))
-    if vision:
-        for pixels, grid in split_vision_inputs(vision["pixel_values"], vision["image_grid_thw"]):
+    # Each source video is encoded as one temporal grid, not as independent
+    # frame images. Images and videos share the same visual encoder/cache keys.
+    for inputs, pixel_name, grid_name in (
+        (vision, "pixel_values", "image_grid_thw"),
+        (video, "pixel_values_videos", "video_grid_thw"),
+    ):
+        if not inputs:
+            continue
+        for pixels, grid in split_vision_inputs(inputs[pixel_name], inputs[grid_name]):
             patches = int(grid.prod())
             if patches % processor.spatial_merge_size ** 2:
                 raise ValueError("Vision grid cannot be divided by spatial merge size")
@@ -298,7 +306,7 @@ def main(argv=None):
                     rate = totals["rows"] / max(elapsed, 1e-9)
                     eta = (total_rows - totals["rows"]) / max(rate, 1e-9)
                     print(f"[huanyu-precompute] {totals['rows']}/{total_rows} rows "
-                          f"audio_chunks={totals['audio']} images={totals['vision']} "
+                          f"audio_chunks={totals['audio']} visual_items={totals['vision']} "
                           f"created={totals['created']} reused={totals['reused']} "
                           f"elapsed={elapsed:.0f}s rate={rate:.2f}rows/s eta={eta:.0f}s", flush=True)
                     last_log = now

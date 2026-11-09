@@ -37,6 +37,10 @@ class FakeProcessor:
             return [], torch.tensor([], dtype=torch.long), []
         return [torch.ones(4, 8)], torch.tensor([8]), [[1]]
 
+    def _video(self, videos):
+        return {"pixel_values_videos": torch.arange(32, dtype=torch.float32).reshape(8, 4) + 100,
+                "video_grid_thw": torch.tensor([[2, 2, 2]])} if videos else {}
+
 
 class FakeEncoders:
     def __init__(self):
@@ -48,7 +52,7 @@ class FakeEncoders:
 
     def vision(self, pixels, grid):
         self.calls.append("vision")
-        return torch.full((1, 6), 2.)
+        return torch.full((int(grid.prod()) // 4, 6), 2.)
 
 
 class FakeBatch:
@@ -130,7 +134,9 @@ class PrecomputeTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.cache = cli.HuanyuEmbeddingCache(self.root / "cache", {"model": "huanyu"}, create=True)
         fake_dataset = ModuleType(f"{PACKAGE}.dataset")
-        fake_dataset.decode_huanyu_media = lambda row, sampling_rate: (row.get("images"), row.get("audios"))
+        fake_dataset.decode_huanyu_media = lambda row, sampling_rate: (
+            row.get("images"), row.get("videos"), row.get("audios"),
+        )
         self.stub = patch.dict(sys.modules, {fake_dataset.__name__: fake_dataset})
         self.stub.start()
         self.addCleanup(self.stub.stop)
@@ -176,6 +182,29 @@ class PrecomputeTests(unittest.TestCase):
         encoders = FakeEncoders()
         with self.assertRaisesRegex(FileNotFoundError, "cache miss"):
             cli.process_row({"audios": ["audio"]}, FakeProcessor(), self.cache, encoders, verify_only=True)
+        self.assertEqual(encoders.calls, [])
+
+    def test_video_is_one_temporal_cache_entry_and_resume_uses_identical_key(self):
+        encoders = FakeEncoders()
+        processor = FakeProcessor()
+        row = {"images": ["image"], "videos": ["video"], "audios": ["audio"]}
+        result = cli.process_row(row, processor, self.cache, encoders)
+        self.assertEqual(result, {"audio": 1, "vision": 2, "created": 3, "reused": 0})
+        self.assertEqual(encoders.calls, ["audio", "vision", "vision"])
+        video = processor._video(row["videos"])
+        key = cli.vision_key(video["pixel_values_videos"], video["video_grid_thw"][0])
+        torch.testing.assert_close(self.cache.get("vision", key, 2, 6), torch.full((2, 6), 2., dtype=torch.bfloat16))
+        result = cli.process_row(row, processor, self.cache, verify_only=True)
+        self.assertEqual(result["reused"], 3)
+        self.assertEqual(result["created"], 0)
+        self.assertEqual(encoders.calls, ["audio", "vision", "vision"])
+
+    def test_old_frame_entries_cannot_satisfy_a_paired_video_cache_lookup(self):
+        processor = FakeProcessor()
+        cli.process_row({"images": ["image"]}, processor, self.cache, FakeEncoders())
+        encoders = FakeEncoders()
+        with self.assertRaisesRegex(FileNotFoundError, "cache miss"):
+            cli.process_row({"videos": ["video"]}, processor, self.cache, encoders, verify_only=True)
         self.assertEqual(encoders.calls, [])
 
     def test_plain_text_row_has_no_encoder_work(self):

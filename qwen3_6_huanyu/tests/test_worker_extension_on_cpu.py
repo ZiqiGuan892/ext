@@ -57,6 +57,7 @@ def worker_modules(*, fail=None):
         ("ab_determinism", "install_ab_determinism_check"),
         ("repeat_determinism", "install_repeat_determinism_check"),
         ("processor_compat", "install_huanyu_processor_compat"),
+        ("video_rollout", "install_huanyu_video_rollout"),
         ("rollout_precision", "install_huanyu_rollout_precision"),
         ("cache_precision", "install_huanyu_cache_precision"),
     ):
@@ -123,7 +124,7 @@ class WorkerExtensionTests(unittest.TestCase):
             self.assertTrue(getattr(cls.update_weights_from_ipc, reload._PATCH_MARKER))
             self.assertIs(cls.__new__, base.__new__)
             cls()
-        self.assertEqual(events, ["processor_compat", "rollout_precision", "cache_precision", "source:inference-worker", "base-new"])
+        self.assertEqual(events, ["processor_compat", "video_rollout", "rollout_precision", "cache_precision", "source:inference-worker", "base-new"])
         self.assertIn("[huanyu-worker] explicit precision extension selected", output.getvalue())
         self.assertIn("ipc_signature=", output.getvalue())
 
@@ -133,12 +134,12 @@ class WorkerExtensionTests(unittest.TestCase):
                 module = load_file(PACKAGE + ".worker_extension", ROOT / "worker_extension.py")
                 worker = module.HuanyuColocateWorkerExtension()
                 self.assertEqual(worker.update_weights_from_ipc(), "original")
-        self.assertEqual(events, ["processor_compat", "rollout_precision", "cache_precision", "source:inference-worker", "base-new", "original-update"])
+        self.assertEqual(events, ["processor_compat", "video_rollout", "rollout_precision", "cache_precision", "source:inference-worker", "base-new", "original-update"])
         self.assertIn("enabled=0", output.getvalue())
         self.assertIn("delegated to original IPC handler", output.getvalue())
 
     def test_factory_import_propagates_installer_failure(self):
-        for failed in ("processor_compat", "rollout_precision", "cache_precision"):
+        for failed in ("processor_compat", "video_rollout", "rollout_precision", "cache_precision"):
             with self.subTest(failed=failed), worker_modules(fail=failed), redirect_stdout(io.StringIO()) as output:
                 with self.assertRaisesRegex(RuntimeError, failed + " unavailable"):
                     load_file(PACKAGE + ".worker_extension", ROOT / "worker_extension.py")
@@ -148,7 +149,7 @@ class WorkerExtensionTests(unittest.TestCase):
         with worker_modules(fail="source") as (_, events, _), redirect_stdout(io.StringIO()) as output:
             with self.assertRaisesRegex(RuntimeError, "source mismatch"):
                 load_file(PACKAGE + ".worker_extension", ROOT / "worker_extension.py")
-        self.assertEqual(events, ["processor_compat", "rollout_precision", "cache_precision", "source:inference-worker"])
+        self.assertEqual(events, ["processor_compat", "video_rollout", "rollout_precision", "cache_precision", "source:inference-worker"])
         self.assertNotIn("explicit precision extension selected", output.getvalue())
 
     def test_actual_server_deploy_writer_receives_huanyu_stage_extension(self):

@@ -18,6 +18,7 @@ import torch
 
 IMAGE_PATTERN = "(<image>./</image>)"
 AUDIO_PATTERN = "(<audio>./</audio>)"
+VIDEO_PATTERN = "(<video>./</video>)"
 
 
 def _get(value, key, default=None):
@@ -42,7 +43,8 @@ def _items(value):
 class HuanyuProcessor:
     """One trajectory at a time, matching AgentLoop's processor contract.
 
-    Images (including video frames) keep Qwen spatial grids. Audio placeholders
+    Images keep Qwen spatial grids; videos pair adjacent frames before encoding.
+    Audio placeholders
     are expanded per 30-second chunk, using real frame lengths, then rescanned
     from the actual token IDs when the training batch is assembled.
     """
@@ -167,6 +169,23 @@ class HuanyuProcessor:
             raise ValueError("Qwen vision processor must return pixel_values and one image_grid_thw per image")
         return {"pixel_values": pixels, "image_grid_thw": grids.long()}
 
+    def _video(self, videos):
+        from .video_frontend import preprocess_video_frames
+
+        if not _items(videos):
+            return {}
+        # Resolve only when video is present, so old audio-only exports remain
+        # usable. A video token must never silently become the unknown token.
+        self.video_token_id = _token_id(self.tokenizer, "<|video_pad|>", _get(self.config, "video_token_id"))
+        vision_config = _get(self.config, "vision_config")
+        for field, processor_field in (("patch_size", "patch_size"), ("temporal_patch_size", "temporal_patch_size"),
+                                       ("spatial_merge_size", "merge_size")):
+            expected = _get(vision_config, field)
+            actual = getattr(self.image_processor, processor_field, None)
+            if expected is not None and actual != expected:
+                raise ValueError(f"Huanyu video {field}: processor {actual} != encoder {expected}")
+        return preprocess_video_frames(self.image_processor, videos)
+
     @staticmethod
     def _replace(text, pattern, replacements):
         if text.count(pattern) != len(replacements):
@@ -177,15 +196,13 @@ class HuanyuProcessor:
 
     def __call__(self, text, images=None, videos=None, audios=None, audio=None,
                  sampling_rate=16000, return_tensors="pt", **kwargs):
-        if _items(videos):
-            raise ValueError("Huanyu dataset must decode videos to ordered image frames before processor invocation")
         texts = [text] if isinstance(text, str) else list(text)
         if len(texts) != 1:
             raise ValueError("HuanyuProcessor supports one trajectory per call; AgentLoop handles batching")
         if audios is not None and audio is not None:
             raise ValueError("Supply either audio or audios, not both")
         audio_features, audio_lengths, groups = self._audio(audios if audios is not None else audio, sampling_rate)
-        vision = self._vision(images)
+        vision = {**self._vision(images), **self._video(videos)}
         image_spans = []
         for grid in vision.get("image_grid_thw", []):
             patches = int(grid.prod())
@@ -194,6 +211,10 @@ class HuanyuProcessor:
                 raise ValueError("Vision grid is not divisible by the configured spatial merge")
             image_spans.append("<|vision_start|>" + "<|image_pad|>" * (patches // merge) + "<|vision_end|>")
         rendered = self._replace(texts[0], IMAGE_PATTERN, image_spans)
+        from .video_frontend import video_placeholder
+        video_spans = [video_placeholder(grid, self.spatial_merge_size)
+                       for grid in vision.get("video_grid_thw", [])]
+        rendered = self._replace(rendered, VIDEO_PATTERN, video_spans)
         audio_spans = ["".join("<|audio_start|>" + "<unk>" * n + "<|audio_end|>" for n in group) for group in groups]
         rendered = self._replace(rendered, AUDIO_PATTERN, audio_spans)
         encoded = dict(self.tokenizer(rendered, add_special_tokens=False, return_tensors=return_tensors))
@@ -218,18 +239,28 @@ class HuanyuProcessor:
                                  expected_tokens=((int(length) + 3) // 4) // 2, hidden_size=hidden)
                         for feat, length in zip(features, lengths)]
         image_embeds = []
-        if vision:
+        if "image_grid_thw" in vision:
             for pixels, grid in split_vision_inputs(vision["pixel_values"], vision["image_grid_thw"]):
                 image_embeds.append(cache.get(
                     "vision", vision_key(pixels, grid),
                     expected_tokens=int(grid.prod()) // self.spatial_merge_size ** 2, hidden_size=hidden,
                 ))
+        video_embeds = []
+        if "video_grid_thw" in vision:
+            for pixels, grid in split_vision_inputs(vision["pixel_values_videos"], vision["video_grid_thw"]):
+                video_embeds.append(cache.get(
+                    "vision", vision_key(pixels, grid),
+                    expected_tokens=int(grid.prod()) // self.spatial_merge_size ** 2, hidden_size=hidden,
+                ))
         inputs.pop("huanyu_audio_features", None)
         inputs.pop("pixel_values", None)
+        inputs.pop("pixel_values_videos", None)
         inputs.update(
             huanyu_cached_audio_embeds=audio_embeds,
             huanyu_cached_vision_embeds=image_embeds,
             huanyu_cached_image_counts=torch.tensor([len(image_embeds)], dtype=torch.long),
+            huanyu_cached_video_embeds=video_embeds,
+            huanyu_cached_video_counts=torch.tensor([len(video_embeds)], dtype=torch.long),
             huanyu_cache_enabled=torch.ones(1, dtype=torch.long),
         )
 
@@ -254,6 +285,20 @@ class HuanyuProcessor:
         actual = [end - begin for begin, end in image_bounds]
         if actual != expected:
             raise ValueError(f"Huanyu image token lengths {actual} != image grid lengths {expected}")
+        video_bounds, start = [], None
+        video_id = getattr(self, "video_token_id", _get(self.config, "video_token_id"))
+        for index, token in enumerate(ids.tolist()):
+            if token == video_id:
+                start = index if start is None else start
+            elif start is not None:
+                video_bounds.append((start, index))
+                start = None
+        if start is not None:
+            video_bounds.append((start, len(ids)))
+        expected_video = [int(grid[1:].prod()) // self.spatial_merge_size ** 2
+                          for grid in vision.get("video_grid_thw", []) for _ in range(int(grid[0]))]
+        if [end - begin for begin, end in video_bounds] != expected_video:
+            raise ValueError("Huanyu video token lengths do not match temporal-group grid lengths")
         return {
             "huanyu_audio_features": features,
             "huanyu_audio_lengths": lengths,
@@ -265,9 +310,7 @@ class HuanyuProcessor:
     def build_multi_modal_inputs(self, input_ids, multi_modal_data, mm_processor_kwargs=None):
         data = multi_modal_data or {}
         kwargs = dict(mm_processor_kwargs or {})
-        if _items(data.get("videos")):
-            raise ValueError("Huanyu training expects dataset videos converted to image frames")
-        vision = self._vision(data.get("images"))
+        vision = {**self._vision(data.get("images")), **self._video(data.get("videos"))}
         features, lengths, groups = self._audio(data.get("audios"), kwargs.get("sampling_rate", self.sampling_rate))
         inputs = {**vision, **self._bound_inputs(input_ids, features, lengths, groups, vision)}
         self._use_embedding_cache(inputs, vision, features, lengths)
@@ -293,8 +336,8 @@ def _rope_token_types(processor, input_ids, attention_mask=None):
     """Describe the actual padded sequence for the newer Qwen RoPE API.
 
     Audio slots use ordinary sequential positions (type 0); their embeddings
-    are replaced separately by the Huanyu forward bridge. Video frames decoded
-    by our dataset use image_pad and therefore image grids/type 1.
+    are replaced separately by the Huanyu forward bridge. Paired video groups
+    use video_pad and video grids/type 2; still images retain type 1.
     """
     if not isinstance(input_ids, torch.Tensor) or input_ids.ndim != 2:
         raise ValueError("Huanyu RoPE requires input_ids with shape [batch, sequence]")

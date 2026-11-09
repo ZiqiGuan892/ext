@@ -15,10 +15,10 @@ def _video_helpers():
 
 
 def video_prompt_parts(item, sampling_rate):
-    from .processor import AUDIO_PATTERN, IMAGE_PATTERN
+    from .processor import AUDIO_PATTERN, VIDEO_PATTERN
     helper = _video_helpers()
     spec = helper.video_spec_from_item(item)
-    parts = [IMAGE_PATTERN] * helper.count_frames(spec)
+    parts = [VIDEO_PATTERN]
     if helper.use_audio_in_video() and helper.extract_video_audio(spec, sampling_rate) is not None:
         parts.append(AUDIO_PATTERN)
     return parts
@@ -82,7 +82,7 @@ def decode_huanyu_media(row, sampling_rate=16000):
     """
     if sampling_rate != 16000:
         raise ValueError("Verified Huanyu checkpoint expects sampling_rate=16000")
-    images, audios = [], []
+    images, videos, audios = [], [], []
     for item in row.get("images") or []:
         images.append(_image(item if isinstance(item, dict) else {"image": item}))
     for item in row.get("audios") or []:
@@ -90,12 +90,12 @@ def decode_huanyu_media(row, sampling_rate=16000):
     for item in row.get("videos") or []:
         helper = _video_helpers()
         spec = helper.video_spec_from_item(item if isinstance(item, dict) else {"video": item})
-        images.extend(helper.sample_frames(spec))
+        videos.append(np.stack([np.asarray(frame.convert("RGB")) for frame in helper.sample_frames(spec)]))
         if helper.use_audio_in_video():
             waveform = helper.extract_video_audio(spec, sampling_rate)
             if waveform is not None:
                 audios.append(waveform)
-    return images, audios
+    return images, videos, audios
 
 
 class Qwen36HuanyuOmniRLHFDataset(RLHFDataset):
@@ -107,7 +107,7 @@ class Qwen36HuanyuOmniRLHFDataset(RLHFDataset):
         sampling_rate = int((kwargs or {}).get("sampling_rate", 16000))
         if sampling_rate != 16000:
             raise ValueError("Verified Huanyu checkpoint expects sampling_rate=16000")
-        images, audios = [], []
+        images, videos, audios = [], [], []
         for message in messages:
             content = message.get("content")
             if not isinstance(content, list):
@@ -121,9 +121,11 @@ class Qwen36HuanyuOmniRLHFDataset(RLHFDataset):
                 elif kind == "video":
                     helper = _video_helpers()
                     spec = helper.video_spec_from_item(item)
-                    images.extend(helper.sample_frames(spec))
+                    # Keep the clip boundary: the frontend pairs adjacent real
+                    # frames before the vision encoder, not duplicated images.
+                    videos.append(np.stack([np.asarray(frame.convert("RGB")) for frame in helper.sample_frames(spec)]))
                     if helper.use_audio_in_video():
                         waveform = helper.extract_video_audio(spec, sampling_rate)
                         if waveform is not None:
                             audios.append(waveform)
-        return images or None, None, audios or None
+        return images or None, videos or None, audios or None

@@ -16,6 +16,7 @@ from numbers import Integral
 logger = logging.getLogger(__name__)
 _IMAGE_PATTERN = "(<image>./</image>)"
 _AUDIO_PATTERN = "(<audio>./</audio>)"
+_VIDEO_PATTERN = "(<video>./</video>)"
 _HOOK_FLAG = "_huanyu_metadata_contraction"
 _MISSING = object()
 
@@ -145,8 +146,20 @@ def contract_rollout_prompt(processor, prompt_ids, multi_modal_data):
     """
     if not isinstance(multi_modal_data, Mapping):
         raise TypeError("Huanyu rollout multi_modal_data must be a mapping")
-    if _media_items(multi_modal_data, "video"):
-        raise ValueError("Huanyu rollout expects dataset video items converted into image frames")
+    videos = _media_items(multi_modal_data, "video")
+    video_groups = []
+    video_pattern, video_pad = [], None
+    if videos:
+        if not callable(getattr(processor, "_video", None)):
+            raise ValueError("Huanyu rollout video requires the temporal-pair processor")
+        video_inputs = processor._video(videos)
+        for grid in video_inputs["video_grid_thw"]:
+            count = int(grid[1:].prod()) // processor.spatial_merge_size ** 2
+            video_groups.append([count] * int(grid[0]))
+        video_pad = int(processor.video_token_id)
+        video_pattern = _ids(processor.tokenizer.encode(_VIDEO_PATTERN, add_special_tokens=False), "video pattern")
+        if not video_pattern:
+            raise ValueError("Huanyu rollout video pattern must tokenize to non-empty IDs")
     images = _media_items(multi_modal_data, "image")
     audios = _media_items(multi_modal_data, "audio")
     groups = [_audio_chunk_lengths(audio, processor) for audio in audios]
@@ -158,16 +171,29 @@ def contract_rollout_prompt(processor, prompt_ids, multi_modal_data):
     )
     if len({vs, ve, image_pad, aus, aue, audio_pad}) != 6:
         raise ValueError("Huanyu media markers must be distinct")
+    if video_pad is not None and video_pad in (vs, ve, image_pad, aus, aue, audio_pad):
+        raise ValueError("Huanyu video marker must be distinct from image/audio markers")
     image_pattern = _ids(processor.tokenizer.encode(_IMAGE_PATTERN, add_special_tokens=False), "image pattern")
     audio_pattern = _ids(processor.tokenizer.encode(_AUDIO_PATTERN, add_special_tokens=False), "audio pattern")
     if not image_pattern or not audio_pattern:
         raise ValueError("Huanyu rollout media patterns must tokenize to non-empty sequences")
 
     output = []
-    image_index = audio_index = index = 0
+    image_index = video_index = audio_index = index = 0
     while index < len(ids):
         token = ids[index]
-        if token == vs:
+        if token == vs and index + 1 < len(ids) and ids[index + 1] == video_pad:
+            if video_index >= len(video_groups):
+                raise ValueError("Huanyu rollout has more video spans than video items")
+            for count in video_groups[video_index]:
+                end = index + count + 1
+                if (index >= len(ids) or ids[index] != vs or end >= len(ids) or ids[end] != ve
+                        or any(value != video_pad for value in ids[index + 1:end])):
+                    raise ValueError("Huanyu rollout video temporal-group spans do not match the processed video grid")
+                index = end + 1
+            output.extend(video_pattern)
+            video_index += 1
+        elif token == vs:
             if image_index >= len(images):
                 raise ValueError("Huanyu rollout has more image spans than image items")
             end = index + 1
@@ -192,21 +218,22 @@ def contract_rollout_prompt(processor, prompt_ids, multi_modal_data):
                 index = end + 1
             output.extend(audio_pattern)
             audio_index += 1
-        elif token in (ve, aue, image_pad):
+        elif token in (ve, aue, image_pad, video_pad):
             raise ValueError(f"Huanyu rollout has an unmatched media marker at token {index}")
         else:
             if (ids[index:index + len(image_pattern)] == image_pattern
-                    or ids[index:index + len(audio_pattern)] == audio_pattern):
+                    or ids[index:index + len(audio_pattern)] == audio_pattern
+                    or (video_pattern and ids[index:index + len(video_pattern)] == video_pattern)):
                 raise ValueError(
                     f"Huanyu rollout contains an unexpanded media literal at token {index}; "
                     "the processor must expand every media item before generation"
                 )
             output.append(token)
             index += 1
-    if image_index != len(images) or audio_index != len(audios):
+    if image_index != len(images) or video_index != len(videos) or audio_index != len(audios):
         raise ValueError(
             f"Huanyu rollout media/span counts differ: images={image_index}/{len(images)}, "
-            f"audios={audio_index}/{len(audios)}"
+            f"videos={video_index}/{len(videos)}, audios={audio_index}/{len(audios)}"
         )
     return output
 

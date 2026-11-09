@@ -196,6 +196,7 @@ class CacheTests(unittest.TestCase):
             (("image_processor", "patch_size"), 32),
             (("audio_execution",), "single_chunk_bf16_v2"),
             (("vision_execution",), "single_image_hf_bf16_eager_q64_v1"),
+            (("video_execution",), "temporal_pairs_single_video_hf_bf16_eager_q128_v1"),
             (("future_contract_field",), "must-not-be-ignored"),
         )
         before = (root / "manifest.json").read_bytes()
@@ -471,6 +472,12 @@ class CacheTests(unittest.TestCase):
         with patch.dict(sys.modules, {runtime.__name__: runtime}), \
                 patch("importlib.import_module", side_effect=AssertionError("must not import model implementations")):
             first = cache_module.make_cache_contract(model, processor)
+            self.assertEqual(first["video_execution"], "temporal_pairs_single_video_hf_bf16_eager_q128_v1")
+            legacy = {key: value for key, value in first.items() if key != "video_execution"}
+            old_root = self.root / "frames-as-images-cache"
+            cache_module.HuanyuEmbeddingCache(old_root, legacy, create=True)
+            with self.assertRaisesRegex(ValueError, "video_execution"):
+                cache_module.HuanyuEmbeddingCache(old_root, first)
             self.assertNotIn("sources", first)
             self.assertEqual(first, cache_module.make_cache_contract(model, processor))
             source.write_text("# native encoder v2\n")

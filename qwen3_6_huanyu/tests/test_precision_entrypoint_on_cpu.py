@@ -14,6 +14,7 @@ PACKAGE = "verl_omni_ext.models.qwen3_6_huanyu"
 ENTRY = PACKAGE + ".engine_hooks"
 INSTALLERS = (
     ("processor_compat", "install_huanyu_processor_compat"),
+    ("video_rollout", "install_huanyu_video_rollout"),
     ("rollout_precision", "install_huanyu_rollout_precision"),
     ("cache_precision", "install_huanyu_cache_precision"),
     ("weight_reload", "install_huanyu_weight_reload"),
@@ -89,6 +90,7 @@ class PrecisionEntrypointTests(unittest.TestCase):
             self.assertEqual(Path(entry.__file__).resolve(), ROOT / "engine_hooks.py")
             self.assertEqual(events, [
                 "whisper-registration", "processor_compat", "installed:processor_compat",
+                "video_rollout", "installed:video_rollout",
                 "rollout_precision", "installed:rollout_precision",
                 "cache_precision", "installed:cache_precision", "weight_reload", "installed:weight_reload",
             ])

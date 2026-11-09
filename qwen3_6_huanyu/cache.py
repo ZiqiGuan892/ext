@@ -118,7 +118,10 @@ def make_cache_contract(model_path, processor):
                            "shards": shards,
                            "audio_preprocessor": processor.audio_preprocessor,
                            "image_processor": image_cfg, "audio_execution": "single_chunk_bf16_v1",
-                           "vision_execution": "single_image_hf_bf16_eager_q128_v1"}))
+                           "vision_execution": "single_image_hf_bf16_eager_q128_v1",
+                           # A source-only change must not adopt a frames-as-images
+                           # cache whose manifest predates paired video inputs.
+                           "video_execution": "temporal_pairs_single_video_hf_bf16_eager_q128_v1"}))
 
 
 def _manifest_payload(contract):
