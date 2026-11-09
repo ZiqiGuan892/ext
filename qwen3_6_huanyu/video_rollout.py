@@ -10,6 +10,7 @@ from functools import wraps
 from importlib import import_module
 from numbers import Integral
 
+from .prompt_updates import apply_huanyu_prompt_updates, native_prompt_updater
 from .video_frontend import preprocess_video_frames, video_grid_for_size, video_placeholder
 
 
@@ -78,8 +79,15 @@ def _video_grid_spans(model, config, input_tokens, feature, limit):
             or input_tokens[end] != model.vision_end_token_id
             or any(token != model.video_token_id for token in input_tokens[start:end])
         ):
+            pad_end = start
+            while pad_end < limit and input_tokens[pad_end] == model.video_token_id:
+                pad_end += 1
             raise ValueError(
-                f"Huanyu video temporal span {group + 1}/{temporal} must contain exactly {count} video pads"
+                f"Huanyu video temporal span {group + 1}/{temporal} must contain exactly {count} video pads; "
+                f"grid={list(grid)} offset={offset} length={length} region_end={limit} "
+                f"cursor={cursor} span_begin={begin} actual_pads={pad_end - start} "
+                f"pads_before_span={sum(token == model.video_token_id for token in input_tokens[cursor:begin])} "
+                f"following_token={input_tokens[pad_end] if pad_end < len(input_tokens) else None}"
             )
         yield start, height, width, count
         cursor = end + 1
@@ -172,6 +180,7 @@ def install_huanyu_video_rollout():
     model_cls = getattr(native, _MODEL_CLASS)
     original_process = cls.process_videos
     original_updates = cls._get_prompt_updates
+    original_apply = cls._apply_prompt_updates
     original_grids = model_cls._q36_iter_mm_grid_hw
     original_prompt = cls.get_video_prompt_texts
     original_frame_size = info_cls.get_video_frame_size_with_most_features
@@ -179,7 +188,7 @@ def install_huanyu_video_rollout():
     installed = [
         getattr(method, _MARKER, False)
         for method in (
-            original_process, original_updates, original_grids,
+            original_process, original_updates, original_apply, original_grids,
             original_prompt, original_frame_size, original_frame_tokens,
         )
     ]
@@ -187,6 +196,13 @@ def install_huanyu_video_rollout():
         return True
     if any(installed):
         raise RuntimeError("Huanyu video rollout hooks are only partially installed")
+    native_apply = native_prompt_updater(original_apply)
+
+    @wraps(original_apply)
+    def apply_prompt_updates(self, token_ids, mm_prompt_updates):
+        if not _is_huanyu(self.info):
+            return original_apply(self, token_ids, mm_prompt_updates)
+        return apply_huanyu_prompt_updates(self, native_apply, token_ids, mm_prompt_updates)
 
     @wraps(original_process)
     def process_videos(self, mm_data, mm_kwargs, tok_kwargs):
@@ -258,19 +274,22 @@ def install_huanyu_video_rollout():
 
     setattr(process_videos, _MARKER, True)
     setattr(get_prompt_updates, _MARKER, True)
+    setattr(apply_prompt_updates, _MARKER, True)
     setattr(iter_mm_grid_hw, _MARKER, True)
     setattr(get_video_prompt_texts, _MARKER, True)
     setattr(get_video_frame_size_with_most_features, _MARKER, True)
     setattr(get_max_video_frame_tokens, _MARKER, True)
     cls.process_videos = process_videos
     cls._get_prompt_updates = get_prompt_updates
+    cls._apply_prompt_updates = apply_prompt_updates
     model_cls._q36_iter_mm_grid_hw = iter_mm_grid_hw
     cls.get_video_prompt_texts = get_video_prompt_texts
     info_cls.get_video_frame_size_with_most_features = get_video_frame_size_with_most_features
     info_cls.get_max_video_frame_tokens = get_max_video_frame_tokens
     print(
         "[huanyu-video] layout=temporal_pairs_v1 frontend=checkpoint "
-        "spans=per_temporal_group rope=per_temporal_group budget=source_frames_conservative",
+        "spans=per_temporal_group rope=per_temporal_group budget=source_frames_conservative "
+        "prompt_updates=native_full_ranges_v1",
         flush=True,
     )
     return True

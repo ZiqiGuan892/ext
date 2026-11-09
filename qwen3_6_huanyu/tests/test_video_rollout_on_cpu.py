@@ -113,6 +113,10 @@ def make_native():
             self.original_calls.append((mm_items, hf_processor_mm_kwargs, out_mm_kwargs))
             return self.updates
 
+        def _apply_prompt_updates(self, token_ids, mm_prompt_updates):
+            self.original_calls.append((token_ids, mm_prompt_updates))
+            return token_ids, {"legacy": True}
+
         def get_video_prompt_texts(self, image_size, num_frames):
             return f"native:{image_size.width}x{image_size.height}:{num_frames}"
 
@@ -236,6 +240,7 @@ class VideoRolloutTests(unittest.TestCase):
 
     def test_installation_is_idempotent(self):
         process, updates = self.cls.process_videos, self.cls._get_prompt_updates
+        apply = self.cls._apply_prompt_updates
         iterator = self.native.MiniCPMO50OmniLLMForConditionalGeneration._q36_iter_mm_grid_hw
         prompt = self.cls.get_video_prompt_texts
         info = self.native.MiniCPMO50OmniLLMProcessingInfo
@@ -243,10 +248,22 @@ class VideoRolloutTests(unittest.TestCase):
         self.assertTrue(rollout.install_huanyu_video_rollout())
         self.assertIs(self.cls.process_videos, process)
         self.assertIs(self.cls._get_prompt_updates, updates)
+        self.assertIs(self.cls._apply_prompt_updates, apply)
         self.assertIs(self.native.MiniCPMO50OmniLLMForConditionalGeneration._q36_iter_mm_grid_hw, iterator)
         self.assertIs(self.cls.get_video_prompt_texts, prompt)
         self.assertIs(info.get_video_frame_size_with_most_features, size)
         self.assertIs(info.get_max_video_frame_tokens, budget)
+
+    def test_full_range_prompt_update_is_huanyu_only(self):
+        ids, updates, expected = [3, 4], {"video": [[]]}, object()
+        huanyu, other = self.cls(), self.cls(huanyu=False)
+        with patch.object(rollout, "apply_huanyu_prompt_updates", return_value=expected) as apply:
+            self.assertIs(huanyu._apply_prompt_updates(ids, updates), expected)
+            self.assertEqual(other._apply_prompt_updates(ids, updates), (ids, {"legacy": True}))
+        apply.assert_called_once()
+        self.assertIs(apply.call_args.args[0], huanyu)
+        self.assertEqual(huanyu.original_calls, [])
+        self.assertEqual(other.original_calls, [(ids, updates)])
 
     def test_checkpoint_maximum_grid_budget_covers_even_odd_and_smaller_requests(self):
         proc = self.cls()

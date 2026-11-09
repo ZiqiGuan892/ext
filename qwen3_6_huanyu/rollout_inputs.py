@@ -12,6 +12,8 @@ import inspect
 import logging
 from numbers import Integral
 
+from .audio_chunking import plan_audio_chunks, prepare_audio_waveform
+
 
 logger = logging.getLogger(__name__)
 _IMAGE_PATTERN = "(<image>./</image>)"
@@ -108,7 +110,7 @@ def _media_items(data, name):
     return list(value)
 
 
-def _audio_chunk_lengths(item, processor):
+def _audio_waveform(item, processor):
     sr = int(processor.sampling_rate)
     if isinstance(item, tuple) and len(item) == 2 and isinstance(item[1], Integral):
         item, actual_sr = item
@@ -116,24 +118,55 @@ def _audio_chunk_lengths(item, processor):
             raise ValueError(f"Huanyu rollout audio sampling rate {actual_sr} != processor rate {sr}")
     if getattr(item, "ndim", None) != 1:
         raise TypeError("Huanyu rollout audio must be a decoded one-dimensional waveform")
-    num_samples = len(item)
-    if num_samples <= 0:
-        raise ValueError("Huanyu rollout audio waveform is empty")
-    n_fft, hop = int(processor.n_fft), int(processor.hop_length)
-    chunk_samples = int(processor.audio_chunk_seconds) * sr
-    encoder_down = int(processor.audio_encoder_downsample)
-    projector_down = int(processor.audio_projector_downsample)
-    if min(sr, n_fft, hop, chunk_samples, encoder_down, projector_down) <= 0:
-        raise ValueError("Huanyu audio frontend rates and downsampling factors must be positive")
-    lengths = []
-    for offset in range(0, num_samples, chunk_samples):
-        size = min(chunk_samples, num_samples - offset)
-        frames = (size - n_fft) // hop + 1
-        tokens = ((frames + encoder_down - 1) // encoder_down) // projector_down
-        if frames <= 0 or tokens <= 0:
-            raise ValueError("Huanyu rollout audio contains a chunk too short to produce a token")
-        lengths.append(tokens)
-    return lengths
+    return item
+
+
+def _audio_chunk_options(processor):
+    return dict(
+        sampling_rate=int(processor.sampling_rate),
+        n_fft=int(processor.n_fft),
+        hop_length=int(processor.hop_length),
+        chunk_seconds=processor.audio_chunk_seconds,
+        encoder_downsample=int(processor.audio_encoder_downsample),
+        projector_downsample=int(processor.audio_projector_downsample),
+    )
+
+
+def _audio_chunk_lengths(item, processor):
+    waveform = _audio_waveform(item, processor)
+    return [chunk.tokens for chunk in plan_audio_chunks(len(waveform), **_audio_chunk_options(processor))]
+
+
+def _prepare_audio_media(processor, media):
+    """Forward the same padded waveform used to count training placeholders.
+
+    Changing only the span count would leave vLLM extracting a zero-token tail.
+    Copy only affected containers: sibling generations can share this request,
+    and ordinary waveforms must retain their original identity.
+    """
+    if not isinstance(media, Mapping):
+        raise TypeError("Huanyu rollout multi_modal_data must be a mapping")
+    audios = _media_items(media, "audio")
+    if not audios:
+        return media
+    prepared = None
+    options = _audio_chunk_options(processor)
+    for index, item in enumerate(audios):
+        waveform = _audio_waveform(item, processor)
+        chunks = plan_audio_chunks(len(waveform), **options)
+        padding = sum(chunk.padding_samples for chunk in chunks)
+        if not padding:
+            continue
+        waveform, _ = prepare_audio_waveform(waveform, **options)
+        if prepared is None:
+            prepared = list(audios)
+        prepared[index] = (waveform, item[1]) if isinstance(item, tuple) else waveform
+        logger.info("Huanyu rollout audio item %d: zero-padded short final chunk by %d samples", index, padding)
+    if prepared is None:
+        return media
+    updated = dict(media)
+    updated["audio"] = tuple(prepared) if isinstance(media["audio"], tuple) else prepared
+    return updated
 
 
 def contract_rollout_prompt(processor, prompt_ids, multi_modal_data):
@@ -304,8 +337,23 @@ def _install_on_server_class(server_class):
                 for kind, key in (("image", "image_data"), ("audio", "audio_data"), ("video", "video_data"))
                 if bound.arguments.get(key) is not None
             }
+        prepared_media = _prepare_audio_media(processor, media)
+        if prepared_media is not media:
+            if method_name == "_preprocess_input":
+                bound.arguments["multi_modal_data"] = prepared_media
+            else:
+                bound.arguments["audio_data"] = prepared_media["audio"]
         original_ids = bound.arguments["prompt_ids"]
-        contracted = contract_rollout_prompt(processor, original_ids, media)
+        contracted = contract_rollout_prompt(processor, original_ids, prepared_media)
+        if _media_items(prepared_media, "video") and not getattr(self, "_huanyu_video_hooks_ready", False):
+            # Tokenization runs in the server process, whereas engine_hooks
+            # may first load in a separate inference worker. Bind the same
+            # frontend and full-range prompt updater before server dispatch.
+            from .video_rollout import install_huanyu_video_rollout
+
+            install_huanyu_video_rollout()
+            self._huanyu_video_hooks_ready = True
+            logger.info("Huanyu video server hooks verified: prompt_updates=native_full_ranges_v1")
         bound.arguments["prompt_ids"] = contracted
         if not getattr(self, "_huanyu_contraction_reported", False):
             logger.info("Huanyu metadata-aware rollout prompt contraction: %d -> %d tokens", len(original_ids), len(contracted))

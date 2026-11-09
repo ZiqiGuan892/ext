@@ -16,6 +16,8 @@ import warnings
 
 import torch
 
+from .audio_chunking import audio_chunking_contract
+
 
 FORMAT = "huanyu_frozen_embeddings_v1"
 _PUBLISH_LOCK_TIMEOUT = 30.0
@@ -113,10 +115,28 @@ def make_cache_contract(model_path, processor):
     if not shards:
         raise ValueError(f"No safetensors checkpoint shards in {root}")
     image_cfg = processor.image_processor.to_dict()
+    audio_cfg = processor.audio_preprocessor
+    frontend = getattr(processor, "audio_frontend", None)
+
+    def audio_value(name, default):
+        return getattr(processor, name, getattr(frontend, name, audio_cfg.get(name, default)))
+
+    # A source-only change is normally compatible, but changing the waveform
+    # segmentation/padding policy changes audio semantics. Keep it outside the
+    # ignored legacy `sources` field, just like the paired-video contract below.
+    audio_chunking = audio_chunking_contract(
+        sampling_rate=audio_value("sampling_rate", 16000),
+        n_fft=audio_value("n_fft", 400),
+        hop_length=audio_value("hop_length", 160),
+        chunk_seconds=getattr(processor, "audio_chunk_seconds", 30),
+        encoder_downsample=getattr(processor, "audio_encoder_downsample", 4),
+        projector_downsample=getattr(processor, "audio_projector_downsample", 2),
+    )
     # JSON roundtrip rejects opaque runtime objects rather than stringifying them.
     return json.loads(_json({"format": FORMAT, "model_path": str(root), "metadata": metadata,
                            "shards": shards,
                            "audio_preprocessor": processor.audio_preprocessor,
+                           "audio_chunking": audio_chunking,
                            "image_processor": image_cfg, "audio_execution": "single_chunk_bf16_v1",
                            "vision_execution": "single_image_hf_bf16_eager_q128_v1",
                            # A source-only change must not adopt a frames-as-images

@@ -63,7 +63,8 @@ def check(model_path, *, native=False):
         if native:
             verify_native(proc, clip, inputs, config)
         outputs.append({"frames": count, "grid": grid.tolist(), "old_visual_tokens": old_tokens,
-                        "paired_visual_tokens": new_tokens, "native_boundaries_checked": native})
+                        "paired_visual_tokens": new_tokens, "native_boundaries_checked": native,
+                        "native_prompt_updates_checked": native})
     print(json.dumps({"status": "PASS", "checkpoint": str(Path(model_path).resolve()),
                       "checks": outputs, "weights_loaded": False}, ensure_ascii=False, indent=2))
 
@@ -93,23 +94,64 @@ def verify_native(proc, clip, inputs, config):
 
     ids = inputs["input_ids"][0].tolist()
     grid = inputs["video_grid_thw"][0]
-    # Real PromptReplacement expansion is exercised by CPU integration tests;
-    # this verifies the installed tokenizer agrees with the shared rendering.
+    # Check the installed tokenizer before exercising native prompt updates.
     rendered = video_placeholder(grid, proc.spatial_merge_size)
     assert tokenizer_ids(proc.tokenizer, rendered) == ids
-    feature = SimpleNamespace(modality="video", data={"video_grid_thw": SimpleNamespace(data=grid)},
-                              mm_position=SimpleNamespace(offset=0, length=len(ids)))
     model_cls = native.MiniCPMO50OmniLLMForConditionalGeneration
     model = SimpleNamespace(config=config, vision_start_token_id=proc.vision_start_token_id,
                             vision_end_token_id=proc.vision_end_token_id, video_token_id=proc.video_token_id)
     model._q36_iter_mm_grid_hw = MethodType(model_cls._q36_iter_mm_grid_hw, model)
-    actual_positions, actual_delta = model_cls.get_mrope_input_positions(model, ids, [feature])
     expected_positions, expected_delta = proc.get_rope_index(
         input_ids=inputs["input_ids"], video_grid_thw=inputs["video_grid_thw"],
         attention_mask=inputs["attention_mask"],
     )
-    torch.testing.assert_close(actual_positions.cpu(), expected_positions[:, 0].cpu(), rtol=0, atol=0)
-    assert actual_delta == int(expected_delta.reshape(-1)[0])
+    for position in _native_video_ranges(proc, native, config, grid, ids):
+        feature = SimpleNamespace(modality="video", data={"video_grid_thw": SimpleNamespace(data=grid)},
+                                  mm_position=position)
+        actual_positions, actual_delta = model_cls.get_mrope_input_positions(model, ids, [feature])
+        torch.testing.assert_close(actual_positions.cpu(), expected_positions[:, 0].cpu(), rtol=0, atol=0)
+        assert actual_delta == int(expected_delta.reshape(-1)[0])
+
+
+def _native_video_ranges(proc, native, config, grid, expected_ids):
+    """Use the installed prompt updater, including any active compatibility patches.
+
+    Hand-constructed offset/length pairs cannot detect failed replacements or a
+    legacy fallback that sums disjoint pad runs and drops the embedding mask.
+    No processor constructor, engine, or model weights are needed here.
+    """
+    boundary = object.__new__(native.MiniCPMO50OmniLLMMultiModalProcessor)
+    boundary.info = SimpleNamespace(
+        get_hf_config=lambda: config,
+        get_tokenizer=lambda: proc.tokenizer,
+        audio_pattern="(<audio>./</audio>)",
+        ctx=SimpleNamespace(model_config=SimpleNamespace(model=config._name_or_path)),
+    )
+    out = {"video": [{"video_grid_thw": SimpleNamespace(data=grid)}]}
+    updates = boundary._get_prompt_updates({}, {}, out)
+    resolved = boundary._bind_and_group_updates(updates, {"video": 1})
+    cases = [(target, tokenizer_ids(proc.tokenizer, target))
+             for target in (native.Q36_VIDEO_PLACEHOLDER, VIDEO_PATTERN)]
+    cases.append(("preexpanded", list(expected_ids)))
+    for target, source_ids in cases:
+        ids, placeholders = boundary._apply_prompt_updates(source_ids, resolved)
+        if list(ids) != expected_ids:
+            raise AssertionError(f"Native video prompt update differs from training for target {target!r}")
+        videos = placeholders.get("video", [])
+        if len(videos) != 1:
+            raise AssertionError(f"Native video prompt update returned {len(videos)} items instead of one")
+        position = videos[0].to_range()
+        if position.offset != 0 or position.length != len(ids):
+            raise AssertionError(
+                f"Native video placeholder lost temporal boundaries: offset={position.offset} "
+                f"length={position.length}, expected offset=0 length={len(ids)}"
+            )
+        mask = getattr(position, "is_embed", None)
+        if mask is None:
+            raise AssertionError("Native video placeholder lost its embedding mask")
+        expected_mask = torch.tensor(ids) == proc.video_token_id
+        torch.testing.assert_close(torch.as_tensor(mask).cpu(), expected_mask, rtol=0, atol=0)
+        yield position
 
 
 def tokenizer_ids(tokenizer, text):

@@ -9,6 +9,7 @@ from types import ModuleType, SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+import numpy as np
 import torch
 from safetensors.torch import save_file
 
@@ -177,6 +178,90 @@ class PrecomputeTests(unittest.TestCase):
         self.assertEqual(encoders.calls, ["audio", "vision"])
         result = cli.process_row(row, FakeProcessor(), self.cache, verify_only=True)
         self.assertEqual(result["reused"], 2)
+
+    def test_real_processor_short_tail_populates_and_verifies_identical_audio_cache(self):
+        processor_module = importlib.import_module(f"{PACKAGE}.processor")
+        frontend_inputs = []
+
+        def extract_fbank(waveform):
+            frontend_inputs.append(waveform.copy())
+            # Keep the native framing contract while making the test feature
+            # depend on every frame's waveform, including the padded tail.
+            windows = torch.from_numpy(waveform.copy()).unfold(0, 400, 160)
+            feature = windows.mean(dim=-1).unsqueeze(0).repeat(40, 1)
+            return feature, windows.shape[0]
+
+        processor = processor_module.HuanyuProcessor(
+            SimpleNamespace(encode=lambda token, **kwargs: [1]), None,
+            SimpleNamespace(extract_fbank=extract_fbank),
+            SimpleNamespace(text_config={"hidden_size": 6}),
+            {"feature_size": 40, "sampling_rate": 16000},
+        )
+
+        class RecordingEncoders(FakeEncoders):
+            def __init__(self):
+                super().__init__()
+                self.audio_inputs = []
+
+            def audio(self, feature, length):
+                self.calls.append("audio")
+                self.audio_inputs.append((feature.clone(), length))
+                tokens = ((length + 3) // 4) // 2
+                return torch.arange(1, tokens * 6 + 1, dtype=torch.float32).reshape(tokens, 6)
+
+        for size, lengths, tokens in (
+            (480749, [2998, 8], [375, 1]),
+            (960749, [2998, 2998, 8], [375, 375, 1]),
+            (749, [8], [1]),
+            (1040, [5], [1]),
+        ):
+            with self.subTest(samples=size):
+                frontend_inputs.clear()
+                waveform = np.linspace(-0.9, 0.9, size, dtype=np.float32)
+                original = waveform.copy()
+                row = {"audios": [waveform]}
+                cache_root = self.root / f"short-tail-{size}"
+                cache = cli.HuanyuEmbeddingCache(cache_root, {"model": "huanyu"}, create=True)
+                encoders = RecordingEncoders()
+                result = cli.process_row(row, processor, cache, encoders)
+                self.assertEqual(result, {"audio": len(lengths), "vision": 0,
+                                          "created": len(lengths), "reused": 0})
+                self.assertEqual([length for _, length in encoders.audio_inputs], lengths)
+                self.assertEqual([len(chunk) for chunk in frontend_inputs],
+                                 [480000] * (size // 480000) + [1520 if size % 480000 < 1040 else 1040])
+                processed = np.concatenate(frontend_inputs)
+                np.testing.assert_array_equal(processed[:size], original)
+                np.testing.assert_array_equal(processed[size:], np.zeros(len(processed) - size, np.float32))
+                np.testing.assert_array_equal(waveform, original)
+                for (feature, length), token_count, chunk in zip(
+                    encoders.audio_inputs, tokens, frontend_inputs, strict=True,
+                ):
+                    self.assertEqual(tuple(feature.shape), (40, length))
+                    expected_frames = torch.from_numpy(chunk).unfold(0, 400, 160).mean(dim=-1)
+                    torch.testing.assert_close(feature, expected_frames.unsqueeze(0).repeat(40, 1))
+                    key = cli.audio_key(feature, length)
+                    embedding = cache.get("audio", key, expected_tokens=token_count, hidden_size=6)
+                    self.assertEqual(tuple(embedding.shape), (token_count, 6))
+                    self.assertEqual(embedding.dtype, torch.bfloat16)
+                before = {path.relative_to(cache_root): path.read_bytes()
+                          for path in cache_root.rglob("*") if path.is_file()}
+                for verify_only in (False, True):
+                    result = cli.process_row(row, processor, cache, encoders, verify_only=verify_only)
+                    self.assertEqual(result, {"audio": len(lengths), "vision": 0,
+                                              "created": 0, "reused": len(lengths)})
+                self.assertEqual(encoders.calls, ["audio"] * len(lengths))
+                after = {path.relative_to(cache_root): path.read_bytes()
+                         for path in cache_root.rglob("*") if path.is_file()}
+                self.assertEqual(before, after)
+
+        encoders = RecordingEncoders()
+        before = {path.relative_to(self.cache.root): path.read_bytes()
+                  for path in self.cache.root.rglob("*") if path.is_file()}
+        with self.assertRaisesRegex(ValueError, "empty"):
+            cli.process_row({"audios": [np.zeros(0, np.float32)]}, processor, self.cache, encoders)
+        self.assertEqual(encoders.calls, [])
+        self.assertEqual(before, {path.relative_to(self.cache.root): path.read_bytes()
+                                 for path in self.cache.root.rglob("*") if path.is_file()})
 
     def test_verify_missing_never_encodes(self):
         encoders = FakeEncoders()

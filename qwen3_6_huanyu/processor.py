@@ -15,6 +15,8 @@ import types
 import numpy as np
 import torch
 
+from .audio_chunking import AUDIO_CHUNK_POLICY, prepare_audio_waveform
+
 
 IMAGE_PATTERN = "(<image>./</image>)"
 AUDIO_PATTERN = "(<audio>./</audio>)"
@@ -45,8 +47,9 @@ class HuanyuProcessor:
 
     Images keep Qwen spatial grids; videos pair adjacent frames before encoding.
     Audio placeholders
-    are expanded per 30-second chunk, using real frame lengths, then rescanned
+    are expanded per 30-second chunk, using processed frame lengths, then rescanned
     from the actual token IDs when the training batch is assembled.
+    A nonempty zero-token tail is extended with silence to one full token group.
     """
 
     _huanyu_training_processor = True
@@ -134,17 +137,26 @@ class HuanyuProcessor:
         if int(sampling_rate) != self.sampling_rate:
             raise ValueError(f"Huanyu expects {self.sampling_rate} Hz waveforms, got {sampling_rate}")
         features, lengths, groups = [], [], []
-        for source in _items(audios):
-            waveform = np.asarray(source, dtype=np.float32)
-            if waveform.ndim != 1 or not np.isfinite(waveform).all():
-                raise ValueError("Huanyu audio must be a finite mono waveform [samples]")
+        for source_index, source in enumerate(_items(audios)):
+            waveform, plan = prepare_audio_waveform(
+                source, sampling_rate=self.sampling_rate, n_fft=self.n_fft, hop_length=self.hop_length,
+                chunk_seconds=self.audio_chunk_seconds, encoder_downsample=self.audio_encoder_downsample,
+                projector_downsample=self.audio_projector_downsample,
+            )
+            padding = sum(part.padding_samples for part in plan)
+            if padding:
+                from .training_logging import get_training_logger
+
+                get_training_logger(__name__).info(
+                    "[huanyu-audio-padding] policy=%s source_index=%d original_samples=%d "
+                    "added_samples=%d tail_frames=%d tail_tokens=%d",
+                    AUDIO_CHUNK_POLICY, source_index, len(waveform) - padding,
+                    padding, plan[-1].frames, plan[-1].tokens,
+                )
             tokens = []
-            for offset in range(0, len(waveform), 30 * self.sampling_rate):
-                chunk = waveform[offset:offset + 30 * self.sampling_rate]
-                frames = (len(chunk) - self.n_fft) // self.hop_length + 1
-                count = ((frames + 3) // 4) // 2
-                if frames < 1 or count < 1:
-                    raise ValueError("Huanyu audio chunk is too short to produce a token; no tail was dropped")
+            for part in plan:
+                chunk = waveform[part.offset:part.offset + part.processed_samples]
+                frames, count = part.frames, part.tokens
                 feat, actual_frames = self.audio_frontend.extract_fbank(chunk)
                 if tuple(feat.shape) != (self.feature_size, frames) or int(actual_frames) != frames:
                     raise ValueError(f"Huanyu frontend returned {tuple(feat.shape)}, expected {(self.feature_size, frames)}")
@@ -153,8 +165,6 @@ class HuanyuProcessor:
                 features.append(feat.float().contiguous())
                 lengths.append(frames)
                 tokens.append(count)
-            if not tokens:
-                raise ValueError("Huanyu audio waveform is empty")
             groups.append(tokens)
         return features, torch.tensor(lengths, dtype=torch.long), groups
 

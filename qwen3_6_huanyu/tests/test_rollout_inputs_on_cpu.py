@@ -8,13 +8,21 @@ import importlib.util
 import inspect
 from io import StringIO
 from pathlib import Path
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 import unittest
+from unittest.mock import Mock, patch
+
+import numpy as np
 
 
 _PATH = Path(__file__).resolve().parents[1] / "rollout_inputs.py"
-_SPEC = importlib.util.spec_from_file_location("huanyu_rollout_inputs_tested", _PATH)
+_PACKAGE = ModuleType("huanyu_rollout_inputs_tested")
+_PACKAGE.__path__ = [str(_PATH.parent)]
+sys.modules[_PACKAGE.__name__] = _PACKAGE
+_SPEC = importlib.util.spec_from_file_location(f"{_PACKAGE.__name__}.rollout_inputs", _PATH)
 rollout = importlib.util.module_from_spec(_SPEC)
+sys.modules[_SPEC.name] = rollout
 _SPEC.loader.exec_module(rollout)
 
 
@@ -70,7 +78,7 @@ class RolloutInputsTest(unittest.TestCase):
         )
         self.assertEqual(actual, [100, 101, 7, 200, 201, 8, 100, 101])
 
-    def test_audio_counts_lengths_and_short_tail_fail(self):
+    def test_audio_counts_lengths_and_missing_short_tail_span_fail(self):
         for ids, media in (
             (audio_span(11), {"audio": [Waveform(16000)]}),
             (audio_span(12), {"audio": [Waveform(31 * 16000)]}),
@@ -81,6 +89,139 @@ class RolloutInputsTest(unittest.TestCase):
         ):
             with self.subTest(ids_count=len(ids), media=media), self.assertRaises(ValueError):
                 rollout.contract_rollout_prompt(Processor(), ids, media)
+
+    def test_short_tails_keep_one_original_audio_item_and_have_real_token_spans(self):
+        for whole_chunks in (0, 1, 2):
+            for tail in (1, 6, 58, 749, 833, 1039):
+                with self.subTest(whole_chunks=whole_chunks, tail=tail):
+                    waveform = Waveform(whole_chunks * 480000 + tail)
+                    spans = audio_span(375) * whole_chunks + audio_span(1)
+                    actual = rollout.contract_rollout_prompt(Processor(), spans, {"audio": [waveform]})
+                    self.assertEqual(actual, [200, 201])
+
+    def test_video_server_installs_native_hooks_before_dispatch_and_only_once(self):
+        class VideoProcessor(Processor):
+            video_token_id = 13
+            spatial_merge_size = 2
+            tokenizer = SimpleNamespace(encode=lambda text, **kw: {
+                "(<image>./</image>)": [100, 101], "(<audio>./</audio>)": [200, 201],
+                "(<video>./</video>)": [300, 301],
+            }[text])
+
+            def _video(self, videos):
+                return {"video_grid_thw": [np.array([2, 2, 2])]}
+
+        events = []
+
+        class Server:
+            def _preprocess_input(self, prompt_ids, multi_modal_data):
+                events.append("dispatch")
+                return prompt_ids, multi_modal_data
+
+        rollout._install_on_server_class(Server)
+        server = Server()
+        server.model_config = SimpleNamespace(processor=VideoProcessor())
+        server._ar_mode = True
+        module = ModuleType(_PACKAGE.__name__ + ".video_rollout")
+        module.install_huanyu_video_rollout = Mock(side_effect=lambda: events.append("install"))
+        media = {"video": [object()]}
+        with patch.dict(sys.modules, {module.__name__: module}):
+            for _ in range(2):
+                ids, forwarded = server._preprocess_input([10, 13, 11] * 2, media)
+                self.assertEqual(ids, [300, 301])
+                self.assertIs(forwarded, media)
+        self.assertEqual(events, ["install", "dispatch", "dispatch"])
+        module.install_huanyu_video_rollout.assert_called_once_with()
+        # A failed installation must never dispatch to an unpatched server.
+        server._huanyu_video_hooks_ready = False
+        module.install_huanyu_video_rollout.side_effect = RuntimeError("unsupported native hooks")
+        with patch.dict(sys.modules, {module.__name__: module}), self.assertRaisesRegex(RuntimeError, "native hooks"):
+            server._preprocess_input([10, 13, 11] * 2, media)
+        self.assertEqual(events, ["install", "dispatch", "dispatch"])
+        self.assertFalse(server._huanyu_video_hooks_ready)
+
+    def test_server_forwards_padded_short_tail_without_mutating_shared_requests(self):
+        class Server:
+            def _preprocess_input(self, prompt_ids, sampling_params, multi_modal_data):
+                return prompt_ids, sampling_params, multi_modal_data
+
+        rollout._install_on_server_class(Server)
+        server = Server()
+        server.model_config = SimpleNamespace(processor=Processor())
+        server._ar_mode = True
+        source = np.arange(960006, dtype=np.float32)
+        source_before = source.copy()
+        rate = np.int64(16000)
+        item = (source, rate)
+        untouched = np.zeros(16000, dtype=np.float32)
+        audios = [item, untouched]
+        images = [object()]
+        media = UserDict(audio=audios, image=images, request_metadata=object())
+        ids = [10, 12, 11] + audio_span(375) * 2 + audio_span(1) + audio_span(12)
+        params = {"max_tokens": 17}
+        result = server._preprocess_input(ids, params, media)
+        forwarded = result[2]
+        self.assertEqual(result[0], [100, 101, 200, 201, 200, 201])
+        self.assertIs(result[1], params)
+        self.assertIsNot(forwarded, media)
+        self.assertIsNot(forwarded["audio"], audios)
+        self.assertIs(forwarded["image"], images)
+        self.assertIs(forwarded["request_metadata"], media["request_metadata"])
+        self.assertIs(forwarded["audio"][0][1], rate)
+        self.assertIs(forwarded["audio"][1], untouched)
+        padded = forwarded["audio"][0][0]
+        self.assertEqual(padded.shape, (961520,))
+        np.testing.assert_array_equal(padded[:len(source)], source_before)
+        np.testing.assert_array_equal(padded[len(source):], 0)
+        self.assertEqual(rollout._audio_chunk_lengths(forwarded["audio"][0], Processor()), [375, 375, 1])
+        self.assertIs(media["audio"], audios)
+        self.assertIs(audios[0], item)
+        np.testing.assert_array_equal(source, source_before)
+        # A second generation can reuse the already-prepared request unchanged.
+        repeated = server._preprocess_input(ids, params, forwarded)
+        self.assertIs(repeated[2], forwarded)
+
+    def test_async_server_forwards_short_audio_preserving_tuple_container_and_rate(self):
+        class Server:
+            async def generate(self, prompt_ids, image_data=None, audio_data=None, video_data=None):
+                return prompt_ids, image_data, audio_data, video_data
+
+        rollout._install_on_server_class(Server)
+        server = Server()
+        server.model_config = SimpleNamespace(processor=Processor())
+        server._ar_mode = True
+        source = np.ones(833, dtype=np.float32)
+        audios = ((source, 16000),)
+        images = [object()]
+        result = asyncio.run(server.generate([10, 12, 11] + audio_span(1), images, audios))
+        self.assertEqual(result[0], [100, 101, 200, 201])
+        self.assertIs(result[1], images)
+        self.assertIsInstance(result[2], tuple)
+        self.assertIsNot(result[2], audios)
+        self.assertEqual(result[2][0][1], 16000)
+        padded = result[2][0][0]
+        self.assertEqual(padded.shape, (1520,))
+        np.testing.assert_array_equal(padded[:833], source)
+        np.testing.assert_array_equal(padded[833:], 0)
+        self.assertIs(audios[0][0], source)
+        self.assertEqual(len(source), 833)
+        self.assertIsNone(result[3])
+
+    def test_existing_positive_token_tails_keep_waveform_and_container_identity(self):
+        for tail in (1040, 1520, 16000):
+            with self.subTest(tail=tail):
+                waveform = np.zeros(480000 + tail, dtype=np.float32)
+                item = (waveform, 16000)
+                media = {"audio": [item]}
+                self.assertIs(rollout._prepare_audio_media(Processor(), media), media)
+                self.assertIs(media["audio"][0], item)
+                self.assertIs(item[0], waveform)
+
+    def test_invalid_short_audio_is_not_hidden_by_zero_padding(self):
+        for waveform in (np.array([], dtype=np.float32), np.array([np.nan]), np.array([np.inf]),
+                         np.array([1j]), np.ones((2, 3))):
+            with self.subTest(waveform=waveform), self.assertRaises((TypeError, ValueError)):
+                rollout._prepare_audio_media(Processor(), {"audio": [waveform]})
 
     def test_malformed_or_missing_image_markers_fail(self):
         for ids, media in (

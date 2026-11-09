@@ -11,7 +11,7 @@ from pathlib import Path
 import sys
 import tempfile
 import threading
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
@@ -485,6 +485,61 @@ class CacheTests(unittest.TestCase):
             runtime.load_huanyu_native.assert_not_called()
             (model / "config.json").write_text('{"model_type":"qwen3_5_moe","revision":2}')
             self.assertNotEqual(first, cache_module.make_cache_contract(model, processor))
+
+    def test_short_tail_policy_invalidates_legacy_cache_even_with_source_compatibility(self):
+        model = self.root / "audio-policy-model"
+        model.mkdir()
+        (model / "config.json").write_text('{"model_type":"qwen3_5_moe"}')
+        save_file({"model.audio_encoder.weight": torch.ones(1, 1)}, str(model / "model.safetensors"))
+        processor = SimpleNamespace(
+            audio_preprocessor={"feature_size": 40},
+            image_processor=SimpleNamespace(to_dict=lambda: {"patch_size": 16}),
+        )
+        current = cache_module.make_cache_contract(model, processor)
+        self.assertIn("audio_chunking", current)
+        for legacy_sources in (False, True):
+            with self.subTest(legacy_sources=legacy_sources):
+                old = {key: value for key, value in current.items() if key != "audio_chunking"}
+                if legacy_sources:
+                    old["sources"] = {"processor.py": {"size": 7, "sha256": "a" * 64}}
+                root = self.root / f"audio-before-tail-fix-{legacy_sources}"
+                cache_module.HuanyuEmbeddingCache(root, old, create=True)
+                manifest = root / "manifest.json"
+                before = manifest.read_bytes()
+                payload = json.loads(before)
+                self.assertFalse(cache_module._source_compatible(payload, current))
+                for create in (False, True):
+                    with self.assertRaisesRegex(ValueError, "audio_chunking"):
+                        cache_module.HuanyuEmbeddingCache(root, current, create=create)
+                self.assertEqual(manifest.read_bytes(), before)
+
+    def test_audio_chunking_identity_tracks_effective_runtime_parameters(self):
+        model = self.root / "audio-parameters-model"
+        model.mkdir()
+        (model / "config.json").write_text('{"model_type":"qwen3_5_moe"}')
+        save_file({"model.audio_encoder.weight": torch.ones(1, 1)}, str(model / "model.safetensors"))
+        processor = SimpleNamespace(
+            audio_preprocessor={"feature_size": 40, "sampling_rate": 16000, "n_fft": 400, "hop_length": 160},
+            image_processor=SimpleNamespace(to_dict=lambda: {"patch_size": 16}),
+        )
+        baseline = cache_module.make_cache_contract(model, processor)
+        mutations = {
+            "sampling_rate": 8000, "n_fft": 512, "hop_length": 128,
+            "audio_chunk_seconds": 20, "audio_encoder_downsample": 8, "audio_projector_downsample": 4,
+        }
+        for name, value in mutations.items():
+            with self.subTest(parameter=name):
+                setattr(processor, name, value)
+                changed = cache_module.make_cache_contract(model, processor)
+                self.assertNotEqual(baseline["audio_chunking"], changed["audio_chunking"])
+                self.assertFalse(cache_module._source_compatible(cache_module._manifest_payload(baseline), changed))
+                delattr(processor, name)
+        # Older adapters can expose FFT parameters only on the frontend.
+        processor.audio_frontend = SimpleNamespace(n_fft=512)
+        frontend_only = cache_module.make_cache_contract(model, processor)
+        self.assertNotEqual(baseline["audio_chunking"], frontend_only["audio_chunking"])
+        processor.n_fft = 400
+        self.assertEqual(baseline["audio_chunking"], cache_module.make_cache_contract(model, processor)["audio_chunking"])
 
 
 if __name__ == "__main__":

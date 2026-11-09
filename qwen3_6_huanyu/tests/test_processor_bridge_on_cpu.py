@@ -112,12 +112,48 @@ class HuanyuProcessorTests(unittest.TestCase):
         rendered = proc.apply_chat_template(messages)
         self.assertEqual(rendered, processor_module.AUDIO_PATTERN + "\n" + processor_module.AUDIO_PATTERN)
 
-    def test_short_audio_tail_and_wrong_rate_are_rejected(self):
+    def test_short_tail_is_encoded_and_keeps_original_samples(self):
         proc = processor()
-        with self.assertRaisesRegex(ValueError, "too short"):
-            proc(processor_module.AUDIO_PATTERN, audios=[np.zeros(30 * 16000 + 200, np.float32)])
+        original = np.linspace(-0.5, 0.5, 960749, dtype=np.float32)
+        before = original.copy()
+        chunks = []
+
+        def extract(waveform):
+            chunks.append(waveform.copy())
+            return Frontend().extract_fbank(waveform)
+
+        proc.audio_frontend = SimpleNamespace(extract_fbank=extract)
+        data = proc(processor_module.AUDIO_PATTERN, audios=[original])
+        self.assertEqual(data["huanyu_audio_lengths"].tolist(), [2998, 2998, 8])
+        self.assertEqual(data["huanyu_audio_chunk_counts"].tolist(), [3])
+        self.assertEqual(data["huanyu_audio_bounds"].diff(dim=-1).flatten().tolist(), [375, 375, 1])
+        self.assertEqual([len(chunk) for chunk in chunks], [480000, 480000, 1520])
+        np.testing.assert_array_equal(np.concatenate(chunks)[:len(before)], before)
+        np.testing.assert_array_equal(chunks[-1][749:], np.zeros(771, np.float32))
+        np.testing.assert_array_equal(original, before)
+
+        rebuilt = proc.build_multi_modal_inputs(data["input_ids"], {"audios": [original]})
+        torch.testing.assert_close(rebuilt["huanyu_audio_bounds"], data["huanyu_audio_bounds"])
+        torch.testing.assert_close(rebuilt["huanyu_audio_lengths"], data["huanyu_audio_lengths"])
+        for actual, expected in zip(rebuilt["huanyu_audio_features"], data["huanyu_audio_features"], strict=True):
+            torch.testing.assert_close(actual, expected)
+
+    def test_short_audio_padding_does_not_hide_invalid_inputs(self):
+        proc = processor()
+        for waveform in (np.zeros(0, np.float32), np.array([np.nan]), np.array([np.inf]),
+                         np.zeros((2, 200), np.float32)):
+            with self.subTest(shape=waveform.shape), self.assertRaises(ValueError):
+                proc(processor_module.AUDIO_PATTERN, audios=[waveform])
         with self.assertRaisesRegex(ValueError, "16000"):
             proc(processor_module.AUDIO_PATTERN, audios=[np.zeros(16000, np.float32)], sampling_rate=48000)
+
+    def test_short_standalone_audio_and_two_media_items_keep_distinct_spans(self):
+        proc = processor()
+        data = proc(processor_module.AUDIO_PATTERN * 2,
+                    audios=[np.ones(6, np.float32), np.ones(16000, np.float32)])
+        self.assertEqual(data["huanyu_audio_lengths"].tolist(), [8, 98])
+        self.assertEqual(data["huanyu_audio_chunk_counts"].tolist(), [2])
+        self.assertEqual(data["huanyu_audio_bounds"].diff(dim=-1).flatten().tolist(), [1, 12])
 
     def test_feature_width_mismatch_never_falls_back_to_whisper(self):
         proc = processor()
