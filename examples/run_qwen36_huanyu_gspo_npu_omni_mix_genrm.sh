@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # OmniMix + independent GenRM pool. Defaults: Actor16 + GenRM16, TP4.
 # Adds dataset/reward settings, then invokes the single Huanyu training backend.
+# Requires a prepared environment and running Ray; never installs packages or
+# sources CANN/ATB setup. Run/source prepare_huanyu_env.sh first, or use a job entry.
 # Caller Hydra overrides follow these defaults; Huanyu model/precision policy
 # is enforced by the final backend. See ../README.md.
 set -eo pipefail

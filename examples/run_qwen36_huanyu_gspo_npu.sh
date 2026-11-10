@@ -292,14 +292,9 @@ _HUANYU_MODEL_ARGS=(
     "++ray_kwargs.ray_init.runtime_env.env_vars.HUANYU_VLLM_SOURCE=${_huanyu_ray_native_root}"
 )
 echo "[huanyu] adapter=Qwen36HuanyuForTraining dataset=Qwen36HuanyuOmniRLHFDataset pipeline=qwen3_6_huanyu; freeze_audio=${HUANYU_FREEZE_AUDIO:-true} precompute=${HUANYU_USE_PRECOMPUTE:-0} length_filter=${FILTER_OVERLONG}"
-case "${HUANYU_SKIP_EDITABLE_INSTALL:-0}" in
-    0)
-        git config --global --add safe.directory "${EXT_ROOT}" || exit $?
-        python3 -m pip install -e "${EXT_ROOT}" --no-deps --no-build-isolation || exit $?
-        ;;
-    1) echo '[huanyu-setup] using installed plugin; editable installation skipped' ;;
-    *) echo 'FATAL: HUANYU_SKIP_EDITABLE_INSTALL must be 0 or 1' >&2; exit 2 ;;
-esac
+# Training only: prepare_huanyu_env.sh owns installation and CANN/ATB setup.
+# Even the legacy HUANYU_SKIP_EDITABLE_INSTALL=0 cannot trigger an install here.
+echo '[huanyu-setup] using prepared environment; no package installation'
 python3 -B "${EXT_ROOT}/verl_omni_ext/models/qwen3_6_huanyu/runtime_imports.py" --check
 
 export CPATH=/usr/include${CPATH:+:$CPATH}
@@ -363,9 +358,6 @@ export RAY_USAGE_STATS_ENABLED=0
 
 export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
 
-ASCEND_HOME_PATH=${ASCEND_HOME_PATH:-/usr/local/Ascend/cann-9.0.0}
-source "${ASCEND_HOME_PATH}/set_env.sh"
-source "${ASCEND_HOME_PATH}/../nnal/atb/set_env.sh"
 
 set -eo pipefail
 
@@ -576,7 +568,7 @@ assert any(
     ep.name == "qwen3_6_whisper"
     and ep.value == "verl_omni_ext.models.qwen3_6_whisper"
     for ep in entry_points(group="verl_omni.models")
-), "Qwen3.6 plugin entry point missing; install this checkout with python3 -m pip install -e . --no-deps --no-build-isolation"
+), "Qwen3.6 plugin entry point missing; run/source prepare_huanyu_env.sh in this Python environment before training"
 
 import verl_omni_ext  # 本脚本已 export VERL_USE_EXTERNAL_MODULES 含 verl_omni_ext → 自动 activate()
 from verl_omni.pipelines.model_base import OmniModelBase, OmniRolloutPipelineBase

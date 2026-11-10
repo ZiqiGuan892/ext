@@ -1,14 +1,14 @@
 # Huanyu 启动脚本与参数 Wiki
 
-更新：2026-11-09。以下说明对应精简后的本地脚本；历史实验结果见[适配与排障记录](HUANYU_ADAPTATION_AND_TROUBLESHOOTING_ZH.md)，不要把历史配置当作当前默认值。
+更新：2026-11-10。以下说明对应精简后的本地脚本；历史实验结果见[适配与排障记录](HUANYU_ADAPTATION_AND_TROUBLESHOOTING_ZH.md)，不要把历史配置当作当前默认值。
 
 ## 1. 目录、保留文件与职责
 
-本分支的 `examples/` 是独立脚本与 Wiki 发布包，含以下 **10 个启动/辅助文件**。服务器运行目录为 `$PROJECT_ROOT/examples/qwen3_6_huanyu/`；模型适配、预计算和诊断代码使用完整工程中的 `verl_omni_ext/models/qwen3_6_huanyu/`。
+本分支的 `examples/` 是独立脚本与 Wiki 发布包，含以下 **11 个启动/辅助文件**。服务器运行目录为 `$PROJECT_ROOT/examples/qwen3_6_huanyu/`；模型适配、预计算和诊断代码使用完整工程中的 `verl_omni_ext/models/qwen3_6_huanyu/`。
 
 | 文件 | 职责与执行位置 |
 |---|---|
-| `prepare_huanyu_env.sh` | 每节点准备环境；`source` 后应用环境，`--start-ray` 同时拉起并检查 Ray |
+| `prepare_huanyu_env.sh` | 集中管理 editable/依赖安装、jemalloc、站点环境及 CANN/ATB；`source` 后应用环境，`--start-ray` 同时拉起并检查 Ray |
 | `start_huanyu_ray.sh` | 已准备环境时，每节点只启动/复用 Ray；`--check` 做 GCS 资源检查 |
 | `prepared_env.py` | 环境快照、差异与 activation 文件生成；由 prepare 调用 |
 | `job_bootstrap.py` | 部署/节点解析、NPU 检查、GCS 等待、AQA 数据预检等辅助命令 |
@@ -18,6 +18,7 @@
 | `run_huanyu_aqa_audio_train.sh` | 已有环境/Ray 的 AQA 入口，音频冻结/解冻和数据预检 |
 | `run_qwen36_huanyu_gspo_npu_omni_mix_genrm.sh` | OmniMix 参数；按奖励模式配置 GenRM 独立池或规则评分 |
 | `run_qwen36_huanyu_gspo_npu.sh` | 最终训练后端：Huanyu adapter、预检、参数汇总和 `python -m verl_omni.trainer.main_omni` |
+| `run_huanyu_train.sh` | 已有环境/Ray 的单文件训练入口；按功能集中列出配置及中文行内注释，直接调用 Python 训练模块 |
 
 原 `run_huanyu.sh`、`run_qwen36_huanyu_32card.sh` 的职责并入最后两个后端；graph、precision、原生源码选择和运行日志初始化不再依赖独立 `.sh` 文件。其他专用 wrapper、AB/serve CLI、转换工具不再放在 examples。下列通用入口加参数替代专用训练 wrapper。
 
@@ -34,6 +35,7 @@ start_huanyu_ray.sh
   └─ job_bootstrap.py：解析节点、等待 head/集群
 
 run_huanyu_32card_job.sh（两节点各执行一次，head 分流训练）
+  ├─ prepare_huanyu_env.sh 的准备函数：安装、allocator、站点/CANN/ATB 环境
   ├─ frozen_cache → run_qwen36_huanyu_gspo_npu_omni_mix_genrm.sh
   ├─ aqa_unfreeze → run_huanyu_aqa_audio_train.sh
   └─ stem → run_huanyu_stem.sh
@@ -49,9 +51,16 @@ run_huanyu_aqa_audio_train.sh / run_huanyu_stem.sh
 run_qwen36_huanyu_gspo_npu_omni_mix_genrm.sh
   └─ run_qwen36_huanyu_gspo_npu.sh
        └─ python3 -m verl_omni.trainer.main_omni
+
+run_huanyu_train.sh（已有环境/Ray，仅 head 执行）
+  └─ python3 -m verl_omni.trainer.main_omni
 ```
 
 `prepare --start-ray` 和独立 Ray 脚本共用启动策略，但 prepare 还会准备/验证 Python 环境、生成 activation，因此不是完全相同的操作。以上入口不依赖已经删除的六个 helper 文件。
+
+环境安装只有 `prepare_huanyu_env.sh` 一处实现。job 以内部 `--functions-only` 接口加载准备函数，不执行 prepare 的独立入口，所以不会递归启动。单独调用 prepare 仍复用 job 的仅准备模式做资源配置和检查，成功后生成 activation；两条路径都只执行一轮准备。
+
+训练入口（包括直接 `bash run_qwen36_huanyu_gspo_npu_omni_mix_genrm.sh`）只设置本次参数、自检并启动训练，不运行 pip/git 安装，也不再 source CANN/ATB 环境脚本。`HUANYU_SKIP_EDITABLE_INSTALL` 仅保留在 activation 中兼容旧部署；当前训练脚本不读取它，设为 `0` 也不会安装。缺少插件时自检失败，应先调用 prepare。
 
 ## 3. 部署与环境准备
 
@@ -66,7 +75,7 @@ cp /tmp/huanyu-examples/examples/*.sh "$SHELL_ROOT/"
 cp /tmp/huanyu-examples/examples/*.py "$SHELL_ROOT/"
 ```
 
-复制不会清理部署目录中历史遗留文件；部署时应以这 10 个文件的清单核对，整套更新。Python 包也要同步，不能只复制 shell 文件。
+复制不会清理部署目录中历史遗留文件；部署时应以这 11 个文件的清单核对，整套更新。Python 包也要同步，不能只复制 shell 文件。
 
 AQA 两节点准备并启动 Ray，在两个终端并行执行以下公共设置；主节点设 `VC_TASK_INDEX=0`，从节点设 `1`。将 IP 替换为当前作业的真实地址，列表顺序必须一致。
 
@@ -82,7 +91,9 @@ source "$SHELL_ROOT/prepare_huanyu_env.sh" --start-ray
 
 STEM 使用 `TOTAL_NPUS=16` 或 `32`，并执行 `source "$SHELL_ROOT/prepare_huanyu_env.sh" --stem --start-ray`；16 卡时 host 列表只有本机、节点数为 1。冻结缓存准备模式为 `HUANYU_JOB_MODE=frozen_cache`，需要可读且匹配的 `HUANYU_EMBED_CACHE_DIR/manifest.json`；prepare 不生成 embedding cache。
 
-站点环境如需额外配置，可设置 `HUANYU_ENV_FILE=/绝对路径/site_env.sh`；默认使用 common job 内置的环境准备，不再需要 examples 下的 env_export 文件。选定可运行训练依赖的 `python3` 后再准备，prepare 沿用当前终端的 Python/代理设置。
+站点环境如需额外配置，可设置 `HUANYU_ENV_FILE=/绝对路径/site_env.sh`；默认使用 prepare 内置的站点配置，不再需要 examples 下的 env_export 文件。安装和 CANN/ATB 初始化由 prepare 统一执行，自定义 site 文件无需再重复这些操作。选定可运行训练依赖的 `python3` 后再准备，prepare 沿用当前终端的 Python/代理设置。
+
+准备时使用同一个 `python3` 安装 ext（`pip install --no-build-isolation --no-deps -e "$PROJECT_ROOT"`）以及 `mathruler zarr`。本机已有 Ray 时跳过包安装，避免运行中的 worker 与磁盘环境不一致；仍应用站点配置并执行相应检查。普通 job 调用准备后启动训练；如果已经准备并激活环境、启动 Ray，可直接运行 mix/AQA 或 STEM 的 `--train-only`，无需再次安装依赖。
 
 Ray 配置：
 
@@ -102,6 +113,33 @@ Ray 配置：
 ## 4. 训练命令：先 export，再启动 job
 
 模型、数据、batch、吞吐和精度参数统一在 job 启动前 `export`。多节点时每个节点使用同一份参数，只有 `VC_TASK_INDEX` 不同。以下示例需要先按第3节设置 `PROJECT_ROOT`、`SHELL_ROOT` 和实际节点地址；不需要手改 shell 文件里的默认值。
+
+### 已有环境与 Ray：集中配置的单文件入口
+
+需要直接在脚本内查看或编辑参数时使用 `run_huanyu_train.sh`。它按路径、资源、数据、媒体、精度、通信、诊断、Actor、FSDP、rollout、奖励和训练调度分组，每项有中文行内注释；不再经过其他训练 wrapper，也不会准备环境、安装依赖或启停 Ray。默认通用 `data/train.parquet` / `validation.parquet`、2748、Actor16 + 独立 GenRM16、TP4、BS32/mini32/N4、prompt3072/response2048、full 精度、eager、冻结音频/视觉、在线编码且不使用 embedding 缓存。视频参数只作为数据行未指定时的回退值，沿用 OmniMix 的 fps=1、max_frames=8。
+
+新入口显式设置 microbatch=1 和 `huanyu_sync_each_microbatch=true`，以在多 microbatch 时同步分片梯度；Actor 参数精度仍默认 FP32，Ref/rollout/GenRM 默认 BF16。全部配置以本文件为准；它列出了该入口使用的覆盖项，没有展开框架的每一个内部默认字段。
+
+仅在 head 执行：
+
+```bash
+bash "$SHELL_ROOT/run_huanyu_train.sh"
+```
+
+可修改文件中的默认值、导出同名环境变量，或在命令末尾追加 Hydra 覆盖。关联长度、资源及精度开关建议通过脚本或环境变量设置，让派生值同步计算；`RAY_ADDRESS` 未设置时使用 `auto`，找不到已有集群会报错。默认日志位于 `$PROJECT_ROOT/runs/huanyu_<时间>_<PID>/console.log`。
+
+```bash
+# 只查看最终启动参数，不加载模型、不连接 Ray、不创建输出目录。
+bash "$SHELL_ROOT/run_huanyu_train.sh" --dry-run
+
+# 两个训练 step，演示环境变量和末尾 Hydra 参数覆盖。
+TRAIN_BATCH_SIZE=16 PPO_MINI_BATCH_SIZE=16 TOTAL_TRAINING_STEPS=2 \
+  bash "$SHELL_ROOT/run_huanyu_train.sh" actor_rollout_ref.rollout.max_num_seqs=16
+```
+
+`HUANYU_REWARD_MODE=rule_based` 会关闭独立 GenRM 池，按数据行 `data_source` 分派已有规则；数据集必须有对应 scorer。使用 forward profiler 仍需先按 [forward profiling 说明](docs/forward_profile.md) 安装钩子，再设置 `HUANYU_FORWARD_PROFILE_DIR`。
+
+GenRM 模式同时显式加载 `verl_omni_ext.models.qwen3_5_moe`（verl 适配器）和 `verl_omni_ext.models.qwen3_5_moe.vllm_omni`（原生 AR pipeline），并将模块列表写入本次 Ray runtime_env。原生 vLLM-Omni 必须支持当前安装约定的 `VLLM_OMNI_EXTERNAL_MODULES` 加载入口。若仍报 `Qwen3_5MoeForConditionalGeneration does not support request-level batching`，应检查报错进程的部署配置是否使用 `qwen3_5_moe_thinker_only`、stage 是否为 `llm_ar`，以及是否存在插件导入失败；降低 `max_num_seqs` 不能验证 AR pipeline 已正确选择。
 
 ### AQA：两节点各执行，Actor16 + GenRM16
 
