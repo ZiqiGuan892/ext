@@ -230,8 +230,11 @@ class StreamMetrics:
         require(self.usage is not None, "Missing final usage; token throughput cannot be measured")
         prompt_tokens = positive_int(self.usage.get("prompt_tokens"))
         completion_tokens = positive_int(self.usage.get("completion_tokens"))
-        require(prompt_tokens == input_tokens,
-                f"Server prompt_tokens={prompt_tokens}, expected {input_tokens}; tokenizer/chat template mismatch")
+        # Audio clients cannot infer the expanded multimodal token count from
+        # a text tokenizer. None means record positive server usage instead.
+        if input_tokens is not None:
+            require(prompt_tokens == input_tokens,
+                    f"Server prompt_tokens={prompt_tokens}, expected {input_tokens}; tokenizer/chat template mismatch")
         require(all(c["finish_reason"] is not None for c in self.choices.values()),
                 f"Not all {self.n} choices finished; n may be ignored by this backend")
         if fixed_output:
@@ -272,7 +275,12 @@ class StreamMetrics:
 def send_request(args, prompt, request_id, output_tokens=None):
     limit = args.output_tokens if output_tokens is None else output_tokens
     payload = make_payload(args, prompt, limit, seed=args.seed + request_id)
-    meter = StreamMetrics(args.n, args.timing_source)
+    return send_payload(args, payload, request_id, expected_input_tokens=args.input_tokens)
+
+
+def send_payload(args, payload, request_id, expected_input_tokens):
+    """Shared SSE transport; payload creation/file I/O precede request timing."""
+    meter = StreamMetrics(payload["n"], args.timing_source)
     start = time.perf_counter()
     try:
         # A session belongs to one request, not multiple concurrent threads.
@@ -291,7 +299,7 @@ def send_request(args, prompt, request_id, output_tokens=None):
                     if meter.done:
                         break
                 latency = time.perf_counter() - start
-        result = meter.finish(latency, args.input_tokens, limit, args.ignore_eos)
+        result = meter.finish(latency, expected_input_tokens, payload["max_tokens"], args.ignore_eos)
     except Exception as exc:
         result = {"success": False, "error": f"{type(exc).__name__}: {exc}",
                   "request_latency_s": time.perf_counter() - start,

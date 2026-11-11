@@ -158,6 +158,26 @@ def test_non_eager_and_nested_profiler_rejected(runtime, monkeypatch):
         run(r, runner)
 
 
+def test_audio_capture_requires_executed_encoder_and_projector(runtime):
+    r = runtime
+    runner = r.Runner()
+    r.arm.touch()
+    for _ in range(3):
+        run(r, runner)
+    # Runtime fixture has an audio encoder, but no projector.
+    with pytest.raises(RuntimeError, match="No audio projector calls captured"):
+        r.h.captures(r.root, expected=1, complete=True, require_audio=True)
+    state = getattr(runner, r.h.MARKER)
+    data = json.loads(state.manifest.read_text())
+    data["hits"]["serve/module/Linear/llm.audio_projection_layer::Projector/forward"] = 1
+    state.manifest.write_text(json.dumps(data))
+    r.h.captures(r.root, expected=1, complete=True, require_audio=True)
+    data["hits"] = {k: v for k, v in data["hits"].items() if "audio_encoder" not in k}
+    state.manifest.write_text(json.dumps(data))
+    with pytest.raises(RuntimeError, match="No audio encoder calls captured"):
+        r.h.captures(r.root, expected=1, complete=True, require_audio=True)
+
+
 def test_original_exception_survives_stop_failure_and_restores_all_wrappers(runtime):
     r = runtime
     runner = r.Runner()

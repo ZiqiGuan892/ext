@@ -6,6 +6,8 @@
 | 文件 | 用途 |
 | --- | --- |
 | `bench_throughput.py` | 精确输入长度、真实 usage 输出计数、按 choice 计算 TTFT/TPOT；支持预热后触发 profile |
+| `bench_audio_profile.py` | 真实 WAV 输入、不同音频预检/预热/采集、按服务端 usage 计数，n=1 |
+| `run_serve_audio_profile.sh` | TP=4 音频 eager 的 serve/request/status/check/analyse 入口 |
 | `prepare_benchmark_configs.py` | 前次吞吐 A/B 使用的配置生成工具，保留 TP、设备和容量参数 |
 | `serve_forward_profile.py` | 安装/卸载独立条件入口、生成 eager 配置、采集进度与完整性检查、离线解析 |
 | `serve_profile_report.py` | 汇总全部已导出设备算子、模块 CPU 时间与覆盖核对 |
@@ -14,6 +16,7 @@
 ## 运行说明
 
 - **当前 eager 全模块采集**：[完整命令及结果解释](docs/serve_forward_profile.md)。
+- **音频输入 TP=4 eager 采集**：[validation_vllm 启动与检查命令](docs/serve_audio_profile.md)。
 - **独立吞吐测量**：[指标定义、启动及压测命令](docs/serve_throughput.md)。
 
 命令针对已核对的 2748 单 stage 部署：vllm `0.28.0+empty`、
@@ -32,8 +35,8 @@ vllm-ascend `0.19.1rc2.dev2002+ge5118d151`、vllm-omni `0.28.0+npu`，
 
 ## CPU 验证
 
-依赖：`pytest`、`requests`、`PyYAML`。实际压测还需要服务环境的 `transformers`
-及 checkpoint tokenizer；NPU 采集和解析需要对应容器的 `torch_npu` 与 CANN。
+依赖：`pytest`、`requests`、`PyYAML`。纯文本压测还需要服务环境的 `transformers`
+及 checkpoint tokenizer；音频客户端无需 tokenizer。NPU 采集和解析需要对应容器的 `torch_npu` 与 CANN。
 
 从仓库根目录执行：
 

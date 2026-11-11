@@ -435,7 +435,7 @@ def edit_entry(path, remove=False):
     print(f"Updated: {path}\nBackup: {backup}")
 
 
-def captures(root, expected=None, complete=False):
+def captures(root, expected=None, complete=False, require_audio=False):
     records = [(p, json.loads(p.read_text(encoding="utf-8"))) for p in sorted(root.glob("serve_pid*_tp*.json"))
                if not p.name.endswith(".inventory.json")]
     if not records:
@@ -461,6 +461,19 @@ def captures(root, expected=None, complete=False):
                 issues.append(f"{path.name}: missing module/source inventory")
     if expected is not None and sorted(ranks) != list(range(expected)):
         issues.append(f"Expected one TP group with ranks 0..{expected - 1}; got {ranks}")
+    if require_audio:
+        # Some backends distribute media work across TP ranks. Require actual
+        # execution somewhere in the complete group, not on every rank.
+        patterns = {"encoder": r"(?:[/.])(?:apm|audio_encoder)(?:[.:/])",
+                    "projector": r"(?:[/.])(?:audio_projection_layer|audio_projection)(?:[.:/])"}
+        for component, pattern in patterns.items():
+            counts = {d["identity"]["tp_rank"]: sum(
+                count for label, count in (d.get("hits") or {}).items()
+                if label.startswith("serve/module/") and label.endswith("/forward") and re.search(pattern, label)
+            ) for _, d in records}
+            print(f"Audio {component} forward calls by TP rank: {counts}", flush=True)
+            if not sum(counts.values()):
+                issues.append(f"No audio {component} calls captured: check fresh audio, cache, window and inventory names")
     if issues:
         raise RuntimeError("\n".join(issues))
     return records
@@ -500,10 +513,14 @@ def main(argv=None):
     parser.add_argument("--runner-file", type=Path)
     parser.add_argument("--profile-dir", type=Path)
     parser.add_argument("--expected-workers", type=int)
+    parser.add_argument("--require-audio", action="store_true",
+                        help="For check/analyse: require captured Huanyu encoder AND projector calls")
     args = parser.parse_args(argv)
     try:
         if args.expected_workers is not None and args.expected_workers < 1:
             parser.error("--expected-workers must be positive")
+        if args.require_audio and args.action not in {"check", "analyse"}:
+            parser.error("--require-audio is only valid with check/analyse")
         if args.action == "prepare":
             if args.source is None or args.output is None:
                 parser.error("--source and --output are required")
@@ -515,7 +532,7 @@ def main(argv=None):
         else:
             if args.profile_dir is None:
                 parser.error("--profile-dir is required")
-            records = captures(args.profile_dir, args.expected_workers, args.action != "status")
+            records = captures(args.profile_dir, args.expected_workers, args.action != "status", args.require_audio)
             if args.action == "analyse":
                 from torch_npu.profiler.profiler import analyse
                 from serve_profile_report import report_capture
