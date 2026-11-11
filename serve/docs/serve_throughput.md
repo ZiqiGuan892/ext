@@ -107,6 +107,12 @@ HTTP 并发 16 不等于引擎同时解码 128 条；当前 max_num_seqs=16，�
 每条消息在本地应用 chat template 后必须恰好 2048 tokens，并逐请求与服务器 usage 核对。
 若模板/processor 不一致则失败，不能再称为固定 2K 输入。
 
+客户端兼容 chat template 返回 token ID 列表、`BatchEncoding.input_ids` 和
+单条 batch 的 token ID 数组；不能直接对 `BatchEncoding` 取 `len()`，那会数到
+字段数而非 tokens。旧版因此可能在发请求前报 `Could not construct exact input length`。
+更新 `bench_throughput.py` 后重试原命令即可；这种构造失败尚未发送请求，也未创建
+profile arm 文件，无需因此重启 serve。真实模板长度仍由服务端 `usage.prompt_tokens` 校验。
+
 使用非零 temperature 支持 n>1，固定 seed；本命令显式关闭 thinking，两组保持一致。
 如需测试 thinking，可把两组都改成 --enable-thinking。新脚本的精确输入和采样口径与
 旧脚本不同，因此应重新运行两组，不能直接与旧报告比较百分比。

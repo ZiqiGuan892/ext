@@ -17,7 +17,9 @@ import math
 import random
 import statistics
 import time
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from numbers import Integral
 from pathlib import Path
 
 import requests
@@ -44,13 +46,32 @@ def messages_for(prompt):
     ]
 
 
+def tokenized_chat_length(encoded):
+    """Count one chat's IDs across Transformers list/BatchEncoding APIs."""
+    # Transformers 5 defaults to BatchEncoding: len(encoded) counts fields,
+    # not tokens. Custom tokenizers may also retain a singleton batch axis.
+    if isinstance(encoded, Mapping):
+        require("input_ids" in encoded, "Tokenized chat has no input_ids")
+        encoded = encoded["input_ids"]
+    if hasattr(encoded, "tolist"):
+        encoded = encoded.tolist()
+    require(isinstance(encoded, (list, tuple)) and len(encoded) > 0,
+            f"Expected nonempty token IDs, got {type(encoded).__name__}")
+    if isinstance(encoded[0], (list, tuple)):
+        require(len(encoded) == 1, "Expected one tokenized chat, got multiple sequences")
+        encoded = encoded[0]
+    require(len(encoded) > 0 and all(isinstance(t, Integral) and not isinstance(t, bool) for t in encoded),
+            "Expected a flat sequence of integer token IDs for one chat")
+    return len(encoded)
+
+
 def make_prompts(tokenizer, count, input_tokens, seed, enable_thinking):
     """Fit each *templated* prompt exactly; never silently round its length."""
     rng = random.Random(seed)
     words = "apple river music garden paper cloud green table winter story light book".split()
 
     def length(text):
-        return len(tokenizer.apply_chat_template(
+        return tokenized_chat_length(tokenizer.apply_chat_template(
             messages_for(text), tokenize=True, add_generation_prompt=True,
             enable_thinking=enable_thinking,
         ))
@@ -78,7 +99,10 @@ def make_prompts(tokenizer, count, input_tokens, seed, enable_thinking):
                     text += suffix
                     break
             else:
-                raise BenchmarkError("Could not construct exact input length with this tokenizer")
+                raise BenchmarkError(
+                    f"Could not construct exact input length with {type(tokenizer).__name__}: "
+                    f"target={input_tokens}, current={current}; tried all filler suffixes"
+                )
         require(length(text) == input_tokens, "Prompt length construction failed")
         prompts.append(text)
     return prompts

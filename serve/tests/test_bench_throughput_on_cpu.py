@@ -2,6 +2,7 @@ import copy
 import importlib.util
 import json
 import sys
+from collections import UserDict
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -228,6 +229,45 @@ def test_exact_templated_input_and_reproducible_distinct_prompts():
     assert prompts == bench.make_prompts(tokenizer, 4, 64, 42, False)
     assert all(len(tokenizer.apply_chat_template(bench.messages_for(p), tokenize=True,
                add_generation_prompt=True, enable_thinking=False)) == 64 for p in prompts)
+
+
+@pytest.mark.parametrize("container", ["mapping", "batch", "mapping_batch", "array"])
+def test_exact_2048_tokens_with_chat_template_return_containers(container):
+    class Array:
+        def __init__(self, ids):
+            self.ids = ids
+
+        def tolist(self):
+            return [self.ids]
+
+    class ContainerTokenizer(Tokenizer):
+        def apply_chat_template(self, messages, **kwargs):
+            ids = super().apply_chat_template(messages, **kwargs)
+            if container == "mapping":
+                return UserDict(input_ids=ids, attention_mask=[1] * len(ids))
+            if container == "batch":
+                return [ids]
+            if container == "mapping_batch":
+                return UserDict(input_ids=[ids], attention_mask=[[1] * len(ids)])
+            return UserDict(input_ids=Array(ids))
+
+    prompts = bench.make_prompts(ContainerTokenizer(), 2, 2048, 42, False)
+    assert len(set(prompts)) == 2
+    # Count independently with the flat tokenizer, not the production helper.
+    assert all(len(Tokenizer().apply_chat_template(bench.messages_for(p), tokenize=True,
+               add_generation_prompt=True, enable_thinking=False)) == 2048 for p in prompts)
+
+
+@pytest.mark.parametrize("encoded,match", [
+    ({"attention_mask": [1, 1]}, "no input_ids"),
+    ([[1, 2], [3, 4]], "multiple sequences"),
+    ({"input_ids": "123"}, "Expected nonempty token IDs"),
+    ({"input_ids": []}, "Expected nonempty token IDs"),
+    ({"input_ids": [[[]]]}, "integer token IDs"),
+])
+def test_invalid_template_result_cannot_be_counted_as_tokens(encoded, match):
+    with pytest.raises(bench.BenchmarkError, match=match):
+        bench.tokenized_chat_length(encoded)
 
 
 def test_http_path_uses_token_metadata_and_closes_response(monkeypatch):
