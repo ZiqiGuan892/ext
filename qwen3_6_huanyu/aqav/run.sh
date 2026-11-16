@@ -14,7 +14,8 @@ MODEL_PATH="${AVQA_MODEL_PATH:-/opt/huawei/dataset/model_gy/downloaded_models/27
 Q36_CKPT_DIR="${Q36_CKPT_DIR:-/opt/huawei/dataset/downloaded_models/Qwen3.6-35B-A3B-whisper-0814-rl}"
 RUN_DIR="${RUN_DIR:-$PROJECT_ROOT/runs/avqa_2748_$(date +%Y%m%d_%H%M%S)_$$}"
 REWARD_FILE="$HERE/choice_reward.py"
-AVQA_OPTIMIZED="${AVQA_OPTIMIZED:-0}" # 1：融合 GDN/RMS/MoE + 图模式，保持 LoRA 配方；暂不启用 route replay。
+AVQA_OPTIMIZED="${AVQA_OPTIMIZED:-0}" # 1：融合 GDN/RMS/MoE + 图模式，保持 LoRA 配方。
+AVQA_REPLAY="${AVQA_REPLAY:-0}" # 专用开关，避免继承其他任务的 HUANYU_EXPERT_REPLAY。
 case "$AVQA_OPTIMIZED" in
     0) precision=custom; gdn_fp32=1 ;;
     1)
@@ -25,6 +26,24 @@ case "$AVQA_OPTIMIZED" in
         }
         ;;
     *) echo 'AVQA_OPTIMIZED 必须为 0 或 1' >&2; exit 2 ;;
+esac
+case "$AVQA_REPLAY" in
+    0) replay=false ;;
+    1)
+        [[ "$AVQA_OPTIMIZED" == 1 ]] || {
+            echo 'AVQA_REPLAY=1 要求 AVQA_OPTIMIZED=1：回放依赖融合 MoE kernel' >&2
+            exit 2
+        }
+        replay=true
+        # 未设置白名单时保持 vLLM 自动发现；已有白名单则追加回放插件。
+        if [[ -v VLLM_PLUGINS ]]; then
+            case ",$VLLM_PLUGINS," in
+                *,huanyu_r3,*) ;;
+                *) VLLM_PLUGINS="${VLLM_PLUGINS:+$VLLM_PLUGINS,}huanyu_r3" ;;
+            esac
+        fi
+        ;;
+    *) echo 'AVQA_REPLAY 必须为 0 或 1' >&2; exit 2 ;;
 esac
 
 # 原实验显式配置。保持 BS、N、优化器和 LoRA 范围；卡数从 4 改为 16。
@@ -126,8 +145,8 @@ ARGS+=(
     "++actor_rollout_ref.model.override_config.huanyu_train_audio_projector=false"
     'actor_rollout_ref.model.exclude_modules=".*talker.*|.*code2wav.*|.*code_predictor.*|.*visual.*|.*audio_tower.*|.*audio_encoder.*|.*audio_projection.*"'
     "actor_rollout_ref.rollout.name=vllm_omni"
-    "actor_rollout_ref.rollout.enable_rollout_routing_replay=false" # 此次 LoRA 重测暂不使用路由回放。
-    "++actor_rollout_ref.rollout.engine_kwargs.vllm_omni.enable_return_routed_experts=false" # 同时关闭引擎路由采集。
+    "actor_rollout_ref.rollout.enable_rollout_routing_replay=$replay" # 与训练侧回放保持一致。
+    "++actor_rollout_ref.rollout.engine_kwargs.vllm_omni.enable_return_routed_experts=$replay" # 引擎返回路由。
     "++actor_rollout_ref.rollout.engine_kwargs.vllm_omni.worker_extension_cls=verl_omni_ext.models.qwen3_6_huanyu.worker_extension.HuanyuColocateWorkerExtension"
     "++actor_rollout_ref.rollout.engine_kwargs.vllm_omni.additional_config.weight_nz_mode=0"
     "reward.reward_model.enable=false"
@@ -168,7 +187,7 @@ RUNTIME_ENV=(
     "HUANYU_PRECISION_PROFILE=$precision" # 不继承 full 参考模式的强制 eager。
     # 显式指定整组开关，避免继承此前 AQA 对照实验的零散配置。
     "MINICPMO_GDN_NPU_KERNEL=$AVQA_OPTIMIZED" "MINICPMO_NPU_RMS_NORM=$AVQA_OPTIMIZED" "MINICPMO_MOE_NPU_KERNEL=$AVQA_OPTIMIZED"
-    "HUANYU_EXPERT_REPLAY=0" "HUANYU_KERNEL_BISECT=none" "HUANYU_REPLAY_DEBUG=0"
+    "HUANYU_EXPERT_REPLAY=$AVQA_REPLAY" "HUANYU_KERNEL_BISECT=none" "HUANYU_REPLAY_DEBUG=0"
     "HUANYU_MOE_FINITE_DEBUG=0" "HUANYU_FINITE_PROBE=0"
     "HUANYU_WSYNC_PROFILE=off" "HUANYU_WSYNC_TRACE=off" "HUANYU_WSYNC_VERIFY=0"
     "HUANYU_WSYNC_LAYOUT=passthrough" "Q36_BACKWARD_PREFETCH=off"

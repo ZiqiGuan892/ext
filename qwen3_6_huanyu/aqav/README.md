@@ -25,11 +25,16 @@
 此模式使用 `kernel_graph` 精度档案，同时关闭与融合 GDN 冲突的 FP32 参考实现。
 不设置该变量时默认 `AVQA_OPTIMIZED=0`，保留原配方的算子路径，作为对照。
 
-**此次暂不启用 route replay**：两种模式均显式设置 `HUANYU_EXPERT_REPLAY=0`、
-`enable_rollout_routing_replay=false`、`enable_return_routed_experts=false`。
-这不表示 LoRA 与 replay 原理上不兼容；当前回放钩子对 PEFT 包装的识别和完整训练链路尚待验证。
-此入口不要求安装 replay 插件，不继承旧终端的 replay、权重同步优化或逐层调试开关。
-融合 MoE 本身可以独立运行，关闭 replay 时使用当前模型正常计算的路由。
+route replay 默认关闭（`AVQA_REPLAY=0`）。用户已反馈在其服务器验证 replay 无问题，
+现在可显式设置 `AVQA_REPLAY=1 AVQA_OPTIMIZED=1 HUANYU_GRAPH_MODE=1` 开启，保持 LoRA32。
+入口同步设置 driver/worker 的 `HUANYU_EXPERT_REPLAY=1`、
+`enable_rollout_routing_replay=true`、`enable_return_routed_experts=true`。
+回放依赖融合 MoE；`AVQA_REPLAY=1 AVQA_OPTIMIZED=0` 会提前报错。
+
+replay 开启时须已安装 `pyproject.toml` 声明的 `huanyu_r3` general plugin；此脚本不安装依赖。
+若已有 `VLLM_PLUGINS` 白名单，只追加 `huanyu_r3`，保留 Ascend 等原有插件；未设置白名单时
+继续自动发现。不要只 export `HUANYU_EXPERT_REPLAY=1`，AQAV 使用专用 `AVQA_REPLAY` 开关，
+避免继承其他任务的环境。replay debug、卡死与数值探针仍默认关闭。
 
 rollout 图模式未设置时默认开启；`AVQA_OPTIMIZED=1` 要求 `HUANYU_GRAPH_MODE=1`，
 显式设置为 0 会提前报错。训练侧 `torch.compile` 仍关闭。
@@ -59,16 +64,18 @@ bash "$AVQA/run.sh" \
 `AVQA_OPTIMIZED=1 HUANYU_GRAPH_MODE=1 bash "$AVQA/run.sh"`，不复用重测目录。
 验证集、奖励和采样参数保持一致，才能解释 reward 的前后变化。
 
-运行后检查 `console.log` 中的 `[avqa] optimized=1 ... replay=0`，以及：
+运行后检查 `console.log` 中的 `[avqa] optimized=1 ... replay=0/1` 与本次开关一致，以及：
 
 ```bash
 grep -aE '\[avqa\]|\[huanyu-kernel\]|trainable params|step:|Initial validation metrics|val-core/avqa_r1_6k/' "$RUN_DIR/console.log"
 ```
 
 应有 `actor GDN fused kernel installed`、`actor npu_rms_norm installed`、
-`actor fused MoE installed ... replay=off` 和 `graph mode requested; resolved cudagraph_mode=`。
+`actor fused MoE installed ... replay=off/on` 和 `graph mode requested; resolved cudagraph_mode=`。
+replay 开启时还应看到 `[huanyu-replay] engine hook installed`、`server patch installed`
+及 EngineCore/worker 的 `plugin applied` 日志。
 这些日志用于确认安装和配置；图实际回放、LoRA 梯度、数值精度及吞吐仍需服务器运行验证。
-本地 CPU 测试验证原配方参数、优化环境与实际 worker 精度策略一致、replay 三处关闭、
+本地 CPU 测试验证原配方参数、优化环境与实际 worker 精度策略一致、replay 开关三处一致、
 奖励及数据转换/过滤契约，不代表已在 NPU 上完成训练。
 
 ## 参数和适配差异
