@@ -1,4 +1,4 @@
-"""Use checkpoint video pixels and matching temporal spans in Huanyu rollout.
+"""Keep Huanyu image boundaries and checkpoint video temporal spans in rollout.
 
 Video profiling uses the checkpoint's maximum image size. Native total-token
 and frame-count budgeting still charge one full temporal-group token budget
@@ -241,16 +241,29 @@ def install_huanyu_video_rollout():
         if not _is_huanyu(self.info):
             return updates
 
+        def replace_image(item_index):
+            grid = out_mm_kwargs["image"][item_index]["image_grid_thw"].data
+            merge = _image_processor(self.info).merge_size
+            patches = int(grid.prod())
+            if patches <= 0 or patches % (merge * merge):
+                raise ValueError("Huanyu image grid is not divisible by the configured spatial merge")
+            text = "<|vision_start|>" + "<|image_pad|>" * (patches // (merge * merge)) + "<|vision_end|>"
+            # Both targets cover the *whole* image span. Replacing them with
+            # pads alone drops two tokens per image and shifts R3 routing rows.
+            # Boundary tokens retain their text embeddings, as in training.
+            return native.PromptUpdateDetails.select_text(text, "<|image_pad|>")
+
         def replace_video(item_index):
             grid = out_mm_kwargs["video"][item_index]["video_grid_thw"].data
             merge = _image_processor(self.info).merge_size
             text = video_placeholder(grid, merge)
             return native.PromptUpdateDetails.select_text(text, "<|video_pad|>")
 
-        # Retain native image/audio update objects, including their closures
-        # and embedding masks. Both supported compact video spellings expand
-        # into exactly the same per-temporal-group spans as training.
-        kept = [update for update in updates if update.modality != "video"]
+        # Retain native audio updates. Visual replacements must include their
+        # boundary tokens and select only pads for embedding injection.
+        kept = [update for update in updates if update.modality not in ("image", "video")]
+        for target in ("<|vision_start|><|image_pad|><|vision_end|>", "(<image>./</image>)"):
+            kept.append(native.PromptReplacement(modality="image", target=target, replacement=replace_image))
         for target in (native.Q36_VIDEO_PLACEHOLDER, "(<video>./</video>)"):
             kept.append(native.PromptReplacement(modality="video", target=target, replacement=replace_video))
         return kept
@@ -289,7 +302,7 @@ def install_huanyu_video_rollout():
     print(
         "[huanyu-video] layout=temporal_pairs_v1 frontend=checkpoint "
         "spans=per_temporal_group rope=per_temporal_group budget=source_frames_conservative "
-        "prompt_updates=native_full_ranges_v1",
+        "prompt_updates=native_full_ranges_v1 image_spans=full_boundaries_v1",
         flush=True,
     )
     return True

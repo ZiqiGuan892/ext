@@ -351,7 +351,9 @@ def _install_on_server_class(server_class):
 
             TRAINING_PROMPT_LEN.set(len(original_ids))
         contracted = contract_rollout_prompt(processor, original_ids, prepared_media)
-        if _media_items(prepared_media, "video") and not getattr(self, "_huanyu_video_hooks_ready", False):
+        if (_media_items(prepared_media, "image") or _media_items(prepared_media, "video")) and not getattr(
+            self, "_huanyu_video_hooks_ready", False
+        ):
             # Tokenization runs in the server process, whereas engine_hooks
             # may first load in a separate inference worker. Bind the same
             # frontend and full-range prompt updater before server dispatch.
@@ -359,7 +361,8 @@ def _install_on_server_class(server_class):
 
             install_huanyu_video_rollout()
             self._huanyu_video_hooks_ready = True
-            logger.info("Huanyu video server hooks verified: prompt_updates=native_full_ranges_v1")
+            logger.info("Huanyu visual server hooks verified: prompt_updates=native_full_ranges_v1 "
+                        "image_spans=full_boundaries_v1")
         bound.arguments["prompt_ids"] = contracted
         if not getattr(self, "_huanyu_contraction_reported", False):
             logger.info("Huanyu metadata-aware rollout prompt contraction: %d -> %d tokens", len(original_ids), len(contracted))

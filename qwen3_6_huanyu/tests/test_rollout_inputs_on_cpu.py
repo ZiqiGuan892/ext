@@ -60,6 +60,17 @@ def audio_span(length):
 
 
 class RolloutInputsTest(unittest.TestCase):
+    def setUp(self):
+        # The server now installs visual prompt hooks for image-only requests
+        # too. This file tests dispatch; native update contracts have their own
+        # tests and do not require vLLM imports here.
+        module = ModuleType(_PACKAGE.__name__ + ".video_rollout")
+        module.install_huanyu_video_rollout = Mock()
+        self.visual_install = module.install_huanyu_video_rollout
+        stub = patch.dict(sys.modules, {module.__name__: module})
+        stub.start()
+        self.addCleanup(stub.stop)
+
     def test_long_audio_is_one_item_and_adjacent_second_audio_stays_separate(self):
         # A 31s waveform has 375+12 tokens; an adjacent 1s waveform has 12.
         # Their source item boundary cannot be inferred from token adjacency.
@@ -139,6 +150,29 @@ class RolloutInputsTest(unittest.TestCase):
             server._preprocess_input([10, 13, 11] * 2, media)
         self.assertEqual(events, ["install", "dispatch", "dispatch"])
         self.assertFalse(server._huanyu_video_hooks_ready)
+
+    def test_image_server_installs_hooks_before_dispatch_and_fails_closed(self):
+        class Server:
+            async def generate(self, prompt_ids, sampling_params, image_data=None, audio_data=None):
+                self.calls.append(prompt_ids)
+                self.assert_installed()
+                return prompt_ids
+
+        rollout._install_on_server_class(Server)
+        server = Server()
+        server.model_config = SimpleNamespace(processor=Processor())
+        server._ar_mode = True
+        server.calls = []
+        server.assert_installed = self.visual_install.assert_called_once_with
+        for _ in range(2):
+            actual = asyncio.run(server.generate([7, 10, 12, 11, 8], {}, image_data=[object()]))
+            self.assertEqual(actual, [7, 100, 101, 8])
+        self.assertEqual(len(server.calls), 2)
+        server._huanyu_video_hooks_ready = False
+        self.visual_install.side_effect = RuntimeError("visual hook unavailable")
+        with self.assertRaisesRegex(RuntimeError, "visual hook unavailable"):
+            asyncio.run(server.generate([10, 12, 11], {}, image_data=[object()]))
+        self.assertEqual(len(server.calls), 2)
 
     def test_server_forwards_padded_short_tail_without_mutating_shared_requests(self):
         class Server:

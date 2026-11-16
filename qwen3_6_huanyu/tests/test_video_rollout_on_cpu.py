@@ -217,16 +217,15 @@ class VideoRolloutTests(unittest.TestCase):
             loader.assert_not_called()
         self.assertEqual(proc.original_calls, [(data, options, tokens), (data, options, tokens)])
 
-    def test_video_updates_keep_image_audio_and_select_only_video_pads(self):
+    def test_video_updates_keep_audio_and_select_only_video_pads(self):
         proc = self.cls()
         out = {"video": [
             {"video_grid_thw": SimpleNamespace(data=torch.tensor([2, 4, 4]))},
             {"video_grid_thw": SimpleNamespace(data=torch.tensor([[1, 2, 4]]))},
         ]}
         updates = proc._get_prompt_updates({}, {}, out)
-        self.assertIs(updates[0], proc.updates[0])
-        self.assertIs(updates[1], proc.updates[2])
-        video_updates = updates[2:]
+        self.assertIs(updates[0], proc.updates[2])
+        video_updates = [u for u in updates if u.modality == "video"]
         self.assertEqual([u.target for u in video_updates], [self.native.Q36_VIDEO_PLACEHOLDER, "(<video>./</video>)"])
         with patch.object(rollout, "_image_processor", return_value=ImageProcessor()):
             for update in video_updates:

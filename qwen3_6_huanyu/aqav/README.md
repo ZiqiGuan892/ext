@@ -562,6 +562,41 @@ token 或截断 `image_bound` 来绕过校验。
 进度行是队列状态快照，不是累计异常数；当前 `failure=0` 不能证明没有轨迹失败，也不能在
 未核对服务器 ReplayBuffer 的消费/补采逻辑前断定失败组已重试或被标为成功。
 
+### Replay 报告 vLLM prompt 394 / training prompt 396
+
+2026-11-16 的服务器源码确认：原生 `_get_prompt_updates` 的两个图像 target
+（`(<image>./</image>)` 和 `<|vision_start|><|image_pad|><|vision_end|>`）
+均覆盖完整占位符，但 replacement 仅返回 N 个 `<|image_pad|>`，因此每张图会
+丢失两个边界 token。训练侧保留这两个 token；AQAV 单图请求的差值正好是 2。
+错误位于 rollout 的 R3 返回校验阶段，不是 Actor OOM，也不能据此认定 LoRA 不兼容。
+
+`video_rollout.py` 的 Huanyu 专用更新器现在也负责图像：完整返回
+`<|vision_start|>` + N 个 `<|image_pad|>` + `<|vision_end|>`，通过
+`PromptUpdateDetails.select_text` 仅选择 image pad 作为视觉 embedding 注入位置。
+`rollout_inputs.py` 对图像或视频请求都在 server dispatch 前确保安装更新器。
+音频更新对象和其他模型路径保留原行为；不关闭 replay 校验、不补齐或截断路由行。
+该输入修复不依赖 replay 开关，replay=0 同样保留图像边界。
+
+同步后须启动新作业，使 server / EngineCore / worker 加载新代码。无需修改原训练配方、
+优化开关或重新制作过滤后的 parquet。安装日志包含：
+
+```text
+image_spans=full_boundaries_v1
+```
+
+可先在训练容器检查实际安装的 vLLM prompt updater（只加载配置、tokenizer 和图像前端，
+使用合成图像，不加载模型权重、不连接 Ray）：
+
+```bash
+python3 "$PROJECT_ROOT/verl_omni_ext/models/qwen3_6_huanyu/check_image_contract.py" \
+  --model /opt/huawei/dataset/model_gy/downloaded_models/2748
+```
+
+期望 `status: PASS`，覆盖两种占位符、已展开输入、单图/多图的逐 token 对齐、
+完整图像范围和 embedding mask。此检查不包含真实音频前端、NPU 推理或完整 R3 训练。
+本地 125 项 CPU 回归通过，另复现了 396 → 394 的旧行为并验证修复后的 token 序列一致；
+16 卡完整训练仍需服务器验证。
+
 ## 判断是否学到了有效行为
 
 ```bash
