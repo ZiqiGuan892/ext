@@ -79,6 +79,9 @@ class RegistrationTests(unittest.TestCase):
         model_outputs = ModuleType(f"{PACKAGE}.model_outputs")
         self.install_model_outputs = Mock()
         model_outputs.install_huanyu_scalar_output_packing = self.install_model_outputs
+        padded_batching = ModuleType(f"{PACKAGE}.padded_batching")
+        self.install_padded_batching = Mock()
+        padded_batching.install_huanyu_padded_batching = self.install_padded_batching
         sync_policy = ModuleType(f"{PACKAGE}.microbatch_sync")
         self.install_sync = Mock()
         sync_policy.install_huanyu_microbatch_sync = self.install_sync
@@ -99,6 +102,7 @@ class RegistrationTests(unittest.TestCase):
             entropy.__name__: entropy,
             log_probs.__name__: log_probs,
             model_outputs.__name__: model_outputs,
+            padded_batching.__name__: padded_batching,
             sync_policy.__name__: sync_policy,
             visual.__name__: visual,
             positions.__name__: positions,
@@ -177,6 +181,7 @@ class RegistrationTests(unittest.TestCase):
         self.install_entropy.assert_called_once_with()
         self.install_log_probs.assert_called_once_with()
         self.install_model_outputs.assert_called_once_with(self.model)
+        self.install_padded_batching.assert_called_once_with(self.model)
         self.install_precision.assert_called_once_with(self.model)
         self.install_sync.assert_not_called()
         self.assertIs(result, self.model)

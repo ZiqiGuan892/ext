@@ -449,6 +449,48 @@ TORCH_COMPILE_DISABLE=1 TORCHINDUCTOR_DISABLE=1 python3 -m pytest -q \
   "$PROJECT_ROOT/verl_omni_ext/models/qwen3_6_huanyu/tests"/test_{model_outputs,log_probs,entropy,vision_fsdp,media_boundary,processor_bridge,cached_processor,forward,cached_forward,video_pipeline,audio_training,registration,aqa_position_ids,train_hang_probe}_on_cpu.py
 ```
 
+### 第一步完成、第二步 Actor backward OOM：限制补齐后的微批次
+
+`avqa_2748_full_20261116_210329_867683` 已完成一个 step，第二步在
+`_update_actor -> loss.backward -> log_probs.py` 分配完整 `grad_logits` 时失败。
+NPU 1 申请 19.92 GiB，空闲 19.88 GiB，allocated 31.57 GiB、reserved 31.72 GiB。
+这是 Actor 反向的明确分配不足；单凭这份日志不能认定跨 step 内存泄漏。
+
+512-token 分块限制交叉熵的中间量，完整 `[B,S,V]` logits 和梯度仍存在。
+原动态分批约束 `sum(valid_lengths) <= 20480`，但 Huanyu 使用 padded forward，
+实际词表张量按 `B * max(lengths) * V` 分配。长短序列混合可能使 padding 后
+的规模远超 20480；第一步能运行不能保证下一步的微批次也能放入显存。
+
+`padded_batching.py` 在 Huanyu FSDP 引擎调用期间额外约束
+`B * S_max <= max_token_len_per_gpu * sp_size`。仍使用原 verl 分批器和索引恢复，
+按需增加微批次数；各 DP rank 协商统一数量，当前已符合预算的 rank 也参与。
+若不可拆分组无法满足共同数量，所有参与 rank 明确报错，不静默丢样本或截断。
+旧概率计算和 Actor 更新均覆盖，其他模型、静态分批、remove-padding 路径保持原行为。
+
+BS128、n16、LoRA32、TP2、mini-batch16、4096/12288 长度上限、20480 token 预算、
+奖励、优化器 step 及损失归一化均保留；微批次划分和累计顺序可能改变，吞吐与浮点
+舍入也可能变化。对 BF16 / V=248320，20480 行词表张量约 9.47 GiB；这不是整个
+训练峰值，激活、温度缩放、其他梯度和算子 workspace 仍需额外空间。
+
+同步新文件、`thinker_adapter.py` 后启动新作业，无需新增开关，probe 继续关闭。
+首次安装以及发生重新分批时会出现：
+
+```text
+[huanyu-padded-batch] installed ... scope=huanyu budget=B*S_max
+[huanyu-padded-batch] ... budget=20480 micro_batches=...->... max_padded_tokens=...->... dp_sync=1
+```
+
+这属于运行路径说明，不是定时诊断探针。重新分批后的 `max_padded_tokens` 应不超过预算。
+CPU 测试覆盖超额 padding、样本及索引完整性、加权梯度、PEFT/外层包装、异常后作用域
+恢复，以及模拟 DP 的统一拆分/失败。另使用本地真实 verl 分批与引擎源码验证了
+150 组长度分布和推理/反向循环。与已有内存、多模态和诊断用例一起运行共 325 项
+CPU 回归通过；模拟 collective 不等同于真实 HCCL/NPU 验证。
+
+```bash
+TORCH_COMPILE_DISABLE=1 TORCHINDUCTOR_DISABLE=1 python3 -m pytest -q \
+  "$PROJECT_ROOT/verl_omni_ext/models/qwen3_6_huanyu/tests"/test_{padded_batching,model_outputs,log_probs,entropy,vision_fsdp,microbatch_sync,media_boundary,processor_bridge,cached_processor,forward,cached_forward,video_pipeline,audio_training,registration,aqa_position_ids,train_hang_probe}_on_cpu.py
+```
+
 ### Rollout 后处理中的图像 token 不匹配
 
 另一轮作业在 `_compute_score -> _compute_multi_modal_inputs` 报告

@@ -140,6 +140,7 @@ class Qwen36HuanyuThinkerAdapter(OmniModelBase):
         from .fsdp_offload import install_huanyu_fsdp_offload
         from .log_probs import install_huanyu_logprob_chunking
         from .model_outputs import install_huanyu_scalar_output_packing
+        from .padded_batching import install_huanyu_padded_batching
         from .precision import install_huanyu_actor_precision
         from .precision_policy import report_policy, install_fsdp_pin_audit
         from verl_omni_ext.models.qwen3_6_whisper.position_ids import install_tq_position_ids_patch
@@ -222,6 +223,7 @@ class Qwen36HuanyuThinkerAdapter(OmniModelBase):
         install_huanyu_entropy_chunking()
         install_huanyu_logprob_chunking()
         install_huanyu_scalar_output_packing(module)
+        install_huanyu_padded_batching(module)
         # Opt in only for the long-context memory profile. Older verl builds
         # lack the engine's no-sync configuration field; use a Huanyu-scoped
         # compatibility guard rather than passing an unknown dataclass key.
