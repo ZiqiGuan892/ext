@@ -32,12 +32,6 @@ class AqaPrecisionEntryTests(unittest.TestCase):
         self.fixture.env["MSYS2_ARG_CONV_EXCL"] = self.fixture.env.get("MSYS2_ARG_CONV_EXCL", "") + (
             ";trainer.rollout_data_dir=;trainer.validation_data_dir="
         )
-        # Exercise the actual setup/install guard, not only the final argv.
-        # Hardware preflights remain excluded by the underlying CPU fixture.
-        backend = EXAMPLES / "run_qwen36_huanyu_gspo_npu.sh"
-        prefix = backend.read_text(encoding="utf-8").split("# =============================================================================", 1)[0]
-        deployed = self.fixture.examples / backend.name
-        deployed.write_text(prefix + deployed.read_text(encoding="utf-8"), encoding="utf-8", newline="\n")
         self.fixture.command_stub.write_text(
             self.fixture.command_stub.read_text(encoding="utf-8").replace(
                 'if command == "pgrep":',
@@ -95,8 +89,9 @@ class AqaPrecisionEntryTests(unittest.TestCase):
         return actual
 
     def assert_no_setup(self):
-        for kind in ("pip", "git", "env-source", "helper"):
+        for kind in ("pip", "git", "env-source"):
             self.assertFalse(self.fixture.events(kind), kind)
+        self.assertEqual([event["args"][0] for event in self.fixture.events("helper")], ["check-aqa"])
         self.assertEqual([event["args"] for event in self.fixture.events("ray")],
                          [["status", "--address=auto"]])
 
@@ -202,7 +197,7 @@ class AqaPrecisionEntryTests(unittest.TestCase):
 
     def test_job_readiness_failure_never_starts_training(self):
         config = self.use_job()
-        result = self.fixture.run_launcher(dict(config, HUANYU_TEST_FAIL_WAIT="wait-cluster"))
+        result = self.fixture.run_launcher(dict(config, HUANYU_JOB_PREFLIGHT="1", HUANYU_TEST_FAIL_WAIT="wait-cluster"))
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertFalse(self.fixture.events("train"))
         self.assertFalse(any("status" in event["args"] for event in self.fixture.events("ray")))

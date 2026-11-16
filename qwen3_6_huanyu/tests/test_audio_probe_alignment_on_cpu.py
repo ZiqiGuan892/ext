@@ -1,11 +1,17 @@
 """Batched and isolated native audio calls align only under a verified contract."""
 
+
 import copy
 import importlib.util
 from pathlib import Path
 import unittest
 
 import numpy as np
+
+# Retained as historical coverage for the removed example CLI.
+import pytest
+pytest.skip("Example CLI removed by the Huanyu examples consolidation", allow_module_level=True)
+
 
 
 SOURCE = Path(__file__).resolve().parents[1] / "examples" / "huanyu_probe_alignment.py"

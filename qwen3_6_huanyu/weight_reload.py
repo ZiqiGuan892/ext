@@ -23,6 +23,9 @@ _PATCH_MARKER = "_huanyu_layerwise_reload_patch"
 _ENV_FLAG = "MINICPMO_HUANYU_LAYERWISE_RELOAD"
 _KNOWN_ARGUMENTS = {"peft_config", "base_sync_done", "use_shm", "zmq_update_id"}
 _REPORTED_FALLBACKS = set()
+# 逐字节校验只在「首次同步」有意义：首次同步发送 checkpoint 原值，跨 run 确定性可比；
+# 其后各次同步是训练更新后的权重，受训练非确定性影响，不能跨 run 对比。一进程一次。
+_VERIFY_DUMPED = False
 
 
 def _log(message, worker=None):
@@ -47,6 +50,45 @@ def _enabled():
     if value in {"0", "false", "no", "off"}:
         return False
     raise ValueError(f"{_ENV_FLAG} must be a boolean, got {value!r}")
+
+
+def _wsync_env_active():
+    """仅凭 env 判断权重同步优化是否开启，不 import 任何重模块（off 路径零新增 import）。"""
+    profile = os.environ.get("HUANYU_WSYNC_PROFILE", "off").strip().lower()
+    if profile not in {"", "off"}:
+        return True
+    trace = os.environ.get("HUANYU_WSYNC_TRACE", "off").strip().lower()
+    if trace not in {"", "off", "0", "false", "no"}:
+        return True
+    verify = os.environ.get("HUANYU_WSYNC_VERIFY", "0").strip().lower()
+    return verify in {"1", "true", "yes", "on"}
+
+
+def _maybe_wsync_config():
+    if not _wsync_env_active():
+        return None
+    from verl_omni_ext.features.weight_sync.config import WsyncConfig
+
+    return WsyncConfig.from_env()
+
+
+def _build_wsync_receiver(handle, device, use_shm, cfg):
+    """按 cfg 构造本地 receiver（协议与 verl v1 一致）+ rollout 侧 trace。"""
+    from verl_omni_ext.features.weight_sync.receiver import EarlyAckReceiver
+    from verl_omni_ext.features.weight_sync.trace import SyncTrace
+
+    sync_fn = None
+    if cfg.trace == "sync":
+        try:
+            from verl.utils.device import get_torch_device
+
+            sync_fn = get_torch_device().synchronize
+        except Exception:  # noqa: BLE001
+            sync_fn = None
+    trace = SyncTrace("rollout", sync_fn=sync_fn, extra={"cfg": cfg.summary()}) if cfg.tracing else None
+    return EarlyAckReceiver(
+        zmq_handle=handle, device=device, use_shm=use_shm, early_ack=cfg.early_ack, trace=trace,
+    )
 
 
 def _standard_model_and_config(worker):
@@ -106,8 +148,60 @@ def _load_audio_weights(model, weights):
     return remaining, count
 
 
-def receive_layerwise_weights(model, model_config, receiver, *, worker=None):
-    """Receive one complete update; finalize once after all buckets succeeded."""
+_THINKER_NATIVE_PREFIXES = ("visual.", "llm.", "apm.", "audio_projection_layer.")
+
+
+def make_direct_thinker_loader(model, *, strict=False):
+    """IPC 每桶直达 ``model.thinker.load_weights``；不可用时返回 ``(None, 原因)``。
+
+    omni 顶层 ``load_weights`` 是为「从磁盘首次加载」写的：批内没有 ``visual.*`` 时从
+    ``Q36_CKPT_DIR`` 重读整套视觉权重、没有 ``apm.*`` 时探测 sidecar 音频权重，并把读到的
+    checkpoint 原值注入本批。IPC 同步每桶都踩中这两条分支（每桶固定 ~0.2s，且视觉若
+    解冻会被 checkpoint 值覆盖）。这里复用模型自己的 ``_map_q36_weights`` 前缀表，只跳过
+    注入；映射不了的张量直接 raise，不像顶层那样 warning 后丢弃。
+    """
+    thinker = getattr(model, "thinker", None)
+    load = getattr(thinker, "load_weights", None)
+    mapper = getattr(model, "_map_q36_weights", None)
+    missing = [name for name, fn in (("thinker.load_weights", load), ("_map_q36_weights", mapper))
+               if not callable(fn)]
+    if missing:
+        reason = f"direct_load unavailable on {type(model).__name__}: missing {missing}"
+        if strict:
+            raise RuntimeError(reason + " (HUANYU_WSYNC_STRICT=1)")
+        return None, reason
+
+    def direct(weights):
+        mapped, unknown = [], []
+        for name, value in weights:
+            if name.startswith(_THINKER_NATIVE_PREFIXES):
+                mapped.append((name, value))
+                continue
+            out = list(mapper([(name, value)]))
+            if out:
+                mapped.extend(out)
+            else:
+                unknown.append(name)
+        if unknown:
+            raise RuntimeError(
+                f"direct_load cannot map {len(unknown)} tensors into the thinker namespace "
+                f"(e.g. {unknown[:4]}); refusing to drop them silently"
+            )
+        if mapped:
+            load(mapped)
+
+    return direct, None
+
+
+def receive_layerwise_weights(model, model_config, receiver, *, worker=None, cfg=None):
+    """Receive one complete update; finalize once after all buckets succeeded.
+
+    ``cfg`` is None for the default (knob-off) path — behaviour is then byte-for
+    -byte identical to before. When a :class:`WsyncConfig` is passed, the bucket
+    callback additionally routes fused experts through the MoE fast consumer and
+    (optionally) checksums the whole model before/after for the VERIFY A/B.
+    """
+    global _VERIFY_DUMPED
     from .audio_reload_guard import AudioReloadGuard
 
     if getattr(model, "_huanyu_full_weight_audit_started", False):
@@ -157,6 +251,30 @@ def receive_layerwise_weights(model, model_config, receiver, *, worker=None):
     # tensors instead of the checkpoint. Limit this to the first IPC update.
     snapshot = getattr(model, "_huanyu_audio_probe_snapshot_weights", None)
     reload_count = getattr(model, "_huanyu_audio_probe_reload_count", 0)
+    do_verify = cfg is not None and cfg.verify and not _VERIFY_DUMPED
+    verify_before = None
+    if do_verify:
+        from verl_omni_ext.features.weight_sync import verify as _verify
+
+        verify_before = _verify.fingerprint_model(model)
+        small_before = _verify.small_values(model)
+
+    # 索引只持有模块引用（layerwise reload 换参数不换模块），放在 initialize 之前：
+    # strict 下索引不可用时在模型仍完好时报错，而不是留下一堆 meta 参数。
+    moe_consumer, moe_stats = None, None
+    if cfg is not None and cfg.moe_fast:
+        from .moe_fast_reload import make_moe_fast_consumer
+
+        moe_consumer, moe_stats = make_moe_fast_consumer(model, strict=cfg.strict)
+    load_remaining, direct_load = model.load_weights, False
+    if cfg is not None and cfg.direct_load:
+        direct, reason = make_direct_thinker_loader(model, strict=cfg.strict)
+        if direct is not None:
+            load_remaining, direct_load = direct, True
+        else:
+            _report_once(f"WARNING {reason}; falling back to model.load_weights", worker)
+    trace = getattr(receiver, "trace", None)
+
     if callable(snapshot) and reload_count == 0:
         snapshot("before_first_reload")
     record_model("before_reload")
@@ -164,7 +282,7 @@ def receive_layerwise_weights(model, model_config, receiver, *, worker=None):
     record_model("after_initialize")
     audio_count, bucket_count, encoder_count, projector_count = 0, 0, 0, 0
 
-    def load_bucket(weights, is_last=None):
+    def load_bucket(weights, is_last=None, owned=False):
         nonlocal audio_count, bucket_count, encoder_count, projector_count
         # Both callback(weights) and callback(weights, is_last) are used by verl
         # versions. Completion is receiver return, never a per-bucket finalize.
@@ -174,18 +292,28 @@ def receive_layerwise_weights(model, model_config, receiver, *, worker=None):
                          extra={**audit_extra, "bucket": bucket_count + 1})
         # Deferred loaders may retain tensors until a later bucket completes a
         # layer. The IPC buffer is reused immediately after the callback's ACK.
-        owned = [(name, value.clone()) for name, value in items]
-        guard.ingest(owned)
+        # ``owned=True`` means the receiver already cloned (early-ack), so skip
+        # the duplicate clone here. 本地名不能叫 owned：那是入参。
+        cloned = items if owned else [(name, value.clone()) for name, value in items]
+        guard.ingest(cloned)
         if audit is not None:
-            audit.record("receiver_owned", owned, round_id=update_id,
+            audit.record("receiver_owned", cloned, round_id=update_id,
                          extra={**audit_extra, "bucket": bucket_count + 1})
-        encoder_count += sum(name.startswith(("model.audio_encoder.", "apm.")) for name, _ in owned)
-        projector_count += sum(name.startswith(("model.audio_projection.", "audio_projection_layer.")) for name, _ in owned)
-        remaining, count = _load_audio_weights(model, owned)
+        encoder_count += sum(name.startswith(("model.audio_encoder.", "apm.")) for name, _ in cloned)
+        projector_count += sum(name.startswith(("model.audio_projection.", "audio_projection_layer.")) for name, _ in cloned)
+        remaining, count = _load_audio_weights(model, cloned)
         audio_count += count
+        if moe_consumer is not None:
+            remaining = moe_consumer(remaining)
+        if moe_stats is not None and trace is not None:
+            # 累计值直接覆盖：trace 在 receive_weights 结束时 emit，此时已是全量。
+            for key in ("fast_tensors", "fast_calls", "fallback_fused_tensors"):
+                trace.counters[f"moe_{key}"] = moe_stats[key]
         bucket_count += 1
         if remaining:
-            model.load_weights(remaining)
+            if trace is not None:
+                trace.counters["model_load_calls"] = trace.counters.get("model_load_calls", 0) + 1
+            load_remaining(remaining)
         record_model("after_load_bucket", bucket=bucket_count)
 
     receiver.receive_weights(on_bucket_received=load_bucket)
@@ -227,7 +355,31 @@ def receive_layerwise_weights(model, model_config, receiver, *, worker=None):
     )
     _log(f"layerwise IPC weight update completed; buckets={bucket_count} "
          f"audio_tensors={audio_count} meta_parameters=0 audio_mode={audio_mode} "
-         f"audio_encoder_tensors={encoder_count} audio_projection_tensors={projector_count}", worker)
+         f"audio_encoder_tensors={encoder_count} audio_projection_tensors={projector_count} "
+         f"direct_load={int(direct_load)}", worker)
+    if moe_stats is not None:
+        _log(f"moe_fast reload stats: fast_tensors={moe_stats['fast_tensors']} "
+             f"fast_calls={moe_stats['fast_calls']} "
+             f"fallback_fused_tensors={moe_stats['fallback_fused_tensors']} "
+             f"indexed_modules={moe_stats['indexed_modules']}/{moe_stats['candidate_modules']} "
+             f"ineligible={moe_stats['ineligible']}", worker)
+        if moe_stats["fast_tensors"] == 0 or moe_stats["fallback_fused_tensors"]:
+            _report_once(
+                "WARNING moe_fast is not covering the fused experts (every fallback costs 256 "
+                "weight_loader calls per shard); set HUANYU_WSYNC_STRICT=1 to fail fast", worker,
+            )
+    if do_verify and verify_before is not None:
+        from verl_omni_ext.features.weight_sync import verify as _verify
+
+        after = _verify.fingerprint_model(model)
+        changed = _verify.diff_fingerprints(verify_before, after)
+        small_after = _verify.small_values(model)
+        small_changed = {name: {"before": small_before.get(name), "after": small_after[name]}
+                         for name in changed if name in small_after}
+        path = _verify.dump_fingerprints(cfg.profile or "custom", after, changed,
+                                         extra={"small_changed": small_changed})
+        _VERIFY_DUMPED = True
+        _log(f"VERIFY fingerprint: changed_tensors={len(changed)} dumped={path}", worker)
 
 
 def _arguments(signature, worker, args, kwargs):
@@ -312,14 +464,22 @@ def bind_huanyu_weight_reload(extension):
         if update_id is not None:
             zmq_utils = importlib.import_module("verl_omni.workers.rollout.vllm_rollout.zmq_utils")
             handle = zmq_utils.make_update_zmq_handle(handle, update_id)
-        receiver_class = importlib.import_module(_RECEIVER_MODULE).BucketedWeightReceiver
-        receiver = receiver_class(
-            zmq_handle=handle, device=worker.device, use_shm=values.get("use_shm", False),
-        )
+        # 默认路径（knob off）用上游 stock receiver，签名/行为不变；仅当权重同步
+        # 优化或观测开启时，换用本地 EarlyAckReceiver（协议与 v1 一致）。
+        cfg = _maybe_wsync_config()
+        use_shm = values.get("use_shm", False)
+        if cfg is not None and cfg.needs_receiver():
+            receiver = _build_wsync_receiver(handle, worker.device, use_shm, cfg)
+        else:
+            cfg = None
+            receiver_class = importlib.import_module(_RECEIVER_MODULE).BucketedWeightReceiver
+            receiver = receiver_class(
+                zmq_handle=handle, device=worker.device, use_shm=use_shm,
+            )
         _report_once(
             f"entered full Huanyu IPC update; worker={type(worker).__module__}.{type(worker).__name__}", worker,
         )
-        return receive_layerwise_weights(*standard, receiver, worker=worker)
+        return receive_layerwise_weights(*standard, receiver, worker=worker, cfg=cfg)
 
     setattr(huanyu_update_weights, _PATCH_MARKER, True)
     extension.update_weights_from_ipc = huanyu_update_weights

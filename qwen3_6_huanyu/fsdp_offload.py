@@ -16,6 +16,9 @@ from types import MethodType
 
 _ORIGINAL_TO = "_huanyu_fsdp_original_to"
 _COUNT = "_huanyu_fsdp_blocking_offload_count"
+# 与 fsdp2_pad_sync（默认开，只在需要 host 补齐的分片上同步）修的是同一个竞争；
+# 本方案把整次 offload 串行化，代价更大，默认关，只留作对照。
+_ENV = "HUANYU_FSDP_BLOCKING_OFFLOAD"
 
 
 def _safe_to(self, *args, **kwargs):
@@ -61,6 +64,13 @@ def install_huanyu_fsdp_offload(module):
     a new outer model (for example PEFT) must install on that final root too;
     a parent's ``to`` traverses child ``_apply`` methods, not child ``to``.
     """
+    if os.environ.get(_ENV, "0") != "1":
+        print(
+            f"[huanyu-fsdp-offload] phase=skipped pid={os.getpid()} {_ENV}!=1; "
+            "uneven-shard re-pad is guarded by fsdp2_pad_sync (HUANYU_FSDP2_PAD_SYNC)",
+            flush=True,
+        )
+        return module
     if hasattr(module, _ORIGINAL_TO):
         return module
     setattr(module, _ORIGINAL_TO, module.to)

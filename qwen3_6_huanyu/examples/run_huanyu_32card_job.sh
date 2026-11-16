@@ -14,6 +14,403 @@
 # Never stops an existing Ray cluster.
 set -euo pipefail
 
+# BEGIN HUANYU audio policy
+huanyu_resolve_audio_train_mode() {
+    local legacy="${HUANYU_FREEZE_AUDIO-false}" default_train key value
+    case "$legacy" in
+        true) default_train=false ;;
+        false) default_train=true ;;
+        *) echo '[huanyu-audio-mode] FATAL: HUANYU_FREEZE_AUDIO must be true or false' >&2; return 2 ;;
+    esac
+    for key in HUANYU_TRAIN_AUDIO_ENCODER HUANYU_TRAIN_AUDIO_PROJECTOR; do
+        value="${!key-$default_train}"
+        case "$value" in
+            true|false) export "$key=$value" ;;
+            *) echo "[huanyu-audio-mode] FATAL: $key must be true or false" >&2; return 2 ;;
+        esac
+    done
+    if [[ "$HUANYU_TRAIN_AUDIO_ENCODER" == true || "$HUANYU_TRAIN_AUDIO_PROJECTOR" == true ]]; then
+        export HUANYU_FREEZE_AUDIO=false MINICPMO_TUNE_AUDIO=1
+    else
+        export HUANYU_FREEZE_AUDIO=true MINICPMO_TUNE_AUDIO=0
+    fi
+}
+# END HUANYU audio policy
+# BEGIN HUANYU graph policy
+huanyu_configure_graph_mode() {
+    if [[ "${HUANYU_PRECISION_PROFILE:-full}" == full && ( "${HUANYU_GRAPH_MODE:-0}" == 1 || "${HUANYU_GRAPH_MODE:-0}" == true ) ]]; then
+        echo "[huanyu-graph] FATAL: HUANYU_PRECISION_PROFILE=full cannot capture Python precision reference kernels; use HUANYU_GRAPH_MODE=0, or explicitly select profile=custom for a separate comparison" >&2
+        return 2
+    fi
+    case "${HUANYU_GRAPH_MODE:-0}" in
+        1|true)
+            export HUANYU_GRAPH_MODE=1 HUANYU_ENFORCE_EAGER=false
+            export VLLM_TORCH_COMPILE=1
+            export TORCH_COMPILE_DISABLE=0 NPU_GRAPH_CAPTURE_DISABLE=0
+            ;;
+        0|false)
+            export HUANYU_GRAPH_MODE=0 HUANYU_ENFORCE_EAGER=true
+            export VLLM_TORCH_COMPILE=0
+            export TORCH_COMPILE_DISABLE=1 NPU_GRAPH_CAPTURE_DISABLE=1
+            ;;
+        *)
+            echo "[huanyu-graph] FATAL: HUANYU_GRAPH_MODE must be 0/1 or false/true" >&2
+            return 2
+            ;;
+    esac
+
+    # Explicit enable/disable values also override flags inherited from an
+    # already-running Raylet. Merely unsetting the driver's environment cannot
+    # remove those worker-side flags. Keep values as Hydra-quoted strings.
+    HUANYU_GRAPH_ARGS=(
+        "actor_rollout_ref.rollout.enforce_eager=${HUANYU_ENFORCE_EAGER}"
+        "reward.reward_model.rollout.enforce_eager=${HUANYU_ENFORCE_EAGER}"
+        "++ray_kwargs.ray_init.runtime_env.env_vars.HUANYU_GRAPH_MODE=\"${HUANYU_GRAPH_MODE}\""
+        "++ray_kwargs.ray_init.runtime_env.env_vars.VLLM_TORCH_COMPILE=\"${VLLM_TORCH_COMPILE}\""
+        "++ray_kwargs.ray_init.runtime_env.env_vars.TORCH_COMPILE_DISABLE=\"${TORCH_COMPILE_DISABLE}\""
+        "++ray_kwargs.ray_init.runtime_env.env_vars.NPU_GRAPH_CAPTURE_DISABLE=\"${NPU_GRAPH_CAPTURE_DISABLE}\""
+    )
+}
+# END HUANYU graph policy
+# BEGIN HUANYU precision policy
+huanyu_configure_precision_mode() {
+    local _key _value _arg _tp="${ROLLOUT_TP:-4}"
+    local _profile="${HUANYU_PRECISION_PROFILE:-full}"
+    case "$_profile" in
+        full|custom|kernel|kernel_graph) ;;
+        *) echo "[huanyu-precision] FATAL: HUANYU_PRECISION_PROFILE must be full, custom, kernel or kernel_graph" >&2; return 2 ;;
+    esac
+    if [[ "$_profile" == full && ( "${HUANYU_GRAPH_MODE:-0}" == 1 || "${HUANYU_GRAPH_MODE:-0}" == true ) ]]; then
+        echo "[huanyu-precision] FATAL: profile=full uses Python precision reference kernels and cannot capture inference graphs; set HUANYU_GRAPH_MODE=0, or explicitly select HUANYU_PRECISION_PROFILE=custom for a separate comparison" >&2
+        return 2
+    fi
+    if [[ "$_profile" == kernel && ( "${HUANYU_GRAPH_MODE:-0}" == 1 || "${HUANYU_GRAPH_MODE:-0}" == true ) ]]; then
+        echo "[huanyu-precision] FATAL: profile=kernel replaces the GDN references with native fused kernels but stays eager (use kernel_graph for aclgraph); set HUANYU_GRAPH_MODE=0" >&2
+        return 2
+    fi
+    if [[ "$_profile" == kernel_graph && "${HUANYU_GRAPH_MODE:-0}" != 1 && "${HUANYU_GRAPH_MODE:-0}" != true ]]; then
+        echo "[huanyu-precision] FATAL: profile=kernel_graph replaces the GDN references with native fused kernels and captures decode graphs; set HUANYU_GRAPH_MODE=1 (or use kernel for eager)" >&2
+        return 2
+    fi
+    export HUANYU_PRECISION_PROFILE="$_profile"
+    local -a _changed=()
+    local -a _on=(
+        MINICPMO_HUANYU_GDN_FP32_TRAINING MINICPMO_GDN_FP32_REFERENCE
+        MINICPMO_HUANYU_LAYERWISE_RELOAD MINICPMO_HYBRID_BLOCK_ZERO_REFERENCE
+        MINICPMO_ISOLATE_MEDIA_ENCODERS
+    )
+    local -a _full=(
+        MINICPMO_GDN_CACHE_BARRIER MINICPMO_GDN_PREFILL_REFERENCE
+        MINICPMO_GDN_L2NORM_REFERENCE MINICPMO_GDN_CONV_REFERENCE
+        MINICPMO_GDN_GATING_REFERENCE MINICPMO_PRIVATE_HYBRID_CACHE
+        MINICPMO_STABLE_LINEAR
+    )
+    local -a _off=(
+        MINICPMO_HF_NORM_REFERENCE
+        MINICPMO_HF_ROUTER_REFERENCE MINICPMO_HF_TEXT_ROPE_REFERENCE
+        MINICPMO_MOE_MATCH_ROLLOUT MINICPMO_ISOLATE_FULL_ATTENTION
+        MINICPMO_VISION_POSITION_REFERENCE MINICPMO_NATIVE_VISION_REFERENCE
+    )
+    for _key in "${_on[@]}" "${_full[@]}" "${_off[@]}"; do
+        if [[ "$_profile" == full && " ${_on[*]} ${_full[*]} " == *" $_key "* ]]; then
+            if [[ -v "$_key" && "${!_key}" != 1 ]]; then
+                _changed+=("$_key=${!_key}->1")
+            fi
+            printf -v "$_key" '%s' 1
+        elif [[ ! -v "$_key" ]]; then
+            case " ${_on[*]} " in
+                *" $_key "*) printf -v "$_key" '%s' 1 ;;
+                *) printf -v "$_key" '%s' 0 ;;
+            esac
+        fi
+        case "${!_key}" in
+            0|1) export "$_key" ;;
+            *) echo "[huanyu-precision] FATAL: $_key must be 0 or 1" >&2; return 2 ;;
+        esac
+    done
+    # kernel 档案：NPU 原生融合 GDN（fwd+bwd）+ npu_rms_norm 替换 FP32 参考，
+    # eager（无 aclgraph）。与 full 一样覆盖陈旧调用值，保证双节点策略一致。
+    local -a _kernel_on=(
+        MINICPMO_GDN_NPU_KERNEL MINICPMO_NPU_RMS_NORM
+        MINICPMO_HUANYU_LAYERWISE_RELOAD MINICPMO_HYBRID_BLOCK_ZERO_REFERENCE
+        MINICPMO_ISOLATE_MEDIA_ENCODERS
+    )
+    local -a _kernel_off=(
+        MINICPMO_HUANYU_GDN_FP32_TRAINING MINICPMO_GDN_FP32_REFERENCE
+        MINICPMO_GDN_CACHE_BARRIER MINICPMO_GDN_PREFILL_REFERENCE
+        MINICPMO_GDN_L2NORM_REFERENCE MINICPMO_GDN_CONV_REFERENCE
+        MINICPMO_GDN_GATING_REFERENCE MINICPMO_STABLE_LINEAR
+        MINICPMO_PRIVATE_HYBRID_CACHE
+        MINICPMO_HF_NORM_REFERENCE MINICPMO_HF_ROUTER_REFERENCE
+        MINICPMO_HF_TEXT_ROPE_REFERENCE MINICPMO_MOE_MATCH_ROLLOUT
+        MINICPMO_ISOLATE_FULL_ATTENTION MINICPMO_VISION_POSITION_REFERENCE
+        MINICPMO_NATIVE_VISION_REFERENCE
+    )
+    if [[ "$_profile" == kernel || "$_profile" == kernel_graph ]]; then
+        for _key in "${_kernel_on[@]}"; do
+            if [[ -v "$_key" && "${!_key}" != 1 ]]; then
+                _changed+=("$_key=${!_key}->1")
+            fi
+            printf -v "$_key" '%s' 1
+            export "$_key"
+        done
+        for _key in "${_kernel_off[@]}"; do
+            if [[ -v "$_key" && "${!_key}" != 0 ]]; then
+                _changed+=("$_key=${!_key}->0")
+            fi
+            printf -v "$_key" '%s' 0
+            export "$_key"
+        done
+        # 诊断二分：kernel 档案把融合 GDN 与 npu_rms_norm 一起打开，NaN 定位
+        # 需要单独回退其中一个。声明走这一个开关，worker 侧 precision_policy
+        # 的策略断言认同一声明（不是绕过断言，而是把断言改成声明的那组值）。
+        export HUANYU_KERNEL_BISECT="${HUANYU_KERNEL_BISECT:-none}"
+        case "$HUANYU_KERNEL_BISECT" in
+            none) ;;
+            gdn_off)
+                export MINICPMO_GDN_NPU_KERNEL=0 MINICPMO_HUANYU_GDN_FP32_TRAINING=1
+                _changed+=("bisect=gdn_off") ;;
+            rms_off)
+                export MINICPMO_NPU_RMS_NORM=0
+                _changed+=("bisect=rms_off") ;;
+            *) echo "[huanyu-precision] FATAL: HUANYU_KERNEL_BISECT must be none, gdn_off or rms_off" >&2; return 2 ;;
+        esac
+    elif [[ -n "${HUANYU_KERNEL_BISECT:-}" && "$HUANYU_KERNEL_BISECT" != none ]]; then
+        echo "[huanyu-precision] FATAL: HUANYU_KERNEL_BISECT only applies to the kernel/kernel_graph profiles" >&2
+        return 2
+    else
+        export HUANYU_KERNEL_BISECT=none
+        # 非 kernel 档案默认关闭 fused kernel 开关（显式 custom 可覆盖）。
+        for _key in MINICPMO_GDN_NPU_KERNEL MINICPMO_NPU_RMS_NORM; do
+            if [[ ! -v "$_key" ]]; then
+                printf -v "$_key" '%s' 0
+            fi
+            case "${!_key}" in
+                0|1) export "$_key" ;;
+                *) echo "[huanyu-precision] FATAL: $_key must be 0 or 1" >&2; return 2 ;;
+            esac
+        done
+    fi
+    # 融合 MoE kernel / R3 路由回放：独立 A/B 开关，所有档案默认 0，
+    # 显式 custom 覆盖；replay 强依赖 fused kernel（worker 侧同样 fail-closed）。
+    for _key in MINICPMO_MOE_NPU_KERNEL HUANYU_EXPERT_REPLAY; do
+        if [[ ! -v "$_key" ]]; then
+            printf -v "$_key" '%s' 0
+        fi
+        case "${!_key}" in
+            0|1) export "$_key" ;;
+            *) echo "[huanyu-precision] FATAL: $_key must be 0 or 1" >&2; return 2 ;;
+        esac
+    done
+    if [[ "$HUANYU_EXPERT_REPLAY" == 1 && "$MINICPMO_MOE_NPU_KERNEL" != 1 ]]; then
+        echo "[huanyu-precision] FATAL: HUANYU_EXPERT_REPLAY=1 requires MINICPMO_MOE_NPU_KERNEL=1 (replay only exists in the fused MoE kernel)" >&2
+        return 2
+    fi
+    # R3 的 vLLM 侧钩子（general plugin）与 trainer/server 侧补丁全部走
+    # _patchkit：任何一个没打上都必须在启动期 raise，不能静默退回原生路由。
+    if [[ "$HUANYU_EXPERT_REPLAY" == 1 ]]; then
+        if [[ -v VERL_OMNI_EXT_PATCH_STRICT && "$VERL_OMNI_EXT_PATCH_STRICT" != 1 ]]; then
+            echo "[huanyu-precision] FATAL: HUANYU_EXPERT_REPLAY=1 requires VERL_OMNI_EXT_PATCH_STRICT=1" >&2
+            return 2
+        fi
+        export VERL_OMNI_EXT_PATCH_STRICT=1
+    fi
+    export HUANYU_REPLAY_DEBUG="${HUANYU_REPLAY_DEBUG:-0}"
+    case "$HUANYU_REPLAY_DEBUG" in
+        0|1) ;;
+        *) echo "[huanyu-precision] FATAL: HUANYU_REPLAY_DEBUG must be 0 or 1" >&2; return 2 ;;
+    esac
+    if [[ "$MINICPMO_MOE_NPU_KERNEL" == 1 && "${MINICPMO_MOE_MATCH_ROLLOUT:-0}" == 1 ]]; then
+        echo "[huanyu-precision] FATAL: MINICPMO_MOE_NPU_KERNEL and MINICPMO_MOE_MATCH_ROLLOUT are mutually exclusive" >&2
+        return 2
+    fi
+    if [[ "$_profile" == full ]]; then
+        if [[ -v MINICPMO_FSDP2_PIN_MEMORY && "$MINICPMO_FSDP2_PIN_MEMORY" != 0 ]]; then
+            _changed+=("MINICPMO_FSDP2_PIN_MEMORY=$MINICPMO_FSDP2_PIN_MEMORY->0")
+        fi
+        export MINICPMO_FSDP2_PIN_MEMORY=0
+    else
+        export MINICPMO_FSDP2_PIN_MEMORY="${MINICPMO_FSDP2_PIN_MEMORY:-0}"
+    fi
+    case "$MINICPMO_FSDP2_PIN_MEMORY" in
+        0|1) ;;
+        *) echo "[huanyu-precision] FATAL: MINICPMO_FSDP2_PIN_MEMORY must be 0 or 1" >&2; return 2 ;;
+    esac
+    # Hydra applies the last CLI override. Use that exact TP in both preflight
+    # arithmetic validation and the worker environment, not a stale shell TP.
+    for _arg in "$@"; do
+        _key="${_arg%%=*}"
+        while [[ "$_key" == +* ]]; do _key="${_key#+}"; done
+        if [[ "$_key" == actor_rollout_ref.rollout.tensor_model_parallel_size ]]; then
+            _tp="${_arg#*=}"
+            _tp="${_tp#\"}"; _tp="${_tp%\"}"
+            _tp="${_tp#\'}"; _tp="${_tp%\'}"
+        fi
+    done
+    if [[ ! "$_tp" =~ ^[1-9][0-9]*$ ]]; then
+        echo "[huanyu-precision] FATAL: rollout tensor_model_parallel_size must be a positive integer" >&2
+        return 2
+    fi
+    export ROLLOUT_TP="$_tp" MINICPMO_HUANYU_ROLLOUT_TP="$_tp"
+    for _key in MINICPMO_MOE_TP_REFERENCE MINICPMO_ROW_TP_REFERENCE; do
+        _value="${!_key:-0}"
+        case "$_value" in
+            0) ;;
+            4)
+                if [[ "$_tp" != 4 ]]; then
+                    echo "[huanyu-precision] FATAL: $_key=4 requires actual rollout TP=4, got $_tp" >&2
+                    return 2
+                fi ;;
+            *) echo "[huanyu-precision] FATAL: $_key supports only 0 or 4" >&2; return 2 ;;
+        esac
+        export "$_key=$_value"
+    done
+    export VLLM_OMNI_EXTERNAL_MODULES=verl_omni_ext.models.qwen3_6_huanyu.engine_hooks
+    export HUANYU_USE_PRECOMPUTE="${HUANYU_USE_PRECOMPUTE:-0}"
+    case "$HUANYU_USE_PRECOMPUTE" in
+        0|1) ;;
+        *) echo "[huanyu-precision] FATAL: HUANYU_USE_PRECOMPUTE must be 0 or 1" >&2; return 2 ;;
+    esac
+    # The two-node job snapshots these defaults/caller overrides across the
+    # site env file. Cache mode, TP and HCCL are resolved later by the launcher.
+    HUANYU_PRECISION_KEYS=(HUANYU_PRECISION_PROFILE "${_on[@]}" "${_full[@]}" "${_off[@]}" \
+        MINICPMO_FSDP2_PIN_MEMORY MINICPMO_MOE_TP_REFERENCE MINICPMO_ROW_TP_REFERENCE \
+        MINICPMO_GDN_NPU_KERNEL MINICPMO_NPU_RMS_NORM \
+        MINICPMO_MOE_NPU_KERNEL HUANYU_EXPERT_REPLAY HUANYU_KERNEL_BISECT)
+    # Opt-in job policy is snapshotted across site setup and explicitly sent to
+    # fresh Ray workers even when their raylet was started with other defaults.
+    export HUANYU_JOB_DETERMINISM="${HUANYU_JOB_DETERMINISM:-0}"
+    case "$HUANYU_JOB_DETERMINISM" in
+        0|1) ;;
+        *) echo '[huanyu-precision] FATAL: HUANYU_JOB_DETERMINISM must be 0 or 1' >&2; return 2 ;;
+    esac
+    HUANYU_PRECISION_KEYS+=(HUANYU_JOB_DETERMINISM)
+    # Preserve optional timing through site setup and existing Ray clusters.
+    export HUANYU_GEN_TIMING="${HUANYU_GEN_TIMING:-0}"
+    export HUANYU_GEN_TIMING_ENGINE_EVERY="${HUANYU_GEN_TIMING_ENGINE_EVERY:-100}"
+    case "$HUANYU_GEN_TIMING" in
+        0|1) ;;
+        *) echo '[huanyu-timing] FATAL: HUANYU_GEN_TIMING must be 0 or 1' >&2; return 2 ;;
+    esac
+    if [[ ! "$HUANYU_GEN_TIMING_ENGINE_EVERY" =~ ^[1-9][0-9]*$ ]]; then
+        echo '[huanyu-timing] FATAL: HUANYU_GEN_TIMING_ENGINE_EVERY must be a positive integer' >&2
+        return 2
+    fi
+    HUANYU_PRECISION_KEYS+=(HUANYU_GEN_TIMING HUANYU_GEN_TIMING_ENGINE_EVERY)
+    if [[ "$HUANYU_JOB_DETERMINISM" == 1 ]]; then
+        export HCCL_DETERMINISTIC=strict ASCEND_LAUNCH_BLOCKING=1 NCCL_DETERMINISTIC=1
+        export LCCL_DETERMINISTIC=1 VLLM_BATCH_INVARIANT=0
+        HUANYU_PRECISION_KEYS+=(ASCEND_LAUNCH_BLOCKING NCCL_DETERMINISTIC LCCL_DETERMINISTIC VLLM_BATCH_INVARIANT)
+    fi
+    HUANYU_PRECISION_ARGS=()
+    if [[ "$HUANYU_JOB_DETERMINISM" == 1 ]]; then
+        # verl's full_determinism option also enables batch-invariant kernels.
+        # This job intentionally selects the independent worker policy instead.
+        HUANYU_PRECISION_ARGS+=(
+            'actor_rollout_ref.rollout.full_determinism=false'
+            '++reward.reward_model.rollout.full_determinism=false'
+            '++actor_rollout_ref.rollout.engine_kwargs.vllm_omni.additional_config.rl_config.enabled=true'
+            '++actor_rollout_ref.rollout.engine_kwargs.vllm_omni.additional_config.rl_config.enable_batch_invariant=false'
+        )
+    fi
+    # Keep the outer actor engine kwargs consistent with stage-0 engine_extras:
+    # native deploy merging must not restore the generic colocated extension.
+    # This applies to the actor only; the reward model keeps its own extension.
+    HUANYU_PRECISION_ARGS+=(
+        "++actor_rollout_ref.rollout.engine_kwargs.vllm_omni.worker_extension_cls=verl_omni_ext.models.qwen3_6_huanyu.worker_extension.HuanyuColocateWorkerExtension"
+    )
+    if [[ "$_profile" == kernel || "$_profile" == kernel_graph ]]; then
+        # 910_93 原生 recurrent decode kernel 仅接受 BF16 state（checkpoint 的
+        # text_config.mamba_ssm_dtype=float32 仅在 cache dtype 为 auto 时生效，
+        # 显式 engine kwarg 优先；rollout_kernels 启动期会断言实际值）。
+        HUANYU_PRECISION_ARGS+=(
+            "++actor_rollout_ref.rollout.engine_kwargs.vllm_omni.mamba_ssm_cache_dtype=bfloat16"
+        )
+    fi
+    for _key in "${HUANYU_PRECISION_KEYS[@]}" \
+        MINICPMO_HUANYU_ROLLOUT_TP VLLM_OMNI_EXTERNAL_MODULES HUANYU_USE_PRECOMPUTE \
+        HUANYU_REPLAY_DEBUG VERL_OMNI_EXT_PATCH_STRICT \
+        HCCL_OP_EXPANSION_MODE HCCL_DETERMINISTIC HCCL_ALGO HCCL_BUFFSIZE \
+        HCCL_ENABLE_OPEN_AIV HUANYU_HCCL_PROFILE; do
+        _value="${!_key:-}"
+        # Do not introduce an empty HCCL setting: native CANN may distinguish
+        # an empty value from an unset variable. Forward only a defined policy.
+        # HUANYU_HCCL_PROFILE 同理：hccl_mode.sh 未 source 时不发明空 profile。
+        if [[ ("$_key" == HCCL_* || "$_key" == HUANYU_HCCL_PROFILE || "$_key" == VERL_OMNI_EXT_PATCH_STRICT) \
+              && -z "$_value" ]]; then continue; fi
+        # Hydra quoted strings preserve the driver's actual numerical policy
+        # when reusing an already-running Raylet.
+        _value="${_value//\\/\\\\}"
+        _value="${_value//\"/\\\"}"
+        HUANYU_PRECISION_ARGS+=("++ray_kwargs.ray_init.runtime_env.env_vars.${_key}=\"${_value}\"")
+    done
+    if (( ${#_changed[@]} )); then
+        echo "[huanyu-precision] profile=full overrides inherited values: ${_changed[*]}"
+    fi
+    # Repeated source calls in one shell revalidate/rebuild argv but only repeat
+    # the detailed report if its actual values changed. Child launchers report
+    # independently, and the worker Python installers report active execution.
+    local _report="profile=$_profile actual_TP=$_tp cache=$HUANYU_USE_PRECOMPUTE graph=${HUANYU_GRAPH_MODE:-0}"
+    for _key in "${HUANYU_PRECISION_KEYS[@]}"; do _report+=" $_key=${!_key}"; done
+    if [[ "${_HUANYU_PRECISION_LAST_REPORT:-}" != "$_report" ]]; then
+        echo "[huanyu-precision] profile=$_profile actual_TP=$_tp cache=$HUANYU_USE_PRECOMPUTE graph=${HUANYU_GRAPH_MODE:-0} hooks=$VLLM_OMNI_EXTERNAL_MODULES"
+        for _key in "${HUANYU_PRECISION_KEYS[@]}"; do
+            echo "[huanyu-precision] effective $_key=${!_key}"
+        done
+        _HUANYU_PRECISION_LAST_REPORT="$_report"
+    fi
+}
+# END HUANYU precision policy
+# BEGIN HUANYU native policy
+huanyu_select_native_source() {
+    local root="${HUANYU_VLLM_SOURCE:-${HUANYU_VLLM_OMNI_ROOT:-/vllm-workspace/vllm-omni}}"
+    local explicit="${1:-}" old_source="${HUANYU_VLLM_SOURCE:-}" old_root="${HUANYU_VLLM_OMNI_ROOT:-}"
+    local entry retained="" required
+    local -a entries=()
+    # Retire source choices inherited from old prepare/activate.sh files.
+    if [[ "$explicit" != --explicit-source ]]; then
+        case "${root%/}" in
+            */vllm-omni-xy|*/vllm-omni-xy-*) root=/vllm-workspace/vllm-omni ;;
+        esac
+    fi
+    if [[ "$root" != /* || "$root" == *:* || "$root" == *$'\n'* ]]; then
+        echo 'FATAL: HUANYU_VLLM_SOURCE must be an absolute directory without colons/newlines' >&2
+        return 2
+    fi
+    for required in vllm_omni/__init__.py \
+        vllm_omni/model_executor/models/minicpmo_5_0/huanyu_audio.py \
+        vllm_omni/model_executor/models/minicpmo_5_0/minicpmo_5_0_omni_llm.py; do
+        [[ -r "$root/$required" ]] || {
+            echo "FATAL: Huanyu-enabled source is incomplete: $root/$required" >&2
+            return 1
+        }
+    done
+    root="$(cd -- "$root" && pwd -P)" || return $?
+    IFS=: read -r -a entries <<< "${PYTHONPATH:-}"
+    for entry in "${entries[@]}"; do
+        case "${entry%/}" in
+            ""|"$root"|"$old_source"|"$old_root"|\
+            /vllm-workspace/vllm-omni|/vllm-workspace/vllm-omni/*|\
+            */vllm-omni-xy|*/vllm-omni-xy/*|*/vllm-omni-xy-*|*/vllm-omni-xy-*/*) continue ;;
+        esac
+        # A differently named checkout must not shadow the installed package.
+        [[ -f "$entry/vllm_omni/__init__.py" ]] && continue
+        retained+="${retained:+:}$entry"
+    done
+    # These are expected-origin checks, not import-path overrides.
+    export HUANYU_VLLM_SOURCE="$root" HUANYU_VLLM_OMNI_ROOT="$root"
+    if [[ "$explicit" == --explicit-source ]]; then
+        export PYTHONPATH="$root${retained:+:$retained}"
+    elif [[ -n "$retained" ]]; then
+        export PYTHONPATH="$retained"
+    else
+        unset PYTHONPATH
+    fi
+}
+# END HUANYU native policy
+
+
+
 # Some schedulers wrap this node-level entry in torchrun/torch.distributed.launch
 # with one Bash process per NPU. Elect local rank 0 BEFORE Python, setup, logs or
 # flock; peers exit successfully so the outer launcher does not kill the owner.
@@ -85,24 +482,23 @@ export PROJECT_ROOT="${PROJECT_ROOT:-/opt/huawei/dataset/infra_data/verl_omni_qw
 _HUANYU_EXAMPLE_DIR="${PROJECT_ROOT}/examples/qwen3_6_huanyu"
 cd "$PROJECT_ROOT"
 if [[ "${HUANYU_JOB_MODE:-frozen_cache}" == aqa_unfreeze ]]; then
-    if [[ "${TRAIN_FILE:-}" == /opt/huawei/dataset/infra_data/data/train.parquet ]]; then unset TRAIN_FILE; fi
-    if [[ "${VAL_FILE:-}" == /opt/huawei/dataset/infra_data/data/validation.parquet ]]; then unset VAL_FILE; fi
-    export TRAIN_FILE="${HUANYU_AQA_TRAIN_FILE:-${TRAIN_FILE:-/opt/huawei/dataset/infra_data/data/aqa_dataset/train.parquet}}"
-    export VAL_FILE="${HUANYU_AQA_VAL_FILE:-${VAL_FILE:-/opt/huawei/dataset/infra_data/data/aqa_dataset/validation.parquet}}"
+    export TRAIN_FILE="${TRAIN_FILE:-${HUANYU_AQA_TRAIN_FILE:-/opt/huawei/dataset/infra_data/data/aqa_dataset/train.parquet}}"
+    export VAL_FILE="${VAL_FILE:-${HUANYU_AQA_VAL_FILE:-/opt/huawei/dataset/infra_data/data/aqa_dataset/validation.parquet}}"
 elif [[ "${HUANYU_JOB_MODE:-}" == stem ]]; then
-    # The STEM launcher owns data selection even if the shell retains AQA paths.
+    # Explicit common paths take priority over STEM aliases and directory defaults.
     export STEM_DATA_DIR="${STEM_DATA_DIR:-/opt/huawei/dataset/infra_data/data/rl_stem_data}"
-    export TRAIN_FILE="${STEM_TRAIN_FILE:-$STEM_DATA_DIR/train.parquet}"
-    export VAL_FILE="${STEM_VAL_FILE:-$STEM_DATA_DIR/val.parquet}"
-    if [[ -z "${STEM_VAL_FILE:-}" && ! -f "$VAL_FILE" && -f "$STEM_DATA_DIR/validation.parquet" ]]; then
-        export VAL_FILE="$STEM_DATA_DIR/validation.parquet"
+    export TRAIN_FILE="${TRAIN_FILE:-${STEM_TRAIN_FILE:-$STEM_DATA_DIR/train.parquet}}"
+    if [[ -z "${VAL_FILE:-}" && -z "${STEM_VAL_FILE:-}" &&
+          ! -f "$STEM_DATA_DIR/val.parquet" && -f "$STEM_DATA_DIR/validation.parquet" ]]; then
+        export STEM_VAL_FILE="$STEM_DATA_DIR/validation.parquet"
     fi
+    export VAL_FILE="${VAL_FILE:-${STEM_VAL_FILE:-$STEM_DATA_DIR/val.parquet}}"
 fi
 # Resolve deployment paths once. Site environment files may still contain old
 # defaults; neither they nor downstream wrappers should replace caller paths.
 declare -A _HUANYU_PATH_CONFIG=(
     [PROJECT_ROOT]="$PROJECT_ROOT"
-    [MODEL_PATH]="${MODEL_PATH:-/opt/huawei/dataset/model_gy/downloaded_models/Qwen3.6-35B-A3B-huanyu06b-iter2000-omni4b-hf-huanyu7tokens}"
+    [MODEL_PATH]="${MODEL_PATH:-/opt/huawei/dataset/model_gy/downloaded_models/2748}"
     [RM_MODEL_PATH]="${RM_MODEL_PATH:-/opt/huawei/dataset/model_gy/downloaded_models/Qwen3.5-35B-A3B}"
     [TRAIN_FILE]="${TRAIN_FILE:-/opt/huawei/dataset/infra_data/data/train.parquet}"
     [VAL_FILE]="${VAL_FILE:-/opt/huawei/dataset/infra_data/data/validation.parquet}"
@@ -119,16 +515,38 @@ done
 # probes in that same interpreter environment.
 _PYTHON=python3
 _HELPER="${_HUANYU_EXAMPLE_DIR}/job_bootstrap.py"
-_ENV_FILE="${HUANYU_ENV_FILE:-${_HUANYU_EXAMPLE_DIR}/env_export_huanyu.sh}"
-_PRECISION_FILE="${_HUANYU_EXAMPLE_DIR}/precision_mode.sh"
+_ENV_FILE="${HUANYU_ENV_FILE:-}"
 _VLLM_SOURCE="${HUANYU_VLLM_SOURCE:-${HUANYU_VLLM_OMNI_ROOT:-/vllm-workspace/vllm-omni}}"
-_NATIVE_PATH_FILE="${_HUANYU_EXAMPLE_DIR}/native_source.sh"
 _RANK="${VC_TASK_INDEX:-}"
 _WAIT="${RAY_CLUSTER_WAIT_TIMEOUT:-900}"
 _INTERVAL="${RAY_CLUSTER_POLL_INTERVAL:-5}"
 _PORT="${RAY_PORT:-6925}"
 _DASHBOARD_PORT="${RAY_DASHBOARD_PORT:-8960}"
 _JOB_MODE="${HUANYU_JOB_MODE:-frozen_cache}"
+# Resolve reward selection before pool validation and preserve it across site
+# setup. An explicit public mode wins over the old per-entry switches.
+_REWARD_MODE="${HUANYU_REWARD_MODE:-}"
+if [[ -z "$_REWARD_MODE" ]]; then
+    if [[ "$_JOB_MODE" == stem && -n "${STEM_REWARD_MODE:-}" ]]; then
+        _REWARD_MODE="$STEM_REWARD_MODE"
+    elif [[ -n "${RM_ENABLE:-}" ]]; then
+        case "$RM_ENABLE" in
+            0) _REWARD_MODE=rule_based ;;
+            1) _REWARD_MODE=RM ;;
+            *) echo 'FATAL: RM_ENABLE must be 0 or 1' >&2; exit 2 ;;
+        esac
+    elif [[ "$_JOB_MODE" == stem ]]; then
+        _REWARD_MODE=rule_based
+    else
+        _REWARD_MODE=RM
+    fi
+fi
+case "${_REWARD_MODE,,}" in
+    rm|genrm) _REWARD_MODE=RM; _REWARD_ENABLED=1 ;;
+    rule|rule_based|ruled_based) _REWARD_MODE=rule_based; _REWARD_ENABLED=0 ;;
+    *) echo 'FATAL: HUANYU_REWARD_MODE must be RM or rule_based' >&2; exit 2 ;;
+esac
+export HUANYU_REWARD_MODE="$_REWARD_MODE" RM_ENABLE="$_REWARD_ENABLED"
 _RAY_READINESS_CHECK="$_PREFLIGHT"
 _CLUSTER_NODES="${HUANYU_CLUSTER_NODES:-2}"
 if [[ "$_JOB_MODE" == stem ]]; then
@@ -149,8 +567,9 @@ declare -A _HUANYU_POOL_CONFIG=(
     [RM_N_GPUS_PER_NODE]="${RM_N_GPUS_PER_NODE:-16}" [RM_NNODES]="${RM_NNODES:-1}"
     [RM_SPLIT_NODES]="${RM_SPLIT_NODES:-1}"
 )
+if (( ! _REWARD_ENABLED )); then _HUANYU_POOL_CONFIG[RM_NNODES]=0; fi
 for _key in NUM_NPUS NNODES ROLLOUT_TP RM_TP RM_N_GPUS_PER_NODE RM_NNODES; do
-    if [[ "$_JOB_MODE" == stem && "$_key" == RM_NNODES && "${_HUANYU_POOL_CONFIG[$_key]}" == 0 ]]; then continue; fi
+    if [[ "$_key" == RM_NNODES && "${_HUANYU_POOL_CONFIG[$_key]}" == 0 && "$_REWARD_ENABLED" == 0 ]]; then continue; fi
     if [[ ! "${_HUANYU_POOL_CONFIG[$_key]}" =~ ^[1-9][0-9]?$ ]]; then
         echo "FATAL: $_key must be a positive integer (without leading zeroes)" >&2
         exit 2
@@ -162,25 +581,28 @@ _RM_PER_NODE=${_HUANYU_POOL_CONFIG[RM_N_GPUS_PER_NODE]}
 _RM_NODES=${_HUANYU_POOL_CONFIG[RM_NNODES]}
 if (( ! _PREPARE_ONLY )); then
 if [[ "$_JOB_MODE" == stem ]]; then
-    if (( _ACTOR_PER_NODE != 16 || _ACTOR_NODES != _CLUSTER_NODES ||
-          _ACTOR_PER_NODE % ${_HUANYU_POOL_CONFIG[ROLLOUT_TP]} != 0 )) || [[ "${RM_ENABLE:-0}" != 0 ]]; then
-        echo 'FATAL: STEM requires all physical nodes for Actor, NUM_NPUS=16, node-local TP dividing 16, and RM_ENABLE=0' >&2
+    if (( _ACTOR_PER_NODE != 16 || _ACTOR_NODES + _RM_NODES > _CLUSTER_NODES ||
+          _ACTOR_PER_NODE % ${_HUANYU_POOL_CONFIG[ROLLOUT_TP]} != 0 ||
+          (_REWARD_ENABLED && (_RM_PER_NODE != 16 || _RM_NODES < 1 ||
+           _RM_PER_NODE % ${_HUANYU_POOL_CONFIG[RM_TP]} != 0)) )); then
+        echo 'FATAL: STEM requires 16-card node-local Actor/RM pools within the physical nodes, with each TP dividing 16' >&2
         exit 2
     fi
 else
 if (( _ACTOR_PER_NODE > 16 || _RM_PER_NODE > 16 || _ACTOR_NODES > 2 || _RM_NODES > 2 ||
-      _ACTOR_PER_NODE * _ACTOR_NODES + _RM_PER_NODE * _RM_NODES != 32 ||
+      _ACTOR_PER_NODE * _ACTOR_NODES + _RM_PER_NODE * _RM_NODES > 32 ||
       _ACTOR_PER_NODE % ${_HUANYU_POOL_CONFIG[ROLLOUT_TP]} != 0 ||
-      _RM_PER_NODE % ${_HUANYU_POOL_CONFIG[RM_TP]} != 0 )); then
-    echo 'FATAL: pool sizes must total 32 on two 16-card nodes; each per-node pool must be divisible by its TP' >&2
+      (_REWARD_ENABLED && (_RM_NODES < 1 || _RM_PER_NODE % ${_HUANYU_POOL_CONFIG[RM_TP]} != 0)) )); then
+    echo 'FATAL: pool sizes must fit within 32 on two 16-card nodes; each enabled per-node pool must be divisible by its TP' >&2
     exit 2
 fi
 # Each per-node pool is STRICT_PACK. Check it can be packed into two physical
-# nodes; checking only the 32-card total would accept impossible [12,12]+[8].
+# nodes; checking only the total would accept impossible [12,12]+[8].
 _POOLS_FIT=0
 for (( _a=0; _a<=_ACTOR_NODES; _a++ )); do
     for (( _r=0; _r<=_RM_NODES; _r++ )); do
-        if (( _a * _ACTOR_PER_NODE + _r * _RM_PER_NODE == 16 )); then
+        if (( _a * _ACTOR_PER_NODE + _r * _RM_PER_NODE <= 16 &&
+              (_ACTOR_NODES - _a) * _ACTOR_PER_NODE + (_RM_NODES - _r) * _RM_PER_NODE <= 16 )); then
             _POOLS_FIT=1
         fi
     done
@@ -189,28 +611,26 @@ if (( ! _POOLS_FIT )); then
     echo 'FATAL: per-node pools cannot fit on two 16-card nodes; for actor24 + RM8 use actor12x2 and RM4x2' >&2
     exit 2
 fi
-if [[ "$_JOB_MODE" == aqa_unfreeze ]] &&
+if [[ "$_JOB_MODE" == aqa_unfreeze ]] && (( _REWARD_ENABLED )) &&
     (( _ACTOR_PER_NODE != 16 || _ACTOR_NODES != 1 || _RM_PER_NODE != 16 || _RM_NODES != 1 )); then
     echo 'FATAL: AQA jobs require actor16 + RM16' >&2
     exit 2
 fi
-fi  # STEM uses every node for Actor and no GenRM resource pool.
+fi  # STEM assigns whole nodes; the two-node multimodal mode also permits smaller pools.
 fi  # Pool packing is checked when launching the job, not during standalone setup.
 case "$_JOB_MODE" in
-    frozen_cache) _TRAIN_ENTRY=run_huanyu.sh ;;
+    frozen_cache) _TRAIN_ENTRY=run_qwen36_huanyu_gspo_npu_omni_mix_genrm.sh ;;
     aqa_unfreeze) _TRAIN_ENTRY=run_huanyu_aqa_audio_train.sh ;;
     stem) _TRAIN_ENTRY=run_huanyu_stem.sh ;;
     *) echo 'FATAL: HUANYU_JOB_MODE must be frozen_cache, aqa_unfreeze or stem' >&2; exit 2 ;;
 esac
 # Keep the component choices through site environment setup and into existing
 # Ray workers. The frozen-cache entry always freezes both audio components.
-_AUDIO_MODE_FILE="${_HUANYU_EXAMPLE_DIR}/audio_train_mode.sh"
-[[ -f "$_AUDIO_MODE_FILE" ]] || { echo "FATAL: missing $_AUDIO_MODE_FILE" >&2; exit 1; }
 if [[ "$_JOB_MODE" == frozen_cache || "$_JOB_MODE" == stem ]]; then
     export HUANYU_FREEZE_AUDIO=true
     export HUANYU_TRAIN_AUDIO_ENCODER=false HUANYU_TRAIN_AUDIO_PROJECTOR=false
 fi
-source "$_AUDIO_MODE_FILE" || exit $?
+huanyu_resolve_audio_train_mode || exit $?
 declare -A _HUANYU_AUDIO_CONFIG=()
 for _key in HUANYU_FREEZE_AUDIO HUANYU_TRAIN_AUDIO_ENCODER HUANYU_TRAIN_AUDIO_PROJECTOR MINICPMO_TUNE_AUDIO; do
     _HUANYU_AUDIO_CONFIG["$_key"]="${!_key}"
@@ -245,53 +665,13 @@ if (( _PORT > 65535 || _DASHBOARD_PORT > 65535 || _PORT == _DASHBOARD_PORT )); t
     exit 2
 fi
 
-# Platform jobs are non-interactive and may never read the image's .bashrc
-# jemalloc export. Set it before Python/pip and the Ascend setup scripts (which
-# also import torch), not just before Ray. This restores the allocator setup in
-# the known working job entry; a native import must still exit successfully.
-_HUANYU_JOB_JEMALLOC="${HUANYU_JEMALLOC_LIBRARY:-${Q36_JEMALLOC_LIBRARY:-}}"
-_HUANYU_PRELOAD_LIBS=()
-_HUANYU_ORIGINAL_PRELOAD="${LD_PRELOAD:-}"
-read -r -a _HUANYU_PRELOAD_LIBS <<< "${_HUANYU_ORIGINAL_PRELOAD//:/ }"
-if [[ -z "$_HUANYU_JOB_JEMALLOC" ]]; then
-    for _library in "${_HUANYU_PRELOAD_LIBS[@]}"; do
-        if [[ "$_library" == /* && "${_library##*/}" == libjemalloc*.so* && -f "$_library" && -r "$_library" ]]; then
-            _HUANYU_JOB_JEMALLOC="$_library"
-            break
-        fi
-    done
-fi
-if [[ -z "$_HUANYU_JOB_JEMALLOC" ]]; then
-    for _library in /usr/lib/"$(uname -m)"-linux-gnu/libjemalloc.so.2 \
-        /usr/lib64/libjemalloc.so.2 /usr/lib/libjemalloc.so.2 \
-        /lib/"$(uname -m)"-linux-gnu/libjemalloc.so.2; do
-        if [[ -f "$_library" && -r "$_library" ]]; then
-            _HUANYU_JOB_JEMALLOC="$_library"
-            break
-        fi
-    done
-fi
-if [[ "$_HUANYU_JOB_JEMALLOC" != /* || ! -f "$_HUANYU_JOB_JEMALLOC" || ! -r "$_HUANYU_JOB_JEMALLOC" \
-    || "$_HUANYU_JOB_JEMALLOC" == *[[:space:]:]* ]]; then
-    echo 'FATAL: set HUANYU_JEMALLOC_LIBRARY to a readable absolute libjemalloc.so path on BOTH nodes (no spaces/colons)' >&2
-    exit 1
-fi
-huanyu_preload_allocator() {
-    local library
-    local -a libraries=()
-    local current_preload="${LD_PRELOAD:-}"
-    read -r -a libraries <<< "${current_preload//:/ }"
-    # Keep unrelated preloads, but do not stack multiple jemalloc versions.
-    export LD_PRELOAD="$_HUANYU_JOB_JEMALLOC"
-    for library in "${libraries[@]}"; do
-        if [[ "${library##*/}" != libjemalloc*.so* && "$library" != "$_HUANYU_JOB_JEMALLOC" ]]; then
-            export LD_PRELOAD="$LD_PRELOAD:$library"
-        fi
-    done
-}
-huanyu_preload_allocator
-[[ -f "$_HELPER" && -f "$_ENV_FILE" && -f "$_PRECISION_FILE" && -f "$_NATIVE_PATH_FILE" ]] || {
-    echo "FATAL: missing Huanyu package, env file or precision_mode.sh" >&2; exit 1;
+# Only load preparation functions here; the standalone prepare entry is not run.
+# Keep allocator setup before the first Python/node probe.
+source "${_HUANYU_EXAMPLE_DIR}/prepare_huanyu_env.sh" --functions-only
+huanyu_prepare_allocator
+
+[[ -f "$_HELPER" && ( -z "$_ENV_FILE" || -f "$_ENV_FILE" ) ]] || {
+    echo "FATAL: missing job_bootstrap.py or explicit HUANYU_ENV_FILE" >&2; exit 1;
 }
 echo "[huanyu-job] allocator before Python/env setup: LD_PRELOAD=$LD_PRELOAD"
 if (( _MANAGE_RAY )); then
@@ -312,33 +692,28 @@ for _arg in "$@"; do
     esac
 done
 
-# Preserve explicit AQA and Whisper settings across site environment setup.
-# Older site env files must not change preflight
-# lengths/batches or sampling defaults before that command is composed.
+# Preserve exported training settings in every mode, including frozen_cache.
+# Site setup provides defaults; it must not replace the caller's experiment.
 declare -A _HUANYU_PROFILE_CONFIG=()
-if [[ "${HUANYU_JOB_PROFILE:-}" == whisper_aligned || "$_JOB_MODE" == aqa_unfreeze || "$_JOB_MODE" == stem ]]; then
-    for _key in TRAIN_BATCH_SIZE PPO_MINI_BATCH_SIZE PPO_MICRO_BATCH_SIZE_PER_GPU \
+for _key in TRAIN_BATCH_SIZE PPO_MINI_BATCH_SIZE PPO_MICRO_BATCH_SIZE_PER_GPU LOG_PROB_MICRO_BATCH_SIZE_PER_GPU \
         ROLLOUT_N ACTOR_MODEL_DTYPE REF_MODEL_DTYPE ACTOR_OFFLOAD_POLICY \
         ACTOR_FORWARD_PREFETCH ACTIVATION_OFFLOAD FILTER_OVERLONG \
         MAX_PROMPT_LENGTH MAX_RESPONSE_LENGTH ROLLOUT_PROMPT_LENGTH \
         ROLLOUT_MAX_MODEL_LEN ROLLOUT_MAX_NUM_BATCHED_TOKENS MAX_TOKEN_LEN_PER_GPU MINICPMO_MM_PROMPT_BUDGET AQA_DYNAMIC_BSZ \
         ROLLOUT_TEMPERATURE ROLLOUT_TOP_P ROLLOUT_TOP_K ROLLOUT_REPETITION_PENALTY \
         ROLLOUT_FREQUENCY_PENALTY ROLLOUT_PRESENCE_PENALTY ROLLOUT_LOGPROBS_MODE \
-        ROLLOUT_GPU_MEM_UTIL HUANYU_GRAPH_MODE EXPERIMENT_NAME TOTAL_TRAINING_STEPS \
-        DEFAULT_LOCAL_DIR TENSORBOARD_DIR ROLLOUT_DATA_DIR VALIDATION_DATA_DIR \
+        ROLLOUT_GPU_MEM_UTIL HUANYU_GRAPH_MODE PROJECT_NAME EXPERIMENT_NAME TOTAL_TRAINING_STEPS \
+        UPDATE_WEIGHTS_BUCKET_MB TOTAL_EPOCHS TRAINER_LOGGER SAVE_FREQ RESUME_MODE ENABLE_THINKING \
+        DEFAULT_LOCAL_DIR TENSORBOARD_DIR GENRM_DUMP_DIR ROLLOUT_DATA_DIR VALIDATION_DATA_DIR WANDB_MODE \
         TEST_FREQ VAL_BEFORE_TRAIN ROLLOUT_MAX_NUM_SEQS ROLLOUT_NUM_WORKERS HUANYU_RUN_DIR HUANYU_RUN_BASE \
+        HUANYU_EMBED_CACHE_DIR HUANYU_JOB_PROFILE HUANYU_REWARD_MODE Q36_BACKWARD_PREFETCH \
         HUANYU_STEM_TEXT_TRAIN HUANYU_CHECKPOINT_VALIDATION_MODE \
         HUANYU_FULL_WEIGHT_AUDIT_DIR HUANYU_FULL_WEIGHT_AUDIT_RUN_ID HUANYU_WEIGHT_SYNC_AUDIT_DIR \
-        HUANYU_AUDIO_PROBE_DIR HUANYU_TEXT_AB_DIR HUANYU_EMBEDDING_AB_DIR HUANYU_EMBEDDING_AB_SIDE; do
-        if [[ -v "$_key" ]]; then _HUANYU_PROFILE_CONFIG["$_key"]="${!_key}"; fi
-    done
-fi
-if [[ "$_JOB_MODE" == stem ]]; then
-    # Preserve every explicit STEM setting through older site env files.
-    for _key in ${!STEM_@}; do
-        _HUANYU_PROFILE_CONFIG["$_key"]="${!_key}"
-    done
-fi
+        HUANYU_AUDIO_PROBE_DIR HUANYU_TEXT_AB_DIR HUANYU_EMBEDDING_AB_DIR HUANYU_EMBEDDING_AB_SIDE \
+        ${!ACTOR_@} ${!REF_@} ${!ROLLOUT_@} ${!PPO_@} ${!RM_@} ${!STEM_@} ${!MAX_@} \
+        ${!GENRM_@} ${!HUANYU_GEN_@} ${!HUANYU_FORWARD_@} ${!HUANYU_NPU_@}; do
+    if [[ -v "$_key" ]]; then _HUANYU_PROFILE_CONFIG["$_key"]="${!_key}"; fi
+done
 if [[ "$_JOB_MODE" == aqa_unfreeze ]]; then
     _HUANYU_PROFILE_CONFIG[HUANYU_GRAPH_MODE]="${HUANYU_GRAPH_MODE:-0}"
     for _key in HUANYU_AQA_TRAIN_FILE HUANYU_AQA_VAL_FILE; do
@@ -349,7 +724,7 @@ fi
 # Own the numerical policy at this entry, even with an older/custom site env.
 # The default full profile overrides stale per-kernel opt-outs. custom keeps
 # explicit caller values for comparisons; site env must not replace the policy.
-source "$_PRECISION_FILE" "${_TRAIN_ARGS[@]}" || exit $?
+huanyu_configure_precision_mode "${_TRAIN_ARGS[@]}" || exit $?
 declare -A _HUANYU_PRECISION_CONFIG=()
 for _key in "${HUANYU_PRECISION_KEYS[@]}"; do
     _HUANYU_PRECISION_CONFIG["$_key"]="${!_key}"
@@ -376,37 +751,39 @@ fi
 _LIVE_RAY=0
 if pgrep -x raylet >/dev/null; then _LIVE_RAY=1; fi
 export HUANYU_VLLM_SOURCE="$_VLLM_SOURCE"
-source "$_NATIVE_PATH_FILE" || exit $?
+huanyu_select_native_source || exit $?
 _VLLM_SOURCE="$HUANYU_VLLM_SOURCE"
 echo "[huanyu-job] expected installed vLLM-Omni=$_VLLM_SOURCE (no source PYTHONPATH injection)"
-if (( _LIVE_RAY )); then
-    echo '[huanyu-job] reusing local Ray; editable installation skipped; existing workers keep their loaded code'
-else
-    # Install this project's plugin, not the shared verl / verl-omni repositories.
-    [[ -f "$PROJECT_ROOT/pyproject.toml" || -f "$PROJECT_ROOT/setup.py" ]] || {
-        echo "FATAL: no packaging file under PROJECT_ROOT=$PROJECT_ROOT" >&2; exit 1;
-    }
-    git config --global --add safe.directory "$PROJECT_ROOT"
-    "$_PYTHON" -m pip install --no-build-isolation --no-deps -e "$PROJECT_ROOT"
-fi
-
-# Source the established Huanyu settings. It reads optional/unset variables and
-# enables xtrace itself; restore our shell options afterwards.
+# All dependency/site setup lives in prepare_huanyu_env.sh. The job retains
+# node/resource orchestration and restores the caller's settings afterwards.
 export HUANYU_GRAPH_MODE="${HUANYU_GRAPH_MODE:-0}"
 set +u
-source "$_ENV_FILE"
+huanyu_prepare_node "$_LIVE_RAY" "$_ENV_FILE" "$@"
 set +x
 set -euo pipefail
 # A custom/older site env may reset these to /vllm-workspace/vllm-omni.
 # Restore the expected installed origin and remove old source-path overrides.
 export HUANYU_VLLM_SOURCE="$_VLLM_SOURCE"
-source "$_NATIVE_PATH_FILE" || exit $?
+huanyu_select_native_source || exit $?
 for _key in "${!_HUANYU_PATH_CONFIG[@]}"; do
     export "$_key=${_HUANYU_PATH_CONFIG[$_key]}"
 done
 for _key in "${!_HUANYU_PROFILE_CONFIG[@]}"; do
     export "$_key=${_HUANYU_PROFILE_CONFIG[$_key]}"
 done
+if [[ "$_JOB_MODE" == aqa_unfreeze || "$_JOB_MODE" == stem ]]; then
+    # Only discard legacy site defaults. An identical path explicitly exported
+    # by the caller is intentional and must reach the training backend.
+    if [[ -z "${_HUANYU_PROFILE_CONFIG[DEFAULT_LOCAL_DIR]+set}" &&
+          "${DEFAULT_LOCAL_DIR:-}" == "$PROJECT_ROOT/checkpoints" ]]; then
+        unset DEFAULT_LOCAL_DIR
+    fi
+    if [[ -z "${_HUANYU_PROFILE_CONFIG[TENSORBOARD_DIR]+set}" &&
+          "${TENSORBOARD_DIR:-}" == "$PROJECT_ROOT/tensorboard_log" ]]; then
+        unset TENSORBOARD_DIR
+    fi
+fi
+export Q36_CKPT_DIR="$MODEL_PATH"
 cd "$PROJECT_ROOT"
 huanyu_preload_allocator
 echo "[huanyu-job] allocator for native check/Ray: LD_PRELOAD=$LD_PRELOAD"
@@ -431,7 +808,7 @@ done
 case "$_JOB_MODE" in
     frozen_cache)
         export HUANYU_USE_PRECOMPUTE=1 HUANYU_FREEZE_AUDIO=true
-        export HUANYU_EMBED_CACHE_DIR="${HUANYU_EMBED_CACHE_DIR:-/opt/huawei/dataset/ccb_data/data/omni/embed_cache_huanyu_sampleall_q128}"
+        export HUANYU_EMBED_CACHE_DIR="${HUANYU_EMBED_CACHE_DIR:-/opt/huawei/dataset/infra_data/data/embed_cache_huanyu_sampleall_q128}"
         export MINICPMO_TUNE_AUDIO=0 HUANYU_AQA_AUDIO_TRAIN=0
         [[ -r "$HUANYU_EMBED_CACHE_DIR/manifest.json" ]] || {
             echo "FATAL: cache manifest not readable on rank $_RANK: $HUANYU_EMBED_CACHE_DIR/manifest.json" >&2
@@ -458,7 +835,8 @@ for _key in "${!_HUANYU_POOL_CONFIG[@]}"; do
     export "$_key=${_HUANYU_POOL_CONFIG[$_key]}"
 done
 export NPUS_PER_NODE=16
-if [[ "$_JOB_MODE" == stem ]]; then
+export HUANYU_REWARD_MODE="$_REWARD_MODE" RM_ENABLE="$_REWARD_ENABLED"
+if (( ! _REWARD_ENABLED )); then
     export RM_ENABLE=0 RM_NNODES=0 REWARD_POOL_NPUS=0
 else
     export REWARD_POOL_NPUS=$((RM_N_GPUS_PER_NODE * RM_NNODES)) RM_ENABLE=1
@@ -470,14 +848,26 @@ for _key in "${!_HUANYU_PRECISION_CONFIG[@]}"; do
 done
 # Source our helper again after site settings and the final pool/cache mode.
 # This also prevents an older env file from selecting the Whisper engine hook.
-source "$_PRECISION_FILE" "${_TRAIN_ARGS[@]}" || exit $?
+huanyu_configure_precision_mode "${_TRAIN_ARGS[@]}" || exit $?
+# 权重同步优化 knob：在 ray start 之前解析并 export VERL_ENGINE_VENDOR + HUANYU_WSYNC_*，
+# 让 vendor 进入 raylet 快照；worker 侧还会经 runtime_env 再透传一次（见下）。
+source "${_HUANYU_EXAMPLE_DIR}/weight_sync_mode.sh" || exit $?
+declare -A _HUANYU_WSYNC_CONFIG=()
+for _key in HUANYU_WSYNC_PROFILE HUANYU_WSYNC_TRACE HUANYU_WSYNC_VERIFY HUANYU_WSYNC_VERIFY_DIR \
+    HUANYU_WSYNC_LOOKAHEAD_MB HUANYU_WSYNC_SKIP_STAGING HUANYU_WSYNC_BF16_GATHER \
+    HUANYU_WSYNC_EARLY_ACK HUANYU_WSYNC_MOE_FAST HUANYU_WSYNC_DIRECT_LOAD HUANYU_WSYNC_BUCKET_MB \
+    HUANYU_WSYNC_LAYOUT HUANYU_WSYNC_LAYOUT_GROUP HUANYU_WSYNC_LAYOUT_DUMP HUANYU_WSYNC_STRICT \
+    VERL_ENGINE_VENDOR; do
+    if [[ -v "$_key" ]]; then _HUANYU_WSYNC_CONFIG["$_key"]="${!_key}"; fi
+done
+echo "[huanyu-job] weight_sync: profile=${HUANYU_WSYNC_PROFILE:-off} trace=${HUANYU_WSYNC_TRACE:-off} verify=${HUANYU_WSYNC_VERIFY:-0} vendor=${VERL_ENGINE_VENDOR:-<unset>} bucket_mb=${HUANYU_WSYNC_BUCKET_MB:-<default>} layout=${HUANYU_WSYNC_LAYOUT:-passthrough} strict=${HUANYU_WSYNC_STRICT:-0}"
 echo "[huanyu-job] precision before Ray: train_GDN=${MINICPMO_HUANYU_GDN_FP32_TRAINING} rollout_GDN=${MINICPMO_GDN_FP32_REFERENCE} reload=${MINICPMO_HUANYU_LAYERWISE_RELOAD} KV_zero=${MINICPMO_HYBRID_BLOCK_ZERO_REFERENCE} isolate_media=${MINICPMO_ISOLATE_MEDIA_ENCODERS} actual_TP=${MINICPMO_HUANYU_ROLLOUT_TP}"
 echo "[huanyu-job] inference hooks: ${VLLM_OMNI_EXTERNAL_MODULES}"
-echo "[huanyu-job] mode=$_JOB_MODE freeze_audio=$HUANYU_FREEZE_AUDIO precompute=$HUANYU_USE_PRECOMPUTE train_entry=$_TRAIN_ENTRY"
+echo "[huanyu-job] mode=$_JOB_MODE reward=$HUANYU_REWARD_MODE freeze_audio=$HUANYU_FREEZE_AUDIO precompute=$HUANYU_USE_PRECOMPUTE train_entry=$_TRAIN_ENTRY"
 echo "[huanyu-job] train_audio_encoder=$HUANYU_TRAIN_AUDIO_ENCODER train_audio_projector=$HUANYU_TRAIN_AUDIO_PROJECTOR"
 echo "[huanyu-job] physical=16x${_CLUSTER_NODES} actor=${NUM_NPUS}x${NNODES} rollout_TP=$ROLLOUT_TP RM=${RM_N_GPUS_PER_NODE}x${RM_NNODES} RM_TP=$RM_TP requested=$((NUM_NPUS * NNODES + REWARD_POOL_NPUS))"
 if (( _PREFLIGHT || _PREPARE_ONLY )); then
-    "$_PYTHON" -B "${_HUANYU_EXAMPLE_DIR}/check_native_runtime.py" \
+    "$_PYTHON" -B "$PROJECT_ROOT/verl_omni_ext/models/qwen3_6_huanyu/runtime_imports.py" \
         --check --expected-root "$_VLLM_SOURCE" || exit $?
     echo '[huanyu-job] native import check exited successfully'
     "$_PYTHON" -B "$_HELPER" check-devices || exit $?
@@ -527,12 +917,7 @@ if (( _PREPARE_ONLY )); then
     if (( _LIVE_RAY )); then
         echo '[huanyu-env] existing Ray was left running; activation does not update its inherited environment'
     fi
-    export HUANYU_SKIP_EDITABLE_INSTALL=1
-    bash "$_NATIVE_PATH_FILE" --clear-persisted-source
-    "$_PYTHON" -S "${_HUANYU_EXAMPLE_DIR}/prepared_env.py" write \
-        --snapshot "$HUANYU_PREPARE_SNAPSHOT" --output "$HUANYU_PREPARED_ENV_FILE" \
-        --stack-limit "$(ulimit -S -s)"
-    echo "[huanyu-env] READY activation=$HUANYU_PREPARED_ENV_FILE"
+    huanyu_publish_prepared_environment "${_HUANYU_EXAMPLE_DIR}"
     exit 0
 fi
 
@@ -544,7 +929,12 @@ if (( _RANK == 0 )); then
     for _key in HUANYU_USE_PRECOMPUTE HUANYU_EMBED_CACHE_DIR HUANYU_FREEZE_AUDIO \
         HUANYU_TRAIN_AUDIO_ENCODER HUANYU_TRAIN_AUDIO_PROJECTOR \
         HUANYU_AQA_AUDIO_TRAIN HUANYU_STEM_TEXT_TRAIN MINICPMO_USE_PRECOMPUTE MINICPMO_TUNE_AUDIO \
-        MINICPMO_TUNE_VISION WANDB_MODE LD_PRELOAD; do
+        MINICPMO_TUNE_VISION WANDB_MODE LD_PRELOAD HUANYU_REWARD_MODE; do
+        _value="$("$_PYTHON" -c 'import json, os, sys; print(json.dumps(os.environ[sys.argv[1]]))' "$_key")"
+        _RUNTIME_ARGS+=("++ray_kwargs.ray_init.runtime_env.env_vars.${_key}=${_value}")
+    done
+    # 权重同步 knob：只透传已设置的键（避免 os.environ KeyError）。
+    for _key in "${!_HUANYU_WSYNC_CONFIG[@]}"; do
         _value="$("$_PYTHON" -c 'import json, os, sys; print(json.dumps(os.environ[sys.argv[1]]))' "$_key")"
         _RUNTIME_ARGS+=("++ray_kwargs.ray_init.runtime_env.env_vars.${_key}=${_value}")
     done

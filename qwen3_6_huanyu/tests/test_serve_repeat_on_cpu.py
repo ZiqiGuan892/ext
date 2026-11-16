@@ -1,5 +1,6 @@
 """Serial HTTP repeats plus real CPU sampler captures; no vLLM/NPU required."""
 
+
 from contextlib import redirect_stdout
 import hashlib
 import importlib.util
@@ -11,6 +12,11 @@ import unittest
 from unittest.mock import patch
 
 import numpy as np
+
+# Retained as historical coverage for the removed example CLI.
+import pytest
+pytest.skip("Example CLI removed by the Huanyu examples consolidation", allow_module_level=True)
+
 
 
 ROOT = Path(__file__).resolve().parents[1]

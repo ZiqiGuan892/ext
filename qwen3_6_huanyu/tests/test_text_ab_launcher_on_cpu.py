@@ -1,5 +1,6 @@
 """Validate comparison launch plans without importing Ray, vLLM, or torch."""
 
+
 import copy
 import hashlib
 import importlib.util
@@ -12,6 +13,11 @@ from types import SimpleNamespace
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest.mock import patch
+
+# Retained as historical coverage for the removed example CLI.
+import pytest
+pytest.skip("Example CLI removed by the Huanyu examples consolidation", allow_module_level=True)
+
 
 
 MODULE_ROOT = Path(__file__).resolve().parents[1]

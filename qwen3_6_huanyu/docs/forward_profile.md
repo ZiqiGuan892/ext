@@ -1,5 +1,7 @@
 # Huanyu rollout forward 的 NPU 细分采集
 
+已有采集的进度、部分 CANN 算子占比及通信瓶颈判断，见[性能分析记录](profile_analysis_20261110.md)。该记录明确区分部分数据可用与完整采集成功。
+
 `../forward_profile.py` 是独立诊断工具。先将该文件同步到各节点当前项目的
 `verl_omni_ext/models/qwen3_6_huanyu/`，不需要替换 native vLLM-Omni 的任何 forward。
 下面命令在服务器执行；本地 Windows 只做 CPU 包装器测试，没有验证 NPU 运行。
@@ -28,7 +30,10 @@ python3 "$P" install
 环境和 Ray 已准备好，只在 head 启动。当前服务器入口是
 `$PROJECT_ROOT/examples/qwen3_6_huanyu/run_huanyu_train.sh`；本地开发对应
 `verl_omni_ext/models/qwen3_6_huanyu/examples/run_huanyu_train.sh`。
-下面用 **AQA 的 aqa_data 路径**、2748、Actor16 + GenRM16 和现有精度默认值。
+下面按服务器当前可用的 **16 张卡**配置为 Actor8 + GenRM8，模型为 2748，
+Actor/GenRM 的 TP 均沿用 4。数据路径使用本次日志已成功读取的 `aqa_dataset`。
+如果仍用入口默认的 Actor16 + GenRM16，需要 Ray 有 32 张可用卡；否则会在资源池
+初始化时报 `Total available GPUs 16.0 is less than total desired GPUs 32`，尚未进入 profiler。
 缩小 batch/输出长度只为先验证采集生命周期，不能与之前的吞吐量结果直接比较。
 
 ```bash
@@ -36,8 +41,9 @@ export PROFILE_DIR="$PROJECT_ROOT/runs/huanyu_forward_$(date +%Y%m%d_%H%M%S)"
 P="$PROJECT_ROOT/verl_omni_ext/models/qwen3_6_huanyu/forward_profile.py"
 printf 'PROFILE_DIR=%s\n' "$PROFILE_DIR"
 
-TRAIN_FILE=/opt/huawei/dataset/infra_data/data/aqa_data/train.parquet \
-VAL_FILE=/opt/huawei/dataset/infra_data/data/aqa_data/validation.parquet \
+NUM_NPUS=8 RM_N_GPUS_PER_NODE=8 \
+TRAIN_FILE=/opt/huawei/dataset/infra_data/data/aqa_dataset/train.parquet \
+VAL_FILE=/opt/huawei/dataset/infra_data/data/aqa_dataset/validation.parquet \
 TRAIN_BATCH_SIZE=4 PPO_MINI_BATCH_SIZE=4 \
 MAX_RESPONSE_LENGTH=128 ROLLOUT_IGNORE_EOS=true \
 TOTAL_TRAINING_STEPS=2 SAVE_FREQ=-1 TEST_FREQ=-1 \
@@ -49,7 +55,8 @@ bash "$PROJECT_ROOT/examples/qwen3_6_huanyu/run_huanyu_train.sh" \
 ```
 
 新入口会把 profiler 变量显式写入 Ray runtime_env；此处不重新准备环境或启动 Ray。
-默认 N=4，所以 BS=4 对应 16 条轨迹，适配 Actor16 的每卡 microbatch=1。
+默认 N=4，所以 BS=4 对应 16 条轨迹，适配 Actor8 的每卡 microbatch=1。
+`NUM_NPUS` 和 `RM_N_GPUS_PER_NODE` 已由入口支持，无需修改 profiler 或重新安装钩子。
 `ignore_eos=true` 在这次采集复测中避免很短的响应提前结束，让每个使用中的引擎能推进窗口。
 数据或模型在采集前报错、worker 未收到请求、进程被终止等情况仍会导致采集不完整；
 下面检查会明确失败，不能把这个命令当成 NPU 成功的事先保证。
@@ -103,25 +110,26 @@ forward 数、已返回的 `profiler.step()` 数、当前阶段和时间、最�
 (
 set -euo pipefail
 P="$PROJECT_ROOT/verl_omni_ext/models/qwen3_6_huanyu/forward_profile.py"
-python3 "$P" check --profile-dir "$PROFILE_DIR" --expected-workers 16
-python3 -u "$P" analyse --profile-dir "$PROFILE_DIR" --expected-workers 16 \
+python3 "$P" check --profile-dir "$PROFILE_DIR" --expected-workers 8
+python3 -u "$P" analyse --profile-dir "$PROFILE_DIR" --expected-workers 8 \
   2>&1 | tee "$PROFILE_DIR/analyse.log"
 )
 ```
 
-上述默认 Actor16 对应 16 个 TP worker；如改了 Actor 卡数，要同步修改 expected-workers。
+上述 Actor8 对应 8 个 TP worker；GenRM 不在 2748 的采集范围内。
+如恢复 Actor16 + GenRM16，要先保证 Ray 有 32 张可用卡，再把 expected-workers 改为 16。
 使用新目录避免混入旧作业。若各节点路径不是共享存储，分别对本节点数据检查，并以本节点
-预期 worker 数替换 16，不能把未看到的远端记录当作已完成。
+预期 worker 数替换 8，不能把未看到的远端记录当作已完成。
 
 - `check` 要求预期数量的 worker 均 complete、warmup+active 步数完整、有 forward 命中，
   且存在有效 `profiler_info*.json`、非空 FRAMEWORK 和 CANN 设备原始数据。
 - `analyse` 逐 worker 调用 `analyse(..., max_process_number=1, export_type="text")`，
   第一个失败即停止；要求新生成的 `trace_view.json` 包含有时长的 `huanyu/forward`，
   `kernel_details.csv` 包含有时长的设备 kernel。不凭解析函数返回或 “All profiling data parsed” 判成功。
-- 成功时输出 `CAPTURE_PASS workers=16` 和 `ANALYSIS_PASS workers=16`，
+- 成功时输出 `CAPTURE_PASS workers=8` 和 `ANALYSIS_PASS workers=8`，
   汇总写入 `$PROFILE_DIR/forward_profile_analysis.json`。它验证可用于 forward 分析的产物，
   不代表数值正确性、所有通信视图或训练整体均已验证。
-- 已有解析结果可用 `python3 "$P" verify --profile-dir "$PROFILE_DIR" --expected-workers 16`
+- 已有解析结果可用 `python3 "$P" verify --profile-dir "$PROFILE_DIR" --expected-workers 8`
   再验收，不重新运行解析。
 
 `stop()` 抛异常、被内部吞掉错误导致元数据缺失、窗口不足或正常退出清理未完成，均不能标 complete。
@@ -175,7 +183,32 @@ Free；进一步检查通信 JSON 的等待/传输/同步和各 rank 时间线�
 `.all().item()`、长度 `.cpu().tolist()` 和 token 循环。现有约 96% 的 host forward 比例
 还不能证明它们是主要原因。
 
-## 5. 关闭
+## 5. 已有部分采集的只读检查
+
+独立脚本 `analyze_forward_audit.py` 不依赖 `serve/test.py`，也不执行模型。
+将该文件同步到服务器对应目录后，检查本次 rank 0：
+
+```bash
+python3 "$PROJECT_ROOT/verl_omni_ext/models/qwen3_6_huanyu/analyze_forward_audit.py" \
+  /opt/huawei/dataset/infra_data/code/verl_omni_qwen36_gzq_new/runs/huanyu_forward_1110 \
+  /tmp/huanyu_partial_profile_imubo9ga \
+  --pid 1635029 --tp-rank 0
+```
+
+两个位置参数分别是采集根目录、包含同名 `PROF_*` 的设备导出副本目录。
+找到多个 manifest 时必须筛选，不会任意选择某个 worker。
+脚本直接用安装版本的 torch_npu 解码器读取 FRAMEWORK，不改原始采集文件或 manifest。
+
+输出包括五轮 execute/forward/ProfilerStep 边界、外层 GDN/Attention/MoE 调用数及
+`HOST_SHARE_PCT`，以及 CANN 时钟文件、设备事件时间范围和 HostToDevice 关联记录数量。
+`chunk_gated_delta_rule` 等可选子分支不参与外层模块齐全性判定。
+模块区间求并集，另列跨类别重叠；解码有告警或外层模块缺失/重复时不输出该轮比例。
+
+`HOST_SHARE_PCT` 包含主机执行、等待和通信，不是纯设备计算比例。
+退出码 0 仅表示检查输出完成，不代表采集完整。缺失元数据时保留实际证据，不伪造时间校准，
+不将设备事件按行数或总时间均分为五轮；本脚本不自动宣布设备轮次完整或重算其通信占比。
+
+## 6. 关闭
 
 下次启动不传 `HUANYU_FORWARD_PROFILE_DIR` 即关闭。可在各节点删除条件入口，保留其他新增代码：
 

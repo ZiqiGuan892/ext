@@ -29,7 +29,7 @@ class HuanyuPrepareEnvironmentTests(unittest.TestCase):
         self.addCleanup(self.fixture.doCleanups)
         fixture = self.fixture
         self.user_dir = fixture.home
-        for name in ("prepare_huanyu_env.sh", "prepared_env.py", "graph_mode.sh"):
+        for name in ("prepare_huanyu_env.sh", "prepared_env.py"):
             shutil.copyfile(EXAMPLES / name, fixture.examples / name)
         self.entry = fixture.examples / "prepare_huanyu_env.sh"
         self.capture = fixture.project / "after_prepare.json"
@@ -133,7 +133,7 @@ exit "$prepare_status"
                 for key, value in {
                     "HUANYU_TEST_SITE_VALUE": "stem-source-worked", "TOTAL_NPUS": str(total),
                     "HUANYU_JOB_MODE": "stem", "STEM_SCALED_JOB": "1", "NNODES": str(total // 16),
-                    "STEM_REWARD_MODE": "rule", "STEM_CONTEXT_LENGTH": "12k", "STEM_IGNORE_EOS": "false",
+                    "STEM_REWARD_MODE": "rule", "STEM_CONTEXT_LENGTH": "12288", "STEM_IGNORE_EOS": "false",
                     "ROLLOUT_TP": "8", "TRAIN_BATCH_SIZE": "128", "PPO_MINI_BATCH_SIZE": "128",
                     "ROLLOUT_N": "16", "HUANYU_FREEZE_AUDIO": "true", "RM_ENABLE": "0",
                     "HUANYU_STEM_TEXT_TRAIN": "1", "HUANYU_SKIP_EDITABLE_INSTALL": "1",
@@ -191,7 +191,8 @@ exit "$prepare_status"
         self.assertEqual(env["HUANYU_TRAIN_AUDIO_PROJECTOR"], "false")
         self.assertEqual(env["HUANYU_PRECISION_PROFILE"], "full")
         self.assertEqual(env["MINICPMO_STABLE_LINEAR"], "1")
-        self.assertEqual(len(self.fixture.events("pip")), 1)
+        self.assertEqual(len(self.fixture.events("pip")), 2)
+        self.assertEqual(self.fixture.events("pip")[1]["args"], ["install", "mathruler", "zarr"])
         self.assertEqual(len(self.fixture.events("runtime")), 1)
         operations = [event["args"][0] for event in self.fixture.events("helper")]
         self.assertEqual(operations, ["check-devices"])
@@ -223,6 +224,40 @@ exit "$prepare_status"
         self.assertIn("activate.sh", result.stdout)
         self.assertFalse(self.capture.exists())
         self.assertEqual(len(self.activation_files()), 1)
+
+    def test_failed_install_never_runs_site_setup_ray_or_training(self):
+        result = self.run_prepare({"HUANYU_TEST_PIP_EXIT": "27"})
+        self.assertEqual(result.returncode, 27, result.stdout + result.stderr)
+        self.assertFalse(self.activation_files())
+        self.assertFalse(self.fixture.events("env-source"))
+        self.assert_no_ray_or_training()
+
+    def test_failed_site_setup_does_not_continue_or_publish_activation(self):
+        self.append_site_env("false\nexport HUANYU_TEST_AFTER_FAILURE=bad\n")
+        result = self.run_prepare()
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(self.activation_files())
+        self.assertNotIn("HUANYU_TEST_AFTER_FAILURE", self.prepared()["env"])
+        self.assert_no_ray_or_training()
+
+    def test_prepare_sources_cann_and_atb_even_with_custom_site_env(self):
+        cann = self.fixture.project / "cann"
+        for path, key in ((cann / "set_env.sh", "HUANYU_TEST_CANN"),
+                          (self.fixture.project / "nnal/atb/set_env.sh", "HUANYU_TEST_ATB")):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(f"export {key}=ready\n", encoding="utf-8")
+        result = self.run_prepare({"ASCEND_HOME_PATH": job_fixture.shell_path(cann)})
+        self.assert_success(result)
+        env = self.prepared()["env"]
+        self.assertEqual(env["HUANYU_TEST_CANN"], "ready")
+        self.assertEqual(env["HUANYU_TEST_ATB"], "ready")
+
+    def test_existing_ray_skips_all_package_installation(self):
+        result = self.run_prepare({"HUANYU_TEST_RAY_LIVE": "1"})
+        self.assert_success(result)
+        self.assertFalse(self.fixture.events("pip"))
+        self.assertFalse(self.fixture.events("git"))
+        self.assertTrue(self.fixture.events("env-source"))
 
     def test_prepare_preserves_proxies_python_selection_and_bashrc(self):
         rc = self.user_dir / ".bashrc"
@@ -320,8 +355,13 @@ exit "$prepare_status"
         site = self.fixture.project / "site-packages"
         site.mkdir()
         (site / "vllm-omni.pth").write_text(str(installed) + "\n", encoding="utf-8")
-        helper = self.fixture.examples / "native_source.sh"
-        helper.write_text(helper.read_text(encoding="utf-8").replace(
+        # Exercise the actual source-selection function embedded in the job,
+        # without running package installation or Ray startup.
+        source = (EXAMPLES / "run_huanyu_32card_job.sh").read_text(encoding="utf-8")
+        begin = source.index("huanyu_select_native_source() {")
+        end = source.index("\n}\n", begin) + 3
+        helper = self.fixture.project / "test_native_policy.sh"
+        helper.write_text((source[begin:end] + "\nhuanyu_select_native_source\n").replace(
             "/vllm-workspace/vllm-omni", job_fixture.shell_path(installed),
         ), encoding="utf-8", newline="\n")
         probe = self.fixture.project / "import_probe.py"
@@ -421,6 +461,14 @@ exit "$prepare_status"
         expected = {
             "MODEL_PATH": "temporary-actor", "RM_MODEL_PATH": "temporary-reward",
             "TRAIN_FILE": "temporary-train.parquet", "VAL_FILE": "temporary-validation.parquet",
+            "ACTOR_LR": "2e-6", "ACTOR_WEIGHT_DECAY": "0.02", "ACTOR_DYNAMIC_BSZ": "true",
+            "REF_LOG_PROB_DYNAMIC_BSZ": "true", "AQA_DYNAMIC_BSZ": "true",
+            "ROLLOUT_LOG_PROB_DYNAMIC_BSZ": "false", "ROLLOUT_GPU_MEM_UTIL": "0.5",
+            "UPDATE_WEIGHTS_BUCKET_MB": "512", "TOTAL_EPOCHS": "3", "TOTAL_TRAINING_STEPS": "2",
+            "TRAINER_LOGGER": "[console]", "SAVE_FREQ": "17", "TEST_FREQ": "23",
+            "PPO_MINI_BATCH_SIZE": "4", "ACTOR_PARAM_OFFLOAD": "false",
+            "ACTOR_OPTIMIZER_OFFLOAD": "true", "REF_PARAM_OFFLOAD": "false",
+            "REF_FORWARD_PREFETCH": "false", "RESUME_MODE": "disable",
         }
         exclusions = self.fixture.env.get("MSYS2_ENV_CONV_EXCL", "") + ";PATH"
         result = self.run_prepare({**expected, "MSYS2_ENV_CONV_EXCL": exclusions,

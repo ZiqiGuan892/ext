@@ -1,10 +1,16 @@
 """Exercise the frozen job through site setup, real training argv and stubbed Ray."""
 
+
 import json
 import shutil
 import unittest
 
 import test_aqa_job_launcher_on_cpu as aqa
+
+# Retained as historical coverage for the removed example CLI.
+import pytest
+pytest.skip("Example CLI removed by the Huanyu examples consolidation", allow_module_level=True)
+
 
 
 ENTRY = "run_huanyu_aqa_frozen_deterministic_32card_job.sh"

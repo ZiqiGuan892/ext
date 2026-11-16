@@ -46,4 +46,10 @@
 
 当前启动脚本默认读取 `/opt/huawei/dataset/infra_data/data/train.parquet` 和同目录的 `validation.parquet`；迁移后的图片路径前缀为 `/opt/huawei/dataset/infra_data/data/dataset/media/`。实际读取全量还是调试子集，取决于这两个文件的内容。
 
-统计依据：[既有转换记录](D:/verl-omni/docs/oc_rl_4b_server_runbook_zh.md:13)；字段定义：[转换脚本](D:/verl-omni/verl_omni_ext/examples/omni_mix_4b.py:356)。
+统计依据：[既有转换记录](../../../docs/oc_rl_4b_server_runbook_zh.md)；字段定义来自当时使用的 `omni_mix_4b.py`，该历史转换脚本不包含在当前仓库中。
+
+## 当前训练入口
+
+2026-11-09脚本精简后，使用 `run_qwen36_huanyu_gspo_npu_omni_mix_genrm.sh` 并通过 `TRAIN_FILE` / `VAL_FILE` 指向上述实际数据；需要环境与Ray job管理时使用 `run_huanyu_32card_job.sh`。AQA入口要求每条有音频，因此不适用于本纯VL数据。完整部署、调用链和参数覆盖见[启动 Wiki](README.md)。脚本改名/合并不改变本页的数据统计。
+
+复现本页的GenRM评分方式时，启动前显式 `export HUANYU_REWARD_MODE=RM`。虽然通用入口也接受 `rule_based`（兼容 `ruled_based`），规则模式由数据的 `data_source` 路由到已注册的规则scorer，不会自动把自定义VL问答转换为AQA的Dice评分；切换前需确认数据来源有适用的评分实现。

@@ -1,5 +1,6 @@
 """CPU fixtures for sync audit classification; no distributed runtime required."""
 
+
 import hashlib
 import importlib.util
 import json
@@ -7,6 +8,11 @@ from pathlib import Path
 import struct
 import tempfile
 import unittest
+
+# Retained as historical coverage for the removed example CLI.
+import pytest
+pytest.skip("Example CLI removed by the Huanyu examples consolidation", allow_module_level=True)
+
 
 
 PATH = Path(__file__).resolve().parents[1] / "examples/compare_huanyu_weight_sync.py"

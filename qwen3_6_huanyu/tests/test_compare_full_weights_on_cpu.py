@@ -1,5 +1,6 @@
 """Offline audit aggregation: incomplete topology/evidence must never pass."""
 
+
 import contextlib
 import copy
 import importlib.util
@@ -9,6 +10,11 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+
+# Retained as historical coverage for the removed example CLI.
+import pytest
+pytest.skip("Example CLI removed by the Huanyu examples consolidation", allow_module_level=True)
+
 
 
 ROOT = Path(__file__).resolve().parents[1]

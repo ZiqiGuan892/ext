@@ -1,5 +1,6 @@
 """Exercise the standalone audio HTTP client without vLLM, NPU or a server."""
 
+
 import base64
 from contextlib import redirect_stderr, redirect_stdout
 import importlib.util
@@ -12,6 +13,11 @@ import unittest
 from unittest.mock import patch
 from urllib.error import HTTPError
 import wave
+
+# Retained as historical coverage for the removed example CLI.
+import pytest
+pytest.skip("Example CLI removed by the Huanyu examples consolidation", allow_module_level=True)
+
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "examples" / "request_aqa_validation_wav.py"

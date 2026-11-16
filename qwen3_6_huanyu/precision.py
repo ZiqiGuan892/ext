@@ -60,7 +60,7 @@ def _install_linear(module, shared):
 
 def _gdn_coverage(language):
     """Inspect bindings only: no tensor reads, device sync or kernel imports."""
-    counts = dict(total=0, guarded=0, native=0, unguarded_torch=0, unrecognized=0)
+    counts = dict(total=0, guarded=0, native=0, npu_kernel=0, unguarded_torch=0, unrecognized=0)
     for layer in language.layers:
         attention = getattr(layer, "linear_attn", None)
         if attention is None:
@@ -69,7 +69,9 @@ def _gdn_coverage(language):
         kernel = getattr(attention, "chunk_gated_delta_rule", None)
         source = getattr(kernel, "__module__", "")
         name = getattr(kernel, "__name__", "")
-        if getattr(kernel, "_huanyu_fp32_guard", False) is True:
+        if getattr(kernel, "_huanyu_npu_kernel", False) is True:
+            counts["npu_kernel"] += 1
+        elif getattr(kernel, "_huanyu_fp32_guard", False) is True:
             counts["guarded"] += 1
         elif source.startswith(("fla.", "flash_linear_attention.")):
             counts["native"] += 1
@@ -78,6 +80,22 @@ def _gdn_coverage(language):
         else:
             counts["unrecognized"] += 1
     return counts
+
+
+def _install_actor_kernels(module):
+    """加载并调用 kernel_perf.actor_kernels；兼容单测的文件级加载（无包上下文）。"""
+    try:
+        from .kernel_perf.actor_kernels import install_actor_kernels
+    except ImportError:
+        import importlib.util
+        from pathlib import Path
+
+        path = Path(__file__).resolve().parent / "kernel_perf" / "actor_kernels.py"
+        spec = importlib.util.spec_from_file_location("huanyu_kernel_perf_actor_kernels", path)
+        loaded = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(loaded)
+        install_actor_kernels = loaded.install_actor_kernels
+    return install_actor_kernels(module)
 
 
 def install_huanyu_actor_precision(module):
@@ -103,6 +121,10 @@ explicit .float() alone does not stop BF16 autocast on recurrence matmuls.
     guarded = 0
     if _enabled("MINICPMO_HUANYU_GDN_FP32_TRAINING", "1"):
         guarded = _shared("packed").isolate_torch_gdn_fallbacks(module)
+
+    # kernel 档案：NPU 融合 GDN（fwd+bwd）与 npu_rms_norm。与上面的 FP32
+    # 参考守护互斥（kernel_perf.actor_kernels 内部校验同开即 raise）。
+    _install_actor_kernels(module)
 
     # Keep the same operation order as the Whisper actor. A TP4 block reference
     # intentionally supersedes the simpler expert reference if both are chosen.
@@ -130,6 +152,7 @@ explicit .float() alone does not stop BF16 autocast on recurrence matmuls.
         f"[huanyu-precision] actor padded forward retained; "
         f"GDN coverage total={coverage['total']} guarded={coverage['guarded']} "
         f"new={guarded} already={coverage['guarded'] - guarded} "
+        f"npu_kernel={coverage['npu_kernel']} "
         f"native={coverage['native']} unguarded_torch={coverage['unguarded_torch']} "
         f"unrecognized={coverage['unrecognized']}; "
         "coverage reports bindings only; execution is logged separately; "

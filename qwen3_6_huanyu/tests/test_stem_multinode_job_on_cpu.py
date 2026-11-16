@@ -25,13 +25,16 @@ class StemMultinodeJobTests(unittest.TestCase):
         self.addCleanup(self.case.doCleanups)
         self.case.setUp()
         self.fixture = self.case.fixture
-        for name in ("run_huanyu_stem_job.sh", "run_huanyu_stem.sh", "run_huanyu.sh"):
+        for name in ("run_huanyu_stem_job.sh", "run_huanyu_stem.sh"):
             shutil.copyfile(EXAMPLES / name, self.fixture.examples / name)
         self.fixture.entry = self.fixture.examples / "run_huanyu_stem_job.sh"
         # Include the real backend capacity preflight as well as the real STEM
         # status check. Otherwise a hidden downstream ray status could survive.
         backend = (EXAMPLES / "run_qwen36_huanyu_gspo_npu.sh").read_text(encoding="utf-8")
-        capacity = backend[backend.index("# Ray 侧资源账本校验"):backend.index("# ---- 数据文件防护 ----")]
+        capacity = backend[
+            backend.index('if [ "${HUANYU_RAY_READINESS_CHECK:-1}" = 0 ]; then'):
+            backend.index("for _v in MODEL_PATH TRAIN_FILE VAL_FILE; do")
+        ]
         fixture_backend = self.fixture.examples / "run_qwen36_huanyu_gspo_npu.sh"
         fixture_backend.write_text(
             fixture_backend.read_text(encoding="utf-8").replace(
@@ -113,7 +116,7 @@ class StemMultinodeJobTests(unittest.TestCase):
             "actor_rollout_ref.actor.fsdp_config.param_offload": "true",
             "actor_rollout_ref.actor.fsdp_config.optimizer_offload": "true",
             "actor_rollout_ref.actor.fsdp_config.offload_policy": "true",
-            "actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes": "512",
+            "actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes": "2048",
             "actor_rollout_ref.actor.fsdp_config.fsdp_size": fsdp_size,
             "actor_rollout_ref.ref.fsdp_config.fsdp_size": fsdp_size,
             "actor_rollout_ref.actor.ulysses_sequence_parallel_size": "1",
@@ -158,7 +161,7 @@ class StemMultinodeJobTests(unittest.TestCase):
             stream.write("export NNODES=8 TRAIN_BATCH_SIZE=128 PPO_MINI_BATCH_SIZE=128 ROLLOUT_N=16\n")
         capture, actual = self.launch(
             {"TRAIN_BATCH_SIZE": "16", "PPO_MINI_BATCH_SIZE": "8", "ROLLOUT_N": "4", "ROLLOUT_TP": "16",
-             "RM_ENABLE": "1", "STEM_REWARD_MODE": "genrm"},
+             "HUANYU_REWARD_MODE": "rule_based", "RM_ENABLE": "1", "STEM_REWARD_MODE": "genrm"},
             ("data.train_batch_size=128", "actor_rollout_ref.actor.ppo_mini_batch_size=128",
              "actor_rollout_ref.actor.fsdp_config.fsdp_size=32", "actor_rollout_ref.ref.fsdp_config.fsdp_size=-1",
              "actor_rollout_ref.rollout.tensor_model_parallel_size=32",
@@ -172,6 +175,58 @@ class StemMultinodeJobTests(unittest.TestCase):
         self.assertEqual(starts[0]["precision"]["MINICPMO_HUANYU_ROLLOUT_TP"], "16")
         self.assertEqual(len(self.fixture.events("train")), 1)
 
+    def test_32_card_rm_reserves_one_node_and_uses_genrm(self):
+        self.configure_cluster(32)
+        capture, actual = self.launch({"HUANYU_REWARD_MODE": "RM", "STEM_REWARD_MODE": "rule", "RM_ENABLE": "0"})
+        self.assertEqual(capture["env"]["HUANYU_REWARD_MODE"], "RM")
+        self.assertEqual(capture["env"]["STEM_REWARD_MODE"], "genrm")
+        self.assertEqual(capture["env"]["HUANYU_CLUSTER_NODES"], "2")
+        self.assertEqual(actual["trainer.nnodes"], "1")
+        self.assertEqual(actual["trainer.n_gpus_per_node"], "16")
+        self.assertEqual(actual["reward.reward_model.nnodes"], "1")
+        self.assertEqual(actual["reward.reward_model.n_gpus_per_node"], "16")
+        self.assertEqual(actual["reward.reward_model.enable"].lower(), "true")
+        self.assertIn("genrm", actual["reward.custom_reward_function.path"].lower())
+        self.assertEqual(capture["env"]["REWARD_POOL_NPUS"], "16")
+
+    def test_legacy_genrm_mode_selects_rm_in_train_only(self):
+        self.configure_cluster(32)
+        capture, actual = self.launch({"STEM_REWARD_MODE": "genrm"}, arguments=("--train-only",))
+        self.assertEqual(capture["env"]["HUANYU_REWARD_MODE"], "RM")
+        self.assertEqual(actual["trainer.nnodes"], "1")
+        self.assertEqual(actual["reward.reward_model.nnodes"], "1")
+        self.assertFalse(self.fixture.events("ray"))
+
+    def test_large_rm_jobs_count_only_actor_nodes_in_batch_divisibility(self):
+        for total in (128, 256):
+            with self.subTest(total=total):
+                self.configure_cluster(total)
+                actor_cards = total - 16
+                capture, actual = self.launch({
+                    "HUANYU_REWARD_MODE": "RM", "TRAIN_BATCH_SIZE": str(actor_cards),
+                    "PPO_MINI_BATCH_SIZE": str(actor_cards),
+                }, arguments=("--train-only",))
+                self.assertEqual(actual["trainer.nnodes"], str(actor_cards // 16))
+                self.assertEqual(capture["env"]["HUANYU_CLUSTER_NODES"], str(total // 16))
+                self.assertEqual(capture["env"]["REWARD_POOL_NPUS"], "16")
+                self.assertEqual(actual["data.train_batch_size"], str(actor_cards))
+                self.fixture.events_file.write_text("", encoding="utf-8")
+
+    def test_rm_rejects_insufficient_or_overallocated_cluster_before_setup(self):
+        for total, extra in ((16, {}), (32, {"NNODES": "2"})):
+            with self.subTest(total=total):
+                self.configure_cluster(total)
+                result = self.fixture.run_launcher(dict(HUANYU_REWARD_MODE="RM", **extra))
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn("FATAL:", result.stderr)
+                self.assertFalse(self.fixture.events_file.exists())
+
+    def test_rule_spelling_alias_selects_math_dapo_without_rm(self):
+        self.configure_cluster(16)
+        capture, actual = self.launch({"HUANYU_REWARD_MODE": "ruled_based", "RM_ENABLE": "1"})
+        self.assert_scaled(capture, actual, 16)
+        self.assertEqual(capture["env"]["HUANYU_REWARD_MODE"], "rule_based")
+
     def test_16_cards_start_only_head_with_custom_batches_and_no_rm(self):
         self.configure_cluster(16)
         capture, actual = self.launch({"TRAIN_BATCH_SIZE": "16", "PPO_MINI_BATCH_SIZE": "8", "ROLLOUT_N": "4"})
@@ -181,6 +236,34 @@ class StemMultinodeJobTests(unittest.TestCase):
         self.assertIn("--head", starts[0]["args"])
         self.assertFalse(any(e["args"][0] == "wait-head" for e in self.fixture.events("helper")))
         self.assertEqual(len(self.fixture.events("train")), 1)
+
+    def test_exported_model_and_parquets_override_aliases_and_site_defaults(self):
+        self.configure_cluster(16)
+        paths = {}
+        for split in ("train", "validation"):
+            path = self.fixture.project / f"chosen {split}.parquet"
+            row = {
+                "data_source": "math_dapo", "ability": "math",
+                "prompt": [{"role": "user", "content": f"Selected {split}: what is 3+4?"}],
+                "reward_model": {"style": "rule", "ground_truth": "7"},
+                "extra_info": {"split": split, "index": 0},
+            }
+            _aqa.pq.write_table(_aqa.pa.Table.from_pylist([row] * 4), path)
+            paths[split] = _job.shell_path(path)
+        with (self.fixture.examples / "env_export_huanyu.sh").open("a", encoding="utf-8") as stream:
+            stream.write("export MODEL_PATH=/obsolete/model TRAIN_FILE=/obsolete/train VAL_FILE=/obsolete/val\n")
+        capture, actual = self.launch({
+            "MODEL_PATH": "/selected/checkpoint", "TRAIN_FILE": paths["train"], "VAL_FILE": paths["validation"],
+            "STEM_TRAIN_FILE": "/unused/alias/train", "STEM_VAL_FILE": "/unused/alias/validation",
+            "TRAIN_BATCH_SIZE": "4", "PPO_MINI_BATCH_SIZE": "4", "ROLLOUT_N": "4",
+        })
+        self.assertEqual(actual["actor_rollout_ref.model.path"], "/selected/checkpoint")
+        for split, key in (("train", "TRAIN_FILE"), ("validation", "VAL_FILE")):
+            prepared = Path(capture["env"][key])
+            self.assertEqual(prepared.name, f"{split}.parquet")
+            rows = _aqa.pq.read_table(prepared).to_pylist()
+            self.assertEqual(len(rows), 4)
+            self.assertTrue(all(row["extra_info"]["question"] == f"Selected {split}: what is 3+4?" for row in rows))
 
     def test_platform_node_count_infers_total_when_unset(self):
         for total in (16, 32, 128, 256):
@@ -233,7 +316,8 @@ class StemMultinodeJobTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(sum("skipping duplicate node launcher" in r.stdout for r in results), 15)
         self.assertEqual(len(self.fixture.events("flock")), 1)
-        self.assertEqual(len(self.fixture.events("pip")), 1)
+        self.assertEqual(len(self.fixture.events("pip")), 2)
+        self.assertEqual(self.fixture.events("pip")[1]["args"], ["install", "mathruler", "zarr"])
         starts = [event for event in self.fixture.events("ray") if "start" in event["args"]]
         self.assertEqual(len(starts), 1)
         self.assertEqual(len(self.fixture.events("train")), 1)

@@ -36,4 +36,8 @@ class Qwen36HuanyuRolloutAdapter(Qwen36WhisperRolloutAdapter):
                 additional = dict(extras.get("additional_config", {}))
                 additional["rl_config"] = {"enabled": True, "enable_batch_invariant": batch_mode == "1"}
                 extras["additional_config"] = additional
+            # R3：HUANYU_EXPERT_REPLAY=1 时打开 vLLM 路由捕获（enable_return_routed_experts）。
+            from .expert_replay import expert_replay_engine_extras
+
+            extras.update(expert_replay_engine_extras())
         return extras

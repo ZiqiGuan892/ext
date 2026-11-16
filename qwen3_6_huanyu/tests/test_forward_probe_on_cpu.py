@@ -1,4 +1,4 @@
-"""Exercise real boundary calls, owned snapshots, and fail-closed comparison."""
+"""Exercise real boundary calls, owned snapshots, and capture completeness."""
 
 import copy
 import importlib.util
@@ -33,7 +33,6 @@ probe = load(PKG + ".logits_probe", ROOT / "logits_probe.py")
 forward = load(PKG + ".forward_probe", ROOT / "forward_probe.py")
 embedding = sys.modules.get(PKG + ".prompt_embedding_probe") or load(
     PKG + ".prompt_embedding_probe", ROOT / "prompt_embedding_probe.py")
-compare = load("huanyu_forward_compare_cpu", ROOT / "examples/compare_huanyu_forward.py")
 CASE, SAMPLE = "a" * 32, "row_000001"
 REQUEST = "huanyuab." + CASE + "." + SAMPLE
 
@@ -170,14 +169,14 @@ class ForwardProbeTests(unittest.TestCase):
             self.step(runner, state)
             self.step(runner, state, [1])
 
-    def report(self):
-        return compare.compare_case(self.root, self.case, self.rows)
-
-    def test_equal_prefill_and_decode(self):
+    def test_prefill_and_decode_boundaries_are_captured(self):
         self.both()
-        r = self.report()
-        self.assertEqual(r["summary"]["status"], "MATCH_CAPTURED_BOUNDARIES")
-        self.assertEqual([s["phase"] for s in r["samples"][0]["steps"]], ["prefill", "decode"])
+        for side in ("serve", "rollout"):
+            records = [json.loads(p.read_text()) for p in (self.root / "forward" / side).glob("*.json")]
+            records.sort(key=lambda record: record["step"])
+            self.assertEqual([record["phase"] for record in records], ["prefill", "decode"])
+            self.assertEqual([record["status"] for record in records], ["CAPTURED", "CAPTURED"])
+            self.assertTrue(all(not record["missing_boundaries"] for record in records))
         self.assertFalse(list((self.root / "forward").rglob("*.npz")))
 
     def test_embedding_forward_and_sampler_probes_compose_with_native_call_signature(self):
@@ -257,54 +256,12 @@ class ForwardProbeTests(unittest.TestCase):
                 records = list((self.root / "embeddings" / side).glob("*.json"))
                 self.assertEqual(len(records), 1)
                 self.assertEqual(json.loads(records[0].read_text())["status"], "complete")
-            report = self.report()
-            self.assertEqual(report["summary"]["status"], "MATCH_CAPTURED_BOUNDARIES")
-            self.assertTrue(report["samples"][0]["full_generation_captured"])
-
-    def test_first_difference_is_attention_output_not_outer_layer(self):
-        self.both(delta=0.125)
-        item = self.report()["samples"][0]
-        self.assertEqual(item["status"], "DIFFERENT")
-        first = item["first_difference"]
-        self.assertEqual(first["step"], 0)
-        self.assertEqual(first["first_difference"]["name"], "layers.1.self_attn")
-        self.assertEqual(first["first_difference"]["boundary"], "output")
-        self.assertTrue(first["first_difference"]["module_input_equal"])
-        self.assertEqual(first["first_difference"]["last_equal_boundary"],
-                         {"name": "layers.1.self_attn", "boundary": "input"})
+            self.assertEqual(len(list((self.root / "forward").rglob("*termination*.json"))), 2)
 
     def full_case(self, limit=4):
         self.case["sampling"] = {"max_tokens": limit}
         self.case["logits_check"]["max_steps"] = limit
         self.case["forward_check"].update(max_steps=limit, until_eos=True)
-
-    def terminate(self, state, prefix, *, reason="stop_token", selected=9, status="complete"):
-        prompt = [8, 9]
-        event = dict(request_id=REQUEST, sample_id=SAMPLE, step=len(prefix),
-                     phase="decode" if prefix else "prefill", prompt_token_ids=prompt,
-                     prompt_token_sha256=compare.canonical_hash(prompt), prefix_token_ids=prefix,
-                     prefix_token_sha256=compare.canonical_hash(prefix), sampled_token_ids=[selected],
-                     terminal_evidence=reason, status=status,
-                     sampling_params={"max_tokens": self.case["sampling"]["max_tokens"],
-                                      "ignore_eos": False, "min_tokens": 0, "all_stop_token_ids": [9]})
-        forward.record_termination(state, event)
-
-    def full_both(self, lengths=(2, 2)):
-        for side, count in zip(("serve", "rollout"), lengths):
-            runner, state = self.runner(side)
-            for step in range(count):
-                self.step(runner, state, [1] * step)
-            reason = "max_tokens" if count == self.case["sampling"]["max_tokens"] else "stop_token"
-            self.terminate(state, [1] * (count - 1), reason=reason)
-
-    def test_early_eos_is_complete_without_fictitious_missing_decode(self):
-        self.full_case()
-        self.full_both()
-        item = self.report()["samples"][0]
-        self.assertEqual(item["status"], "MATCH_CAPTURED_BOUNDARIES")
-        self.assertEqual(item["issues"], [])
-        self.assertTrue(item["full_generation_captured"])
-        self.assertEqual([c["generated_steps"] for c in item["coverage"]], [2, 2])
 
     def test_real_sampler_closes_trace_after_separate_execute_and_sample_calls(self):
         self.full_case()
@@ -338,106 +295,7 @@ class ForwardProbeTests(unittest.TestCase):
             self.assertEqual(result.sampled_token_ids.tolist(), [[3]])
             marker = next((self.root / "forward" / side).glob("*termination*.json"))
             self.assertEqual(json.loads(marker.read_text())["terminal_evidence"], "stop_token")
-        item = self.report()["samples"][0]
-        self.assertEqual(item["status"], "MATCH_CAPTURED_BOUNDARIES")
-        self.assertTrue(item["full_generation_captured"])
-
-    def test_first_token_eos_and_length_limit_are_both_valid(self):
-        for count in (1, 4):
-            with self.subTest(count=count):
-                # Each subtest uses a separate case directory, not overwrites.
-                self.root = self.root / str(count)
-                self.root.mkdir()
-                self.full_case()
-                self.full_both((count, count))
-                self.assertTrue(self.report()["samples"][0]["full_generation_captured"])
-
-    def test_deletion_or_invalid_terminal_evidence_cannot_pass(self):
-        self.full_case()
-        self.full_both()
-        marker = next((self.root / "forward/serve").glob("*termination*.json"))
-        original = marker.read_bytes()
-        for mode in ("missing", "bad_stop", "runtime", "history"):
-            with self.subTest(mode=mode):
-                if mode == "missing":
-                    marker.unlink()
-                else:
-                    record = json.loads(original)
-                    if mode == "bad_stop":
-                        record["sampled_token_ids"] = [8]
-                    elif mode == "runtime":
-                        record["runtime_id"] = "other"
-                    else:
-                        record["prefix_token_ids"] = [7]
-                        record["prefix_token_sha256"] = compare.canonical_hash([7])
-                    marker.write_text(json.dumps(record), encoding="utf-8")
-                self.assertEqual(self.report()["summary"]["status"], "INCOMPLETE")
-                marker.write_bytes(original)
-
-    def test_missing_middle_forward_and_duplicate_terminal_are_incomplete(self):
-        self.full_case()
-        self.full_both((4, 4))
-        marker = next((self.root / "forward/serve").glob("*termination*.json"))
-        duplicate = marker.with_name("duplicate.json")
-        duplicate.write_bytes(marker.read_bytes())
-        self.assertEqual(self.report()["summary"]["status"], "INCOMPLETE")
-        duplicate.unlink()
-        next((self.root / "forward/serve").glob("*-step00001-*.json")).unlink()
-        self.assertEqual(self.report()["summary"]["status"], "INCOMPLETE")
-
-    def test_different_termination_lengths_are_reported_without_false_missing_steps(self):
-        self.full_case()
-        self.full_both((1, 2))
-        item = self.report()["samples"][0]
-        self.assertTrue(item["full_generation_captured"])
-        self.assertEqual(item["unpaired_after_termination"], 1)
-
-    def test_late_decode_difference_identifies_module_and_equal_input(self):
-        self.full_case()
-        for side in ("serve", "rollout"):
-            runner, state = self.runner(side)
-            for step in range(4):
-                if side == "rollout" and step == 3:
-                    runner.model.thinker.llm.model.layers[0].linear_attn.delta = 0.25
-                self.step(runner, state, [1] * step)
-            self.terminate(state, [1, 1, 1], reason="max_tokens")
-        first = self.report()["samples"][0]["first_difference"]
-        self.assertEqual(first["step"], 3)
-        self.assertEqual(first["first_difference"]["name"], "layers.0.linear_attn")
-        self.assertTrue(first["first_difference"]["module_input_equal"])
-
-    def test_earliest_module_across_tp_ranks_wins_over_rank_zero(self):
-        self.case["engine"]["tensor_parallel_size"] = 2
-        for side in ("serve", "rollout"):
-            for rank in range(2):
-                runner, state = self.runner(side, rank=rank)
-                if side == "rollout":
-                    llm = runner.model.thinker.llm.model
-                    target = llm.layers[0].linear_attn if rank == 1 else llm.layers[1].self_attn
-                    target.delta = 0.25
-                self.step(runner, state)
-                self.step(runner, state, [1])
-        first = self.report()["samples"][0]["first_difference"]
-        self.assertEqual(first["tp_rank"], 1)
-        self.assertEqual(first["first_difference"]["name"], "layers.0.linear_attn")
-
-    def test_input_difference_is_not_attributed_to_module_internal_arithmetic(self):
-        self.both()
-        path = next((self.root / "forward/rollout").glob("*-step00000-*.json"))
-        record = compare.read(path)
-        entry = next(e for e in record["events"] if e["name"] == "layers.1.self_attn" and e["boundary"] == "input")
-        entry["value"]["hidden_states"]["sha256"] = "0" * 64
-        path.write_text(json.dumps(record), encoding="utf-8")
-        first = self.report()["samples"][0]["first_difference"]["first_difference"]
-        self.assertEqual(first["boundary"], "input")
-        self.assertFalse(first["module_input_equal"])
-
-    def test_runtime_flags_not_hidden_by_identical_forward_source(self):
-        self.both(sequence_parallel=True)
-        item = self.report()["samples"][0]
-        self.assertEqual(item["status"], "DIFFERENT")
-        self.assertIsNone(item["first_difference"])
-        self.assertIn("use_sequence_parallel", item["steps"][0]["runtime_difference"]["path"])
+        self.assertEqual(len(list((self.root / "forward").rglob("*termination*.json"))), 2)
 
     def test_observation_preserves_calls_and_results(self):
         expected = LLM()(None, torch.arange(2), inputs_embeds=torch.arange(8, dtype=torch.float32).reshape(2, 4))
@@ -455,36 +313,15 @@ class ForwardProbeTests(unittest.TestCase):
         self.assertEqual(before, saved)
         self.assertNotEqual(before["x"]["sha256"], forward.tensor_tree(tensor)["sha256"])
 
-    def test_missing_tp_rank_is_incomplete(self):
-        self.case["engine"]["tensor_parallel_size"] = 2
-        self.both()
-        self.assertEqual(self.report()["summary"]["status"], "INCOMPLETE")
-
-    def test_duplicate_record_is_incomplete(self):
-        self.both()
-        p = next((self.root / "forward/serve").glob("*.json"))
-        p.with_name("duplicate.json").write_bytes(p.read_bytes())
-        self.assertEqual(self.report()["summary"]["status"], "INCOMPLETE")
-
     def test_missing_internal_hook_is_incomplete(self):
         runner, state = self.runner("serve")
         layer = runner.model.thinker.llm.model.layers[0]
         # Simulate a bypassed instance hook in a different native version.
         layer.linear_attn.forward = layer.linear_attn.forward.__wrapped__
         self.step(runner, state)
-        record = compare.read(next((self.root / "forward/serve").glob("*.json")))
+        record = json.loads(next((self.root / "forward/serve").glob("*.json")).read_text())
         self.assertEqual(record["status"], "INCOMPLETE")
         self.assertIn(["layers.0.linear_attn", "output"], record["missing_boundaries"])
-
-    def test_different_prefix_not_used_to_accuse_forward(self):
-        for side, prefix in (("serve", [1]), ("rollout", [2])):
-            runner, state = self.runner(side)
-            self.step(runner, state)
-            self.step(runner, state, prefix)
-        item = self.report()["samples"][0]
-        self.assertEqual(item["status"], "INCOMPLETE")
-        self.assertIsNone(item["first_difference"])
-        self.assertFalse(item["steps"][1]["same_prefix"])
 
     def test_disabled_probe_does_not_wrap_llm(self):
         self.case["forward_check"]["enabled"] = False

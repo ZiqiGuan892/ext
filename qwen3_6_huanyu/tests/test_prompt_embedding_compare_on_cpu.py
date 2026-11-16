@@ -1,5 +1,6 @@
 """Strict prompt comparison must reject missing provenance and partial captures."""
 
+
 import contextlib
 import copy
 import hashlib
@@ -14,6 +15,11 @@ from unittest.mock import patch
 import weakref
 
 import numpy as np
+
+# Retained as historical coverage for the removed example CLI.
+import pytest
+pytest.skip("Example CLI removed by the Huanyu examples consolidation", allow_module_level=True)
+
 
 
 ROOT = Path(__file__).resolve().parents[1]

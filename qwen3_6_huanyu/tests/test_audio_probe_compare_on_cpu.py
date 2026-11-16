@@ -1,5 +1,6 @@
 """Audio evidence comparison must not manufacture sample or call alignment."""
 
+
 import copy
 import importlib.util
 import json
@@ -10,6 +11,11 @@ import unittest
 from unittest.mock import patch
 
 import numpy as np
+
+# Retained as historical coverage for the removed example CLI.
+import pytest
+pytest.skip("Example CLI removed by the Huanyu examples consolidation", allow_module_level=True)
+
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "examples/compare_huanyu_audio_probe.py"

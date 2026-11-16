@@ -243,6 +243,23 @@ def install_huanyu_forward(module, *, start_token_id, end_token_id, placeholder_
         return torch.stack(rows)
 
     embedding.register_forward_hook(inject_audio)
+    reported_logits_dtype = False
+
+    def audit_mixed_precision(output):
+        """一次性报告前向输出 dtype：验证 FSDP2 mp_policy/autocast 的实际生效精度。
+
+        model_dtype=fp32 + mixed_precision.param_dtype=bfloat16 时 logits 应为
+        bf16；若打印 fp32 说明混合精度未生效（配置未透传或引擎路径变更）。
+        """
+        nonlocal reported_logits_dtype
+        if reported_logits_dtype:
+            return output
+        logits = getattr(output, "logits", None)
+        if isinstance(logits, torch.Tensor):
+            reported_logits_dtype = True
+            print(f"[huanyu-precision] component=forward_dtype phase=executed pid={os.getpid()} "
+                  f"logits_dtype={logits.dtype}", flush=True)
+        return output
 
     @wraps(getattr(original_forward, "__func__", original_forward))
     def forward(self, *args, **kwargs):
@@ -302,7 +319,7 @@ def install_huanyu_forward(module, *, start_token_id, end_token_id, placeholder_
                 if active["calls"] != 1:
                     raise RuntimeError("HF forward did not consume Huanyu cached embeddings")
                 report_audio(_feature_chunks(cached_audio), "cached_frozen")
-                return output
+                return audit_mixed_precision(output)
             finally:
                 _ACTIVE_AUDIO.reset(token)
         if any(value is not None for value in (cache_enabled, cached_audio, cached_vision, image_counts,
@@ -328,7 +345,7 @@ def install_huanyu_forward(module, *, start_token_id, end_token_id, placeholder_
         if batch is None:
             if has_audio_markers:
                 raise ValueError("Audio tokens are present but Huanyu audio features are missing")
-            return original_forward(*args, **kwargs)
+            return audit_mixed_precision(original_forward(*args, **kwargs))
         if not has_audio_markers:
             raise ValueError("Huanyu audio features are present but audio tokens are missing")
 
@@ -351,7 +368,7 @@ def install_huanyu_forward(module, *, start_token_id, end_token_id, placeholder_
             if active["calls"] != 1:
                 raise RuntimeError("HF forward did not consume Huanyu audio through the input embedding module")
             report_audio(chunks, "online_trainable" if require_audio_only else "online_frozen")
-            return output
+            return audit_mixed_precision(output)
         finally:
             _ACTIVE_AUDIO.reset(token)
 

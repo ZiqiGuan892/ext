@@ -45,6 +45,9 @@ class Layer:
         yield "weight", self.weight
         yield "bias", self.bias
 
+    def named_modules(self):
+        yield "", self
+
 
 class Model:
     def __init__(self):
@@ -76,6 +79,9 @@ def full_audio_weights(value=9):
 @contextmanager
 def fake_reload_api(model, *, leave_meta=False):
     api = ModuleType(reload._RELOAD_MODULE)
+    layerwise = ModuleType(api.__name__ + ".layerwise")
+    recorded = SimpleNamespace(restore_metadata=({"weight": object()}, {}))
+    layerwise.LAYERWISE_INFO = {model.thinker.apm: recorded, model.thinker.audio_projection_layer: recorded}
     events, pending = [], []
 
     def initialize(current):
@@ -98,7 +104,7 @@ def fake_reload_api(model, *, leave_meta=False):
 
     api.initialize_layerwise_reload = initialize
     api.finalize_layerwise_reload = finalize
-    with patch.dict(sys.modules, {api.__name__: api}):
+    with patch.dict(sys.modules, {api.__name__: api, layerwise.__name__: layerwise}):
         yield events, pending
 
 

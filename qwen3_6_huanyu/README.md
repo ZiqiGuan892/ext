@@ -1,508 +1,407 @@
-# Qwen3.6-Huanyu 训练适配
+# Huanyu 启动脚本与参数 Wiki
 
-本目录接入 Huanyu 的 GSPO/GenRM 链路，包含模型适配、测试、启动入口和文档。`deploy/` 同时打包项目根目录环境文件和三个共享启动脚本，方便在只包含 Huanyu 文件夹的分支中发布。
+更新：2026-11-10。以下说明对应精简后的本地脚本；历史实验结果见[适配与排障记录](HUANYU_ADAPTATION_AND_TROUBLESHOOTING_ZH.md)，不要把历史配置当作当前默认值。
 
-具体适配内容、端到端数据流及实际故障的原因和处理结果见 [Huanyu 训练适配与问题处理记录](HUANYU_ADAPTATION_AND_TROUBLESHOOTING_ZH.md)。
+## 1. 目录、保留文件与职责
 
-新增的 [AQA 在线编码与冻结／解冻训练说明](AQA_AUDIO_TRAINING_ZH.md) 提供不使用缓存的音频解冻入口。统一超参数为 `actor_rollout_ref.model.override_config.huanyu_freeze_audio`，默认 `true` 保留冻结路径；设置 `false` 时 encoder 和 projector 都参与更新。新增脚本在本目录的 `examples/`，服务器部署到 `${PROJECT_ROOT}/examples/qwen3_6_huanyu/`。
+源码目录为 `verl_omni_ext/models/qwen3_6_huanyu/examples/`，服务器运行目录通常为 `$PROJECT_ROOT/examples/qwen3_6_huanyu/`。此目录包含以下 **11 个文件**（原 10 个文件，加一个集中配置训练入口）；模型适配、预计算和诊断模块仍位于上一级 Python 包内。
 
-## 单独提取 AQA 数据
-
-`omni_mix.py` 中纯音频 AQA 的来源名为 `aqa_real`，生成 parquet 后保存在 `extra_info.raw_source`。顶层 `data_source` 对所有来源都是 `omni_mix`；`vaqa` 则是另一种 image+audio 来源。新增 [extract_aqa.py](extract_aqa.py) 只筛选 `extra_info.raw_source == "aqa_real"`，保留原 schema、样本顺序、媒体路径、ID 和 `reward_model.ground_truth`，不重新转换原始 JSON、不合并 train/validation，也不改动已有数据或 cache。
-
-将该脚本同步到服务器同名目录后执行：
-
-```bash
-python3 -u /opt/huawei/dataset/ccb_data/code/hufenyu/verl_omni_qwen36_gzq/verl_omni_ext/models/qwen3_6_huanyu/extract_aqa.py \
-  --input /opt/huawei/dataset/ccb_data/data/omni/omni_mix_f8_genrm_sampleall/train.parquet \
-  --output /opt/huawei/dataset/ccb_data/data/omni/omni_mix_aqa_only/train.parquet
-```
-
-脚本自动创建父目录、逐批打印扫描/保留行数，并核对输出行数和 schema。以末尾 `[aqa] COMPLETE` 为成功标志；不覆盖已有目标。若被强制终止而留下不完整输出，检查后另选新输出目录。历史统计中原 train 的 AQA 为 19,344 行，实际数量以本次结果为准。
-
-如果验证也只评估 AQA，再对原 validation 独立筛选，保留原划分：
-
-```bash
-python3 -u /opt/huawei/dataset/ccb_data/code/hufenyu/verl_omni_qwen36_gzq/verl_omni_ext/models/qwen3_6_huanyu/extract_aqa.py \
-  --input /opt/huawei/dataset/ccb_data/data/omni/omni_mix_f8_genrm_sampleall/validation.parquet \
-  --output /opt/huawei/dataset/ccb_data/data/omni/omni_mix_aqa_only/validation.parquet
-```
-
-`run_32card.sh` 现为兼容入口，其委托的 `run_huanyu.sh` 仍固定 export 原 TRAIN_FILE/VAL_FILE。AQA 在线训练请使用新增的 [examples/run_huanyu_aqa_audio_train.sh](examples/run_huanyu_aqa_audio_train.sh)，它默认读取上述两个 AQA parquet，也支持 `TRAIN_FILE`／`VAL_FILE` 环境变量，并对实际使用的数据做预检，避免只改 CLI 后共享脚本仍检查原文件。
-
-同一缓存契约下，完整原数据对应的同模型 Huanyu cache 可以复用，因为筛选没有改变媒体、前处理或缓存键；不需要仅因 parquet 路径变化而重算。若之前缓存未生成完整，仍应使用 Huanyu `--verify-only` 对新子集核对。视频配对更新改变了缓存契约，升级前的旧缓存不适用，见下节。
-
-## 部署与当前状态
-
-切换 `verl_omni_qwen36` / `verl_omni_qwen36_gzq` 的最新版部署方式见 [deploy/README.md](deploy/README.md)：先把配套脚本部署到所选项目，再通过 `export PROJECT_ROOT=...` 和 `source "$PROJECT_ROOT/env_export_huanyu.sh"` 选择运行目录。以下历史排障命令中的绝对路径仅代表当时环境。
-
-状态（2026-10-19）：用户提供的服务器日志已出现 rollout、GenRM 和训练指标，训练进度达到 3/34870 步，随后在 old_log_prob 的 entropy 计算中 OOM。对应分块修复已推送，完整 Huanyu CPU 回归 200 项通过；尚待服务器复测，不能据此宣称全量训练已完成。本地没有真实 checkpoint 或 NPU。
-
-## 原因与确认的接口
-
-之前只切换 MODEL_PATH 和推理后端路径，训练端仍由原注册项选择 Whisper adapter，造成 Huanyu encoder 权重全部 unexpected，以及 projector 的 `[2048,3072]` 对 `[2048,1024]` 形状错误。
-
-用户提供的真实服务器构造代码和 audio_preprocessor_config.json 已确认：
-
-| 项目 | 本次模型 |
+| 文件 | 职责与执行位置 |
 |---|---|
-| HF 主体 | Qwen3_5MoeForConditionalGeneration |
-| 音频前端 | 16 kHz、40 维 fbank；n_fft=400、hop=160 为运行时默认值 |
-| Encoder | VGG + 8 层 Conformer，hidden=1536 |
-| VGG 时间下采样 | 4；40 维版 flat Linear 输入为 1920，不能当作 projector 输入 |
-| Projector | 两帧拼接：1536×2=3072 → linear1 → ReLU → linear2 → 2048 |
-| 有效音频 token 数 | `ceil(真实 fbank 帧数 / 4) // 2`，按 30 秒 chunk 计算 |
-| checkpoint 前缀 | `model.audio_encoder.*`、`model.audio_projection.*` |
+| `prepare_huanyu_env.sh` | 集中管理 editable/依赖安装、jemalloc、站点环境及 CANN/ATB；`source` 后应用环境，`--start-ray` 同时拉起并检查 Ray |
+| `start_huanyu_ray.sh` | 已准备环境时，每节点只启动/复用 Ray；`--check` 做 GCS 资源检查 |
+| `prepared_env.py` | 环境快照、差异与 activation 文件生成；由 prepare 调用 |
+| `job_bootstrap.py` | 部署/节点解析、NPU 检查、GCS 等待、AQA 数据预检等辅助命令 |
+| `run_huanyu_32card_job.sh` | 每节点 job 入口：环境、Ray、资源布局；仅 head 提交训练 |
+| `run_huanyu_stem_job.sh` | STEM 16/32 等规模配置；`--train-only` 跳过准备和 Ray 启动 |
+| `run_huanyu_stem.sh` | 已有环境/Ray 的 STEM 数据准备、文本模式和奖励配置 |
+| `run_huanyu_aqa_audio_train.sh` | 已有环境/Ray 的 AQA 入口，音频冻结/解冻和数据预检 |
+| `run_qwen36_huanyu_gspo_npu_omni_mix_genrm.sh` | OmniMix 参数；按奖励模式配置 GenRM 独立池或规则评分 |
+| `run_qwen36_huanyu_gspo_npu.sh` | 最终训练后端：Huanyu adapter、预检、参数汇总和 `python -m verl_omni.trainer.main_omni` |
+| `run_huanyu_train.sh` | 已有环境/Ray 的单文件训练入口；按功能集中列出配置及中文行内注释，直接调用 Python 训练模块 |
 
-旧 processing_huanyu.py 是 128 维版本，不用于当前 40 维链路。本目录的 audio_frontend.py 和 load_huanyu_processor() 保留为旧版检查组件；当前训练使用 build_huanyu_processor()。
+原 `run_huanyu.sh`、`run_qwen36_huanyu_32card.sh` 的职责并入最后两个后端；graph、precision、原生源码选择和运行日志初始化不再依赖独立 `.sh` 文件。其他专用 wrapper、AB/serve CLI、转换工具不再放在 examples。下列通用入口加参数替代专用训练 wrapper。
 
-## 实现分工与数据流
-
-| 文件 | 职责 |
-|---|---|
-| thinker_adapter.py | 独立注册 Qwen36HuanyuForTraining + thinker，挂载 Huanyu 音频模块 |
-| audio_runtime.py | 复用当前 vLLM-Omni 的 encoder、projector、fold；严格加载音频权重 |
-| audio_training.py | 显式冻结超参数、可微在线音频执行、分块梯度 checkpoint 及 FSDP 音频子树检查 |
-| runtime_imports.py | 检查实际进程的 vLLM-Omni 来源、Huanyu 文件和接口；提供独立导入预检 |
-| processor.py | 40 维 fbank、Qwen 图像处理、媒体 token 展开、原生 HF mRoPE、AgentLoop 输入桥接及可选严格 cache 读取 |
-| dataset.py | 读取原始图片、音频、视频帧；不读取 Whisper cache |
-| forward.py | 保留 HF 图像/文本前向，在经过验证的音频 token 位置注入 embedding |
-| entropy.py | Huanyu worker 内安装逐 token 分块 entropy，覆盖 padded old_log_prob 路径与一阶反向 |
-| rollout_inputs.py | 按媒体元数据收缩推理占位符，兼容独立预处理方法及内联预处理的 async generate 接口 |
-| rollout_adapter.py | 独立注册 qwen3_6_huanyu，复用现有单 llm stage 拓扑 |
-| run_32card.sh | 调用原 32 卡入口，追加 Huanyu 配置、关闭长度预筛，显式传递 Ray 导入路径 |
-| check_runtime.py | 不加载模型权重的真实依赖/processor/mRoPE CPU 接口检查 |
-| precompute.py / cache.py | Huanyu 专用音频、图片和视频帧 embedding 预计算、内容键与模型身份校验 |
+## 2. 调用链
 
 ```text
-音频路径/bytes/zarr member
- → 16 kHz 单声道波形 → 按原音频分 30 秒 chunk
- → 40 维 fbank [40,T] + 未 padding 的真实帧数
- → Huanyu VGG/Conformer [T_encoder,1536]
- → 相邻两帧拼接 [T_tokens,3072]
- → 原生 projector [T_tokens,2048]
- → 替换 <|audio_start|><unk>...<|audio_end|> 中的 <unk> embedding
- → HF Qwen3.5-MoE 文本主干 → logits/log_probs → 原 GSPO 更新
+prepare_huanyu_env.sh
+  ├─ prepared_env.py：生成环境快照与 activate.sh
+  └─ run_huanyu_32card_job.sh（仅准备模式）
+       └─ job_bootstrap.py：节点、设备、可选 Ray/GCS 检查
+  --stem 时先经 run_huanyu_stem_job.sh 设定 STEM 资源/环境
+
+start_huanyu_ray.sh
+  └─ job_bootstrap.py：解析节点、等待 head/集群
+
+run_huanyu_32card_job.sh（两节点各执行一次，head 分流训练）
+  ├─ prepare_huanyu_env.sh 的准备函数：安装、allocator、站点/CANN/ATB 环境
+  ├─ frozen_cache（旧模式名，现为冻结在线编码）→ run_qwen36_huanyu_gspo_npu_omni_mix_genrm.sh
+  ├─ aqa_unfreeze → run_huanyu_aqa_audio_train.sh
+  └─ stem → run_huanyu_stem.sh
+
+run_huanyu_stem_job.sh
+  ├─ 默认 → run_huanyu_32card_job.sh → run_huanyu_stem.sh
+  └─ --train-only → head 直接 run_huanyu_stem.sh；其他节点退出
+
+run_huanyu_aqa_audio_train.sh / run_huanyu_stem.sh
+  ├─ GenRM → run_qwen36_huanyu_gspo_npu_omni_mix_genrm.sh
+  └─ rule  → run_qwen36_huanyu_gspo_npu.sh
+
+run_qwen36_huanyu_gspo_npu_omni_mix_genrm.sh
+  └─ run_qwen36_huanyu_gspo_npu.sh
+       └─ python3 -m verl_omni.trainer.main_omni
+
+run_huanyu_train.sh（已有环境/Ray，仅 head 执行）
+  └─ python3 -m verl_omni.trainer.main_omni
 ```
 
-图像交给 Qwen image processor 和 HF 原生视觉模块；视频保留每段 clip 的边界，按 checkpoint 的 temporal_patch_size 将相邻真实帧组合为像素 patch，再交给视觉塔。奖励函数、GenRM、优势和 GSPO 公式不由本目录改写。
+`prepare --start-ray` 和独立 Ray 脚本共用启动策略，但 prepare 还会准备/验证 Python 环境、生成 activation，因此不是完全相同的操作。以上入口不依赖已经删除的六个 helper 文件。
 
-新增训练字段为 huanyu_audio_features、huanyu_audio_lengths、huanyu_audio_bounds、huanyu_audio_chunk_counts。每条样本始终带 chunk_count（无音频为 0），进入 batch 后逐条验证，避免跨样本错配。音频 bounds 从实际 input_ids 重建，包含左 padding 后的位置，不依赖 decode 后的文本。
+环境安装只有 `prepare_huanyu_env.sh` 一处实现。job 以内部 `--functions-only` 接口加载准备函数，不执行 prepare 的独立入口，所以不会递归启动。单独调用 prepare 仍复用 job 的仅准备模式做资源配置和检查，成功后生成 activation；两条路径都只执行一轮准备。
 
-推理侧仍接收原始图片/波形，由 vLLM-Omni 自己编码。31 秒音频在训练侧分两个 chunk，回到推理侧仍是一个原始 audio 条目，不能按相邻标记猜条目边界。两个运行时 hook 仅处理 Huanyu processor，其他模型转交原方法；没有修改公共源码文件。
+训练入口（包括直接 `bash run_qwen36_huanyu_gspo_npu_omni_mix_genrm.sh`）只设置本次参数、自检并启动训练，不运行 pip/git 安装，也不再 source CANN/ATB 环境脚本。`HUANYU_SKIP_EDITABLE_INSTALL` 仅保留在 activation 中兼容旧部署；当前训练脚本不读取它，设为 `0` 也不会安装。缺少插件时自检失败，应先调用 prepare。
 
-### 视频相邻帧配对
+## 3. 部署与环境准备
 
-视频文件解码由本目录自带的 `video_decode.py` 提供，训练数据集和离线预计算共用同一抽帧实现；部署 Huanyu 不需要安装 `verl_omni_ext.models.minicpmo_5_0` 包。同步代码时必须包含该文件。Parquet 视频条目中的 `fps`、`max_frames`、`max_pixels` 优先于环境变量默认值。
-
-Huanyu 视频不再展开成独立图片。`temporal_patch_size=2` 时，`[A,B,C]` 编码为 `[A,B]`、`[C,C]`，只补最后一个不完整时间组；不同视频不会相互配对。预处理复用 checkpoint 图像处理器的 resize、归一化和空间 patch 顺序，在像素层重排时间槽，不拼接或平均已有 embedding。每段视频内所有帧必须有相同的 resize 后网格，否则明确报错。
-
-训练、离线预计算和 rollout 共用 `video_frontend.py`。每段视频保留一个 `video_grid_thw`，每个时间组对应一个 `<|vision_start|><|video_pad|>…<|vision_end|>` span。`video_rollout.py` 同步更新原生前端、placeholder、M-RoPE 和启动预算，仅作用于 Huanyu；沿用当前简化协议，不新增时间戳。更新在 `engine_hooks.py` 和显式 worker extension 中安装，需重启使用旧代码的训练/serve 进程。
-
-偶数帧且 resize 相同时，视频视觉 token 数减半；完整 prompt、解码时间与训练 step 时间不保证减半。单段视频的原始抽帧数没有减少。多视频测试验证了媒体边界，但实际请求仍受 `limit_mm_per_prompt.video` 限制，继承的默认值是 1；多视频作业需显式设置符合数据的限制。
-
-缓存新增 `video_execution=temporal_pairs_single_video_hf_bf16_eager_q128_v1`。旧 manifest（包括旧纯音频 AQA 缓存）会被严格拒绝，不自动改写或复用旧 digest。使用原预计算命令生成到**新目录**（例如 `embed_cache_2748_huanyu_35b_video_pairs_v1`），再切换 `HUANYU_EMBED_CACHE_DIR`。不能把旧逐帧 embedding 合并成新配对 embedding，也不能手改 manifest 绕过校验。
-
-在同步本目录代码后的服务器上，可先运行不加载权重、不连接 Ray 的边界检查：
-
-```bash
-/usr/local/python3.12.13/bin/python3 \
-  "$PROJECT_ROOT/verl_omni_ext/models/qwen3_6_huanyu/check_video_contract.py" \
-  --model /opt/huawei/dataset/model_gy/downloaded_models/2748 --native
-```
-
-检查使用不同颜色的 1/2/3/8 帧，比较旧图片 token 数、新配对 token 数、训练/原生前端像素和 HF/vLLM M-RoPE。输出 `status: PASS` 只证明这些边界一致，不代表真实 NPU 推理或模型效果已验收；随后应以一个真实视频完成 rollout、缓存重建及 actor log-prob 对齐检查。
-
-## 复用的服务器实现
-
-```text
-$HUANYU_VLLM_SOURCE/vllm_omni/model_executor/models/minicpmo_5_0/huanyu_audio.py
-  HuanyuFbankFeatureExtractor / HuanyuAudioEncoder / huanyu_project_and_fold
-$HUANYU_VLLM_SOURCE/vllm_omni/model_executor/models/minicpmo_5_0/minicpmo_5_0_omni_llm.py
-  MultiModalProjector
-```
-
-准备与训练入口使用已有的 `/vllm-workspace/vllm-omni` 安装，不再把 vLLM-Omni 源码加入 `PYTHONPATH`。它们移除继承的 checkout 路径，保留 ext/CANN 等依赖路径；`HUANYU_VLLM_SOURCE` 和 `HUANYU_VLLM_OMNI_ROOT` 只记录预期导入来源。旧 `vllm-omni-xy*` 选择会重置到工作区安装。实际 `__file__` 不符时预检失败，不会偷偷切换或重新安装依赖。通用 prepare 还会备份停用旧版自动生成的源码 hook；`.bashrc` 只追加代理清理和 Python PATH 初始化，不注入 vLLM-Omni 源码路径。推理继续使用现有 minicpmo_5_0_thinker_only pipeline ID，其模型根据 audio_config.model_type 选择 Huanyu；verl 的 rollout 注册名另设为 qwen3_6_huanyu。
-
-训练别名仅用于 verl 注册表，**不改写 checkpoint 的 HF architectures**，不覆盖 Whisper/RM 的原注册项。model.external_lib 显式导入本目录，不需要修改 pyproject.toml。
-
-## 服务器命令
-
-将本目录完整同步到 gzq 副本。环境加载与各节点 Ray 启动仍由操作者完成；所有节点需要看到相同插件及包含 Huanyu 的 vLLM-Omni。
-
-在**每个节点**检查原生模块（特别是本次报错的 `172.16.3.168`）：
+显式设置项目路径，避免普通入口和 STEM job 的历史默认根目录差异。各节点必须使用相同的插件和脚本版本。
 
 ```bash
 export PROJECT_ROOT=/opt/huawei/dataset/infra_data/code/verl_omni_qwen36_gzq_new
-export HUANYU_VLLM_SOURCE=/vllm-workspace/vllm-omni
-source "$PROJECT_ROOT/examples/qwen3_6_huanyu/native_source.sh"
-python3 -B "$PROJECT_ROOT/examples/qwen3_6_huanyu/check_native_runtime.py" \
-  --check --expected-root "$HUANYU_VLLM_SOURCE"
+export SHELL_ROOT="$PROJECT_ROOT/examples/qwen3_6_huanyu"
+mkdir -p "$SHELL_ROOT"
+cp "$PROJECT_ROOT/verl_omni_ext/models/qwen3_6_huanyu/examples/"*.sh "$SHELL_ROOT/"
+cp "$PROJECT_ROOT/verl_omni_ext/models/qwen3_6_huanyu/examples/"*.py "$SHELL_ROOT/"
 ```
 
-成功时输出 `[huanyu-runtime] OK` 和解析符号链接后的实际源码位置。预检只导入依赖，不加载 checkpoint 权重。若失败，按后面的故障记录处理。
+复制不会清理部署目录中历史遗留文件；部署时应以这 11 个文件的清单核对，整套更新。Python 包也要同步，不能只复制 shell 文件。
 
-先运行低成本接口检查（不启动 Ray、不读取模型 tensor、不占 NPU；不是 encoder 数值验收）：
+AQA 两节点准备并启动 Ray，在两个终端并行执行以下公共设置；主节点设 `VC_TASK_INDEX=0`，从节点设 `1`。将 IP 替换为当前作业的真实地址，列表顺序必须一致。
 
 ```bash
-cd /opt/huawei/dataset/ccb_data/code/hufenyu/verl_omni_qwen36_gzq
-python3 -B verl_omni_ext/models/qwen3_6_huanyu/check_runtime.py \
-  --model-path /opt/huawei/dataset/downloaded_models/Qwen3.6-35B-A3B-huanyu06b-iter2000-omni4b-hf-huanyu7tokens
+export VC_WORKER_HOSTS=172.16.7.181,172.16.2.73
+export VC_WORKER_NUM=2
+export VC_TASK_INDEX=0                    # 从节点改为 1
+export HUANYU_JOB_MODE=aqa_unfreeze
+source "$SHELL_ROOT/prepare_huanyu_env.sh" --start-ray
 ```
 
-训练入口：
+仅准备环境：去掉 `--start-ray`。之后每节点执行 `bash "$SHELL_ROOT/start_huanyu_ray.sh" --check`。用 `bash prepare_huanyu_env.sh` 而非 `source` 时，它打印 activation 路径，需在调用终端再 `source` 该文件。
 
-```bash
-bash /opt/huawei/dataset/ccb_data/code/hufenyu/verl_omni_qwen36_gzq/verl_omni_ext/models/qwen3_6_huanyu/run_32card.sh
-```
+STEM 使用 `TOTAL_NPUS=16` 或 `32`，并执行 `source "$SHELL_ROOT/prepare_huanyu_env.sh" --stem --start-ray`；16 卡时 host 列表只有本机、节点数为 1。`HUANYU_JOB_MODE=frozen_cache` 保留旧名字，但 common job 现在始终关闭预计算 embedding，冻结媒体模块并在线编码；prepare 不需要也不生成 embedding cache。
 
-入口固定使用上述 Huanyu checkpoint、原 35B OmniMix 的 train/validation parquet、Qwen3.5-35B-A3B RM，调用原 examples/qwen3_6_whisper/run_qwen36_whisper_32card.sh。batch、采样和奖励参数沿用既有后端，可通过原有环境变量/CLI 参数控制。长度预算由本目录入口统一设置，使用下文列出的环境变量调整，避免共享 DEBUG 分支覆盖。训练日志仍由原后端写入 run_qwen36_whisper_gspo_npu.log。
+站点环境如需额外配置，可设置 `HUANYU_ENV_FILE=/绝对路径/site_env.sh`；默认使用 prepare 内置的站点配置，不再需要 examples 下的 env_export 文件。安装和 CANN/ATB 初始化由 prepare 统一执行，自定义 site 文件无需再重复这些操作。选定可运行训练依赖的 `python3` 后再准备，prepare 沿用当前终端的 Python/代理设置。
 
-核心覆盖如下，入口已包含：
+准备时使用同一个 `python3` 安装 ext（`pip install --no-build-isolation --no-deps -e "$PROJECT_ROOT"`）以及 `mathruler zarr`。本机已有 Ray 时跳过包安装，避免运行中的 worker 与磁盘环境不一致；仍应用站点配置并执行相应检查。普通 job 调用准备后启动训练；如果已经准备并激活环境、启动 Ray，可直接运行 mix/AQA 或 STEM 的 `--train-only`，无需再次安装依赖。
 
-```text
-actor_rollout_ref.model.external_lib=verl_omni_ext.models.qwen3_6_huanyu
-actor_rollout_ref.model.architecture=Qwen36HuanyuForTraining
-actor_rollout_ref.model.model_stage=thinker
-actor_rollout_ref.model.use_remove_padding=false
-data.custom_cls.path=pkg://verl_omni_ext.models.qwen3_6_huanyu.dataset
-data.custom_cls.name=Qwen36HuanyuOmniRLHFDataset
-++actor_rollout_ref.rollout.engine_kwargs.vllm_omni.pipeline_name=qwen3_6_huanyu
-data.filter_overlong_prompts=false
-MINICPMO_USE_PRECOMPUTE=0
-MINICPMO_TUNE_AUDIO=0
-HUANYU_VLLM_SOURCE=/vllm-workspace/vllm-omni
-```
+Ray 配置：
 
-入口把清理后的 ext/依赖 `PYTHONPATH`，通过 `++ray_kwargs.ray_init.runtime_env.env_vars.PYTHONPATH` 显式传入 Ray；同样传递两个预期来源变量供 worker 检查。所有节点须有相同的工作区安装。这是新任务的启动环境，不会修改已经运行的 worker，也不会自动启停 Ray。
-
-不需要重新生成 parquet。默认使用在线编码；可按下节生成并启用 Huanyu 专用 cache，不能复用 Whisper cache。共享脚本可能仍打印原 cache 路径，但本目录不访问旧缓存。关闭长度预筛只跳过全量预扫描，真实请求仍受上下文长度限制。
-
-## Job 与环境准备的 Ray 设置
-
-`examples/` 中的 AQA、冻结音频、16K、Whisper 对齐、Projector 和 STEM job 都通过
-`run_huanyu_32card_job.sh` 启动 Ray。普通 job 默认 `HUANYU_JOB_PREFLIGHT=0`，跳过额外的
-native import、设备数量及集群就绪探测；从节点仍先等待 head，再连接集群。
-设置 `HUANYU_JOB_PREFLIGHT=1` 可启用这些探测，失败时终止启动。
-旧变量 `HUANYU_RAY_READINESS_CHECK` 仍可作为回退开关，新变量显式设置时优先。
-这不关闭训练入口自身的数据、配置或资源检查。
-
-环境统一使用 `prepare_huanyu_env.sh` 准备，STEM 可复用已准备的环境。此入口始终验证环境；加 `--start-ray`
-时，主节点通过 GCS 验证全部节点和 NPU 资源，从节点验证自身注册，不依赖 Dashboard，
-也不创建探测用的 Ray driver。各节点需并行执行准备命令。未加 `--start-ray` 时只准备环境。
-
-环境已准备时，可在每个节点单独执行 `bash examples/start_huanyu_ray.sh [--check]`，
-无需再次运行 prepare。此入口只启动或复用 Ray，每节点注册16个NPU，沿用下方三个
-启动参数；`--check` 开启 GCS 检查。填写 `VC_TASK_INDEX` 和主节点在前的
-`VC_WORKER_HOSTS`；`VC_WORKER_NUM` 可由主机列表推导。完成后 Ray 留在后台，
-训练在主节点另行提交。双节点命令见 [examples 使用说明](examples/README.md#311-环境已准备只启动-ray)。
-
-公共入口在加载站点环境后设置以下参数，并写入 prepare 生成的 `activate.sh`，
-供手动启动 Ray 时继承。这些参数不改变 AgentLoopWorker 的总数量，也不会更新已运行的 Raylet。
-
-```bash
-export RAY_worker_maximum_startup_concurrency=32
-export RAY_prestart_worker_first_driver=1
-export RAY_enable_worker_prestart=0
-```
-
-训练脚本的 Actor rollout 显存预算默认改为 `0.6`，仍可用
-`ROLLOUT_GPU_MEM_UTIL` 覆盖。AB 测试的独立预算及 GenRM 预算不变。
-
-## Huanyu 预计算原 35B OmniMix 数据集
-
-需先将本目录全部更新同步到服务器。环境加载与 Ray 启停仍由操作者负责。以下预计算命令不使用 Ray，只使用执行节点的一张 NPU（`npu:0`），应在该卡空闲时运行。原始 parquet、原始媒体及所有旧 Whisper/MiniCPM cache 均不修改。
-
-```bash
-cd /opt/huawei/dataset/ccb_data/code/hufenyu/verl_omni_qwen36_gzq
-mkdir -p /opt/huawei/dataset/ccb_data/code/hufenyu/verl_omni_qwen36_gzq/logs/huanyu_precompute
-
-(
-set -o pipefail
-python3 -u /opt/huawei/dataset/ccb_data/code/hufenyu/verl_omni_qwen36_gzq/verl_omni_ext/models/qwen3_6_huanyu/precompute.py \
-  --parquet \
-    /opt/huawei/dataset/ccb_data/data/omni/omni_mix_f8_genrm_sampleall/train.parquet \
-    /opt/huawei/dataset/ccb_data/data/omni/omni_mix_f8_genrm_sampleall/validation.parquet \
-  --model_path /opt/huawei/dataset/downloaded_models/Qwen3.6-35B-A3B-huanyu06b-iter2000-omni4b-hf-huanyu7tokens \
-  --cache_dir /opt/huawei/dataset/infra_data/data/embed_cache_huanyu_sampleall_q128 \
-  --device npu:0 \
-  --sampling_rate 16000 \
-  --read-batch-size 16 \
-  --log-interval 10 \
-  2>&1 | tee -a /opt/huawei/dataset/ccb_data/code/hufenyu/verl_omni_qwen36_gzq/logs/huanyu_precompute/precompute.log
-)
-```
-
-一条命令先处理 train，再处理 validation，共用同一个 cache。也可以将 `--parquet` 后分别只保留其中一个文件，分两次运行。成功以最后的 `[huanyu-precompute] COMPLETE` 为准；中途异常带 parquet 路径和行号。每约 10 秒（在一条样本完成后）输出累计行数、音频 chunk 数、图片数、已创建/复用条目数、速率和估算剩余时间。
-
-`--read-batch-size` 是 parquet 的读取批大小，不是 NPU 推理批大小。当前为每个音频 chunk、每张图片分别编码，限制峰值显存，并使音频计算不受同批其他样本 padding 的影响；没有旧脚本的 `--batch_size`、`--num_workers`、`--max_slice_nums` 选项。视频使用与训练相同的采样 helper，采样帧计入 vision cache，启用视频音轨时也处理音轨。预计算和训练的 `MINICPMO_VIDEO_*`、`MINICPMO_USE_AUDIO_IN_VIDEO` 等解码设置必须一致；否则内容键可能不命中并明确报错。
-
-缓存保存的是音频 fold/projector 和视觉 merger 后的 BF16 `[tokens, 2048]`，不是 fbank 或原始像素。预计算不加载 35B 文本主干。音频编码复用服务器 Huanyu 实现，视觉编码使用当前训练侧 HF 类与严格匹配的 `model.visual.*` 权重。视觉 eager attention 每块最多计算 128 个 query，每块仍使用完整 K/V；不缩图、不截断视觉 token。非空 DeepStack 配置不支持并报错。
-
-当前预计算使用新的 `_q128` 目录，避免与旧版完整矩阵 eager 缓存混用。需要同步本目录的 `precompute.py`、`vision_attention.py` 和 `cache.py`；训练所有节点也需更新以读取相同 contract。原 `embed_cache_huanyu_sampleall` 目录保留，不删除、不修改 manifest。新目录生成后，再次运行相同命令仍会校验并复用其完整条目。
-
-新目录结构为 `manifest.json`、`audio/<内容哈希>.pt`、`vision/<内容哈希>.pt`。键来自真实 fbank/像素及 grid，图片绝对路径变化本身不会造成旧式路径键错配。manifest 校验 checkpoint 路径、配置、权重分片元数据/头部、前处理设置及运行时源码版本；不把整个 35B 权重读入内存做哈希。checkpoint 必须保持不可变，多节点挂载/复制需保持一致的分片元数据。缓存不兼容时需使用新目录，不能手改 manifest 绕过校验。
-
-重复执行相同命令会校验并复用已有完整条目；损坏条目报错，不覆盖。不将没有 Huanyu manifest 的旧 cache 目录接管为新缓存。发布使用同目录临时文件、目录锁及 rename，不要求支持硬链接；文件系统需支持原子 mkdir 和同目录 rename。所有并发预计算进程必须使用此更新后的发布协议。
-
-若仅要复核完整性，给上述 python 命令添加 `--verify-only`（可去掉日志管道）。它重新扫描两个 parquet 并检查每个需要的条目，不启动 encoder、不写入 cache。这是覆盖和完整性检查，不是 NPU 数值验收。
-
-### 使用多张 NPU 并行预计算
-
-`precompute_parallel.py` 在当前节点上为每张指定的卡启动一个独立进程，不使用 Ray、DDP 或 HCCL。每张卡独立加载冻结的 audio/vision encoder，按跨 train/validation 连续的全局行号 `% 卡数` 分配样本，所有进程写入同一个 `_q128` cache。只改变样本调度，既有缓存 contract、query=128 分块方式、媒体 token 数和权重保持一致，已经生成的完整 `_q128` 条目可以直接复用。
-
-先将本目录更新到服务器。若原单卡预计算仍在运行，先用 Ctrl-C 结束该任务，再启动下方命令，避免它与并行进程争用同一卡。例子使用当前节点可见的 0–7 共 8 张空闲 NPU；需要 16 张时，将 `--devices` 列表扩展到 `npu:15`。编号是当前进程可见的逻辑编号，启动器不会修改设备可见性环境变量，也不启停 Ray。
-
-```bash
-python3 -u /opt/huawei/dataset/ccb_data/code/hufenyu/verl_omni_qwen36_gzq/verl_omni_ext/models/qwen3_6_huanyu/precompute_parallel.py \
-  --devices npu:0 npu:1 npu:2 npu:3 npu:4 npu:5 npu:6 npu:7 \
-  --log-dir /opt/huawei/dataset/ccb_data/code/hufenyu/verl_omni_qwen36_gzq/logs/huanyu_precompute_parallel \
-  --parquet \
-    /opt/huawei/dataset/ccb_data/data/omni/omni_mix_f8_genrm_sampleall/train.parquet \
-    /opt/huawei/dataset/ccb_data/data/omni/omni_mix_f8_genrm_sampleall/validation.parquet \
-  --model_path /opt/huawei/dataset/downloaded_models/Qwen3.6-35B-A3B-huanyu06b-iter2000-omni4b-hf-huanyu7tokens \
-  --cache_dir /opt/huawei/dataset/infra_data/data/embed_cache_huanyu_sampleall_q128 \
-  --sampling_rate 16000 \
-  --read-batch-size 16 \
-  --log-interval 10
-```
-
-启动器为每次运行创建新的日志子目录，每张卡的完整输出单独存放，主终端汇总进度。所有 worker 退出码为 0、完成记录中的分片编号和行数通过核对后，才报告总 `COMPLETE`；任一失败会停止本次启动的其余 worker 并返回非零退出码。Ctrl-C/SIGTERM 同样清理本次子进程，不操作其他任务。正常终止会展开缓存写入的 finally；若进程被强杀后遇到残留锁，按前文锁超时说明处理，不自动删除缓存。`--verify-only` 也可通过此入口并行校验，不运行 encoder。
-
-每个 worker 会读取 parquet，但在转换 Python 行对象、读取图片/音频和编码之前先选取自己的样本。加速来自多张卡同时处理不同样本，不是把一张大图分到多张卡；实际速度取决于样本尺寸、CPU 前处理和共享存储带宽，不能保证按卡数线性增长。重复媒体仍可能在不同进程中同时编码，缓存发布锁和哈希校验会保护同一个条目；日志 `created` 表示新编码/写入尝试次数，不代表唯一文件数。增加卡数不需要改变 cache 路径，也无需重算已完成条目。
-
-启动器仅在未设置时为每个 worker 设置 `OMP_NUM_THREADS=2`、`MKL_NUM_THREADS=2`，避免多个进程争抢 CPU；保留用户显式设置。设备绑定在 processor 和原生模型插件导入前完成，避免所有 worker 的早期初始化都落在默认卡上。
-
-底层 `precompute.py` 保留单卡用法，并新增 `--num-shards N --shard-index R`；仅应由一个并行入口完整分配所有 `R=0..N-1`。不要在两台节点上直接各运行一遍上述完整命令，否则会重复相同分片；当前一键入口只调度本机卡。
-
-本次完整 CPU 回归共 180 项通过，包括真实 Arrow 多文件/多 row-group 分片、三个真实 CPU 子进程的非均匀任务分配、日志汇总、失败清理与既有缓存测试；两个预计算入口的 `--help` 均通过。尚未在本地验证多 NPU 吞吐或跨设备数值，服务器运行后以所有 worker 的 `COMPLETE` 和实际耗时为准。
-
-**缓存生成完成后，训练时必须显式启用读取：**
-
-```bash
-HUANYU_USE_PRECOMPUTE=1 \
-HUANYU_EMBED_CACHE_DIR=/opt/huawei/dataset/infra_data/data/embed_cache_huanyu_sampleall_q128 \
-bash /opt/huawei/dataset/ccb_data/code/hufenyu/verl_omni_qwen36_gzq/verl_omni_ext/models/qwen3_6_huanyu/run_32card.sh
-```
-
-入口把这两个变量传入新 Ray 任务；旧 `MINICPMO_USE_PRECOMPUTE` 保持 0。训练侧应打印 `[huanyu-cache] strict audio+vision cache reader`，模型适配器日志应为 `cache=strict`。processor 保留媒体 token/grid 和 RoPE，读 cache 替代训练侧 encoder 输入；forward 校验逐样本数量、位置和长度后注入 embedding，跳过音频/视觉编码。缺项、版本不匹配或未传入缓存标记即失败，不在部分 rank 上在线回退。rollout 仍携带原始媒体，推理侧仍自行编码；缓存也不消除 LLM/FSDP 本身的通信。
-
-Huanyu 在线音频现在也逐 chunk 编码并按真实长度独立 padding，与离线输入形状一致。未改变 encoder/projector 网络或权重。CPU 回归验证缓存读写、缺项/损坏拒绝、混合 batch 插入、梯度与 checkpoint 重算；真实 checkpoint 的 NPU 数值一致性和分布式性能仍需服务器小样本验证。不能仅凭 cache 已生成就断言之前的 AllGather 超时已解决。
-
-预计算功能初次发布时的本地验证：`python -B -m unittest discover -s verl_omni_ext/models/qwen3_6_huanyu/tests -p 'test_*_on_cpu.py' -q`，133 项通过；`precompute.py --help` 和 `bash -n run_32card.sh` 通过。非重入 checkpoint 测试仅绕过编译装饰器，实际执行反向重算。Huanyu 目录外的 79 个插件文件哈希与修改前一致。
-
-## 2026-10-19：预计算在发布 manifest 时被挂载拒绝
-
-日志为 `cache.py → _publish → os.link(temporary, manifest.json)` 抛出 `PermissionError: [Errno 1] Operation not permitted`。临时文件创建、写入和 fsync 已完成，失败的是硬链接操作，说明该挂载拒绝此操作；不能直接据此认定整个目录没有写权限。此时尚未开始样本编码，与 Huanyu 网络、通信超时或 `_version.py` 警告无关。
-
-修复限定于本目录的缓存发布逻辑：先完整写入临时文件并 fsync，再用 `.huanyu-<目标文件名>.lock` 目录锁串行化检查和 rename。锁内再次确认目标不存在，已有条目由原有完整性校验处理，不覆盖。manifest 的旧目录接管检查也放在同一把锁内，避免多个初始化进程互相误判。manifest 和所有 audio/vision 条目共用这一机制，均不再调用 `os.link`。
-
-更新服务器 `verl_omni_ext/models/qwen3_6_huanyu/cache.py` 后，直接重跑上面的完整预计算命令，继续使用 `/opt/huawei/dataset/ccb_data/data/omni/embed_cache_huanyu_sampleall`。本修复不改变缓存格式、内容键或 contract；本次失败留下的空目录可直接使用，不必删除目录、改路径或重新转换 parquet。如果存在之前成功写出的完整条目，会按原规则校验后复用。
-
-目录锁最多等待 30 秒；异常退出遗留的锁不会被自动删除，以免打断另一个节点正在发布的缓存。若报 `publication lock timed out`，日志会包含具体锁路径，应先确认所有节点均没有使用该锁的写入进程，再处理该锁；不要删除整个缓存目录。并发进程须统一更新，目录锁不保护不遵守此协议的旧程序或外部写入者。
-
-附件末尾的 `bash: syntax error near unexpected token ')'` 是另一个问题：只粘贴了命令尾部的 `)`，没有对应的开头 `(`。复制本节完整命令块时保留成对括号；仅执行 `python3 ... | tee ...` 时不要额外追加 `)`。第二次执行已经没有此语法错误，但仍因硬链接失败，二者无因果关系。
-
-本次修复新增 9 项 CPU 回归，覆盖硬链接被禁用、并发发布/初始化、已有目标保护及异常清理；完整 Huanyu CPU 测试共 142 项通过。测试使用本地文件系统和故障注入，服务器实际挂载及 NPU 预计算仍需重跑验证。
-
-## 2026-10-19：第 9 条样本的视觉 eager attention OOM
-
-新日志已出现 `mode=populate rows=124016`、`created=1` 和音频 `290/4 tensors; features=40`，说明 manifest 发布及音频权重加载已通过。真正失败在 `train.parquet row 8 (zero-based)`：`FrozenEncoders.vision → Qwen3_5MoeVisionModel → eager_attention_forward → torch.matmul(query, key.T) * scaling`，单次申请 31.13 GiB，设备当时仅余 24.31 GiB。不是 Huanyu 音频网络加载失败，也不是 Ray/HCCL 通信超时。`33.60 GiB already allocated` 包含运行时中间张量，不能解释成预计算加载了 35B 文本主干。
-
-原脚本虽然每次只编码一张图片，但 eager 会构造形如 `[batch, heads, S, S]` 的注意力分数，缩放和 FP32 softmax 还需额外空间。`--read-batch-size 16` 控制 CPU parquet 读取；调成 1 仍不能消除单张大图的平方矩阵。该 HF attention 的接口和分段行为可参照 [Transformers Qwen3.5 MoE 源码](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_5_moe/modeling_qwen3_5_moe.py)，服务器的具体失败点以本次 traceback 为准。
-
-修复在本目录新增 `vision_attention.py`：仅在离线视觉前向期间拦截该模型实例的 HF eager 调用，将 query 轴按 128 分块；每块仍对完整 K/V 做原实现的缩放、FP32 softmax 和 BF16 输出。不切 key 轴，不将图片裁成互相隔离的小图，也不改变 HF 已有的图片/视频帧 `cu_seqlens` 边界。逐块释放 attention weights，按原顺序拼回 query 输出。HF 原函数在异常时也会恢复，不安装到训练或 rollout 的模型前向。
-
-guard 要求 `eval + no_grad + dropout=0 + noncausal`，并验证输出布局、dtype 和 device；关闭 attention/hidden-state 收集。若实际 HF 前向未经过 hook，则报错，不保存未经验证的输出。正常日志包含 `attention=eager_query_chunked query_chunk=128`、图片 `grid/patches/merged_tokens` 和 `vision attention verified` 的调用数、最大 query 分块及完整 key 长度。只在首张图和较大的新尺寸记录这些信息，避免逐层刷屏。
-
-分块保留完整 attention 数学语义与输入，但不同 NPU GEMM 形状不保证逐 bit 一致。manifest 因此新增 helper 源码哈希和执行标识 `single_image_hf_bf16_eager_q128_v1`，不把旧缓存冒充新执行结果。本节上方的预计算和训练命令已改用 `embed_cache_huanyu_sampleall_q128`。已有旧目录不受影响，不能手改旧 manifest 绕过检查。该方案降低 score/softmax 峰值显存，不降低全量 attention 的平方计算量；实际 NPU 数值、峰值内存和耗时仍需服务器验证。
-
-本次本地完整 CPU 回归共 157 项通过。新增测试以 FP32/BF16 小张量对照完整 eager，并覆盖 query mask、GQA、完整 K/V、不同帧不交叉、异常恢复和 hook 未命中时拒绝保存。测试不代表已在服务器 NPU 上完成预计算。
-
-## 2026-10-19：TaskRunner 找不到 huanyu_audio
-
-日志中的异常是：
-
-```text
-TaskRunnerV1 host=172.16.3.168 pid=1142861
-qwen3_6_huanyu/thinker_adapter.py → build_huanyu_processor
-ModuleNotFoundError:
-vllm_omni.model_executor.models.minicpmo_5_0.huanyu_audio
-```
-
-调用栈证明 Huanyu 训练 adapter 已生效。故障位于 processor 初始化的 Python 导入阶段，尚未开始音频网络权重加载。它与上一轮“Whisper 结构加载 Huanyu 权重”的错误不同。
-
-该日志没有打印 worker 实际导入路径，因此只能确认该进程找不到原生模块，不能直接认定它加载了某个具体旧目录。主要需区分：Ray worker 导入了不含 Huanyu 的旧版本；或该 worker 所在节点的正确目录本身缺少文件/挂载。
-
-当前导入检查流程：
-
-1. 启动器清除 vLLM-Omni 源码路径覆盖，仅将 ext 与其他依赖路径保留在 `PYTHONPATH`，并在训练前核对现有安装的真实导入位置。
-2. 通过 Ray `runtime_env.env_vars` 显式传递清理后的路径与预期安装来源。已有 Ray 集群启动时的环境与当前 shell 环境可能不同，仅在主节点 `find_spec` 成功不足以验证 worker。
-3. processor 与 encoder 共用原生模块导入检查。失败时报告主机/PID、实际包与模块来源、模型包搜索路径、预期文件是否存在、缺失模块名以及 PYTHONPATH，保留原异常链。已经加载了另一份代码时直接拒绝，不在进程内替换 `sys.modules` 或混用两个版本。
-
-如何读取新错误：
-
-| 输出 | 处理 |
+| 参数 | 默认/含义 |
 |---|---|
-| `source mismatch`，实际来源不属于指定目录 | 检查新任务的 `ray init kwargs` 是否包含上述两个环境变量；检查服务器额外的环境重写代码，然后重新启动训练任务 |
-| `expected_native_file=... exists=False` | 在报错节点核对 `HUANYU_VLLM_SOURCE` 的链接/挂载，部署完整且一致的 Huanyu 版 vLLM-Omni；单改 ext 导入路径不能补出缺失文件 |
-| 文件存在但仍无法导入 | 结合 `vllm_omni_origin` 与 `model_package_paths` 检查包搜索路径，保留原异常链继续定位 |
-| `missing_module` 为其他依赖名 | 安装/校正该版本要求的依赖，不误认为缺少 Huanyu 模型代码 |
-| `runtime API mismatch` | 当前 Huanyu 模块缺少适配器所需接口，需核对完整版本，不能使用旧 Whisper 组件代替 |
+| `VC_TASK_INDEX` | 物理节点序号；head 为 0 |
+| `VC_WORKER_HOSTS` | 按 head 在前排列的逗号分隔 IP/host |
+| `RAY_PORT` / `RAY_DASHBOARD_PORT` | `6925` / `8960` |
+| `RAY_CLUSTER_WAIT_TIMEOUT` / `RAY_CLUSTER_POLL_INTERVAL` | `900` / `5` 秒 |
+| `HUANYU_JOB_PREFLIGHT` | 默认 `0`；设 `1` 启用 job 的额外检查。独立 Ray 的 `--check` 和 prepare 的 `--start-ray` 明确检查 |
+| worker startup | `RAY_worker_maximum_startup_concurrency=32`、`RAY_prestart_worker_first_driver=1`、`RAY_enable_worker_prestart=0` |
 
-不要只复制一个 `huanyu_audio.py` 到旧推理仓库：推理模型的 Huanyu 分支及 processor 分派也必须同版本。先保证每节点安装完整且一致，`HUANYU_VLLM_SOURCE` 在准备/训练中仅指定预期来源；检查按解析后的真实路径比较。
+每节点注册 `NPU:16`。head 检查所有节点，worker 检查本机注册；检查直接走 GCS，不要求 Dashboard API，也不创建训练 driver。复用运行中的 Ray 不会修改旧 raylet 的启动参数。独立 `bash start_huanyu_ray.sh` 不会向父 shell 导出变量；按输出设置 `RAY_ADDRESS=head_ip:6925`，避免 `auto` 指向另一个 session。
 
-本地未提供服务器 V1 的 `verl.trainer.main_ppo.run_ppo` 及额外 `worker_env.py`，无法本地证明服务器是否再次覆盖 Ray 环境。最终以新任务打印的配置和 worker 导入结果验收；本地没有执行 NPU 训练。
+默认使用现有 `/vllm-workspace/vllm-omni` 安装，不把 checkout 插入 `PYTHONPATH`。源码来源预检仍保留，HF checkpoint、ext 包和 native backend 的版本必须匹配。
 
-## 2026-10-19：安装 rollout hook 时没有 _preprocess_input
+## 4. 训练命令：先 export，再启动 job
 
-新日志已越过原生 Huanyu 导入和 `build_huanyu_processor()`，随后在 `configure_processor()` 安装推理输入 hook 时失败：
+模型、数据、batch、吞吐和精度参数统一在 job 启动前 `export`。多节点时每个节点使用同一份参数，只有 `VC_TASK_INDEX` 不同。以下示例需要先按第3节设置 `PROJECT_ROOT`、`SHELL_ROOT` 和实际节点地址；不需要手改 shell 文件里的默认值。
 
-```text
-TaskRunnerV1 pid=1390206 ip=172.16.3.226
-rollout_inputs.py → _install_on_server_class(vLLMOmniHttpServer)
-AttributeError: type object 'vLLMOmniHttpServer' has no attribute '_preprocess_input'
-```
+### 已有环境与 Ray：集中配置的单文件入口
 
-问题在本插件对 server 接口的假设。旧实现直接读取 `_preprocess_input`，只兼容本地所见版本；新日志中的实际导入对象没有该属性。错误发生在 trainer 初始化阶段，尚未产生 rollout，不能解释为 Huanyu encoder 权重或音频特征出错。
+需要直接在脚本内查看或编辑参数时使用 `run_huanyu_train.sh`。它按路径、资源、数据、媒体、精度、通信、诊断、Actor、FSDP、rollout、奖励和训练调度分组，每项有中文行内注释；不再经过其他训练 wrapper，也不会准备环境、安装依赖或启停 Ray。默认通用 `data/train.parquet` / `validation.parquet`、2748、Actor16 + 独立 GenRM16、TP4、BS32/mini32/N4、prompt3072/response2048、full 精度、eager、冻结音频/视觉、在线编码且不使用 embedding 缓存。视频参数只作为数据行未指定时的回退值，沿用 OmniMix 的 fps=1、max_frames=8。
 
-本次只修改 Huanyu 目录里的 hook、测试和本说明：
+新入口显式设置 microbatch=1 和 `huanyu_sync_each_microbatch=true`，以在多 microbatch 时同步分片梯度；Actor 参数精度仍默认 FP32，Ref/rollout/GenRM 默认 BF16。全部配置以本文件为准；它列出了该入口使用的覆盖项，没有展开框架的每一个内部默认字段。
 
-- 若导出对象是 Ray ActorClass，先取其 `__ray_metadata__.modified_class`，对实际 Python 类安装 hook。
-- 有同步 `_preprocess_input(self, prompt_ids, ..., multi_modal_data, ...)` 时沿用此入口。
-- 没有独立预处理方法时，支持带 `prompt_ids/image_data/audio_data` 的异步 `generate` 入口：从该请求的媒体参数构造元数据，收缩 prompt 后 `await` 原方法。请求 ID、采样参数、媒体对象和其他参数继续传给原方法；不重写引擎生成逻辑。
-- 只选择一个入口，重复安装不会二次包裹；其他模型仍调用原方法。音频条目与 30 秒 chunk 的校验继续保留，不通过跳过 hook 或删除媒体检查绕过报错。
-- 方法缺失或签名不匹配时明确报出不支持的接口，不能把“安装函数返回了”当作适配成功。
-- 包装器保留 Huanyu 模块内的局部函数身份，不复制原 server 方法的 `__module__/__qualname__`，避免序列化时只记录服务器原方法路径、远端恢复成未安装 hook 的方法；签名与原方法调用关系仍保留。
-
-安装成功的日志包含 `Huanyu rollout input hook installed`、实际方法名（`_preprocess_input` 或 `generate`）和源码路径。服务器尚需核实真实方法实现并重跑验证，不能仅凭 AttributeError 判断一定是 Ray 包装导致。
-
-同步更新后的 `rollout_inputs.py` 到所有节点的 `verl_omni_ext/models/qwen3_6_huanyu/`，继续使用同一个 `run_32card.sh`。无需修改训练参数、重算 cache 或重建 parquet。
-
-## 2026-10-19：generate 被 autoregressive server mode 检查拦截
-
-15:18 的日志已进入 `SingleTurnAgentLoop → server_manager.generate → vLLMOmniHttpServer.generate`，随后在 Huanyu 包装器内报错：
-
-```text
-rollout_inputs.py → contract_arguments
-RuntimeError: Huanyu rollout requires the autoregressive server mode
-```
-
-这说明异步 `generate` hook 已安装并被远端调用。本次失败在调用原始生成方法之前，不是 encoder 算子、模型生成或 RM 打分报错。调用栈中的 `qwen3_6_whisper/rollout_sampling.py` 是复用的采样包装器，仅凭这个路径不能认定模型又走回 Whisper 音频适配器。
-
-旧检查 `getattr(self, "_ar_mode", False)` 将“私有属性不存在”和“显式 False”合并为同一个错误。该日志没有打印属性值，因此不能据此断言引擎实际使用了非 AR 模式；此前启动参数已包含 `engine_kwargs.vllm_omni.output_mode=ar`，但仍须在报错 server 进程中确认。
-
-随后提供的服务器源码搜索结果补齐了版本差异：`vllm_omni_async_server.py:70` 使用 `strategy_cls = ARStrategy if omni_kwargs.get("output_mode", "diffusion") == "ar" else DiffusionStrategy`，整个文件未找到 `_ar_mode`。该版本改为策略类分派，插件继续依赖旧私有字段是不兼容的。应按实际 rollout 配置确认 AR，而不是把缺少旧字段解释为配置选中了 diffusion；原启动脚本中的 `output_mode=ar` 无需更改。
-
-修复只在本目录：
-
-- 同时读取 server 的 `_ar_mode` 与 `self.config.engine_kwargs.vllm_omni.output_mode`，配置支持字典和属性对象。
-- `_ar_mode` 缺失且配置明确为 `ar` 时允许继续；旧版 server 的 `_ar_mode=True` 且配置未设置时仍兼容。
-- 显式 `_ar_mode=False`、非 AR 配置、两者冲突或没有模式依据时仍拒绝。不会通过设置 `_ar_mode=True`、修改配置或移除检查强行切换 server。
-- 通过时每个 server 仅打印一次 `Huanyu rollout mode verified`，包含两项实际值；失败信息也包含两项值，以区分接口缺失与真正的模式冲突。媒体条目与占位符校验保持不变，其他模型不经过该检查。
-
-同步新版 `rollout_inputs.py` 到两节点当前 ext 目录后，启动新的训练任务即可，不修改原训练参数、parquet 或 cache。若仍报错，请保留完整的新错误行：`_ar_mode=False` 表示需要核查实际 server 初始化分支；`<missing>` 配合配置缺失表示该服务器版本的配置保存接口仍需核实。不要再用旧错误推断具体字段值。
-
-## 2026-10-19：AgentLoop 缺少 mm_token_type_ids，以及展开 prompt 超长
-
-本轮日志包含两个独立故障，不能只修其中一个：
-
-1. 18 处 `Qwen3_5MoeModel.get_rope_index() missing 1 required positional argument: 'mm_token_type_ids'`。部分请求已完成 rollout，在 `AgentLoopWorkerTQ._agent_loop_postprocess → _compute_score → _compute_position_ids → HuanyuProcessor.get_rope_index` 失败。该调用栈中的 `_compute_score` 不等于 RM 模型故障，具体失败点是位置编码的接口适配。
-2. 4 处 `Multimodal prompt produced 3107 tokens, exceeding rollout.prompt_length=3104`，发生在其他请求生成前的 `ct_build_initial_tokens`。关闭长度预筛不取消运行时容量限制。
-
-日志中个别请求的 `[mm-merge] ok features=... placeholders=...` 只说明相应请求的数量对齐，不能证明整个训练链路或 encoder 数值已经正确。
-
-### RoPE 参数修复
-
-新 Qwen 接口要求形状为 `[B,S]` 的 `mm_token_type_ids`，文本为 0、图片为 1、视频为 2。旧 Huanyu 适配器只转发 AgentLoop 提供的参数，没有生成这个新增字段。本目录的 `processor.py` 现按已安装原生函数的签名处理：
-
-- 旧版不要求该参数时，继续原调用。
-- 新版缺少该参数或值为 None 时，从实际 `input_ids` 构造同形状、同设备的整数类型标记，兼容 padding；不从 decode 文本或原始 problem 猜位置。
-- `image_pad` 为 1；原生 `video_token_id` 为 2。本目录的视频已拆为图片帧，实际走 image token 和 image grid，因此这些帧为 1。
-- Huanyu 音频 `<unk>` 槽位、文本和媒体边界符为 0，padding 为 0。这里的 0 表示使用顺序位置编码，并不意味着丢弃音频：音频 embedding 仍由 Huanyu forward 在对应槽位注入。
-- 调用方已经明确传入类型 tensor 时原样转发。原生 HF 函数继续负责图像三维位置及 delta；没有把整条多模态序列改成普通 arange，也没有改动 token、图片网格或 attention mask。
-
-用户更正后提供的真实实现来自 `/usr/local/python3.12.13/lib/python3.12/site-packages/transformers/models/qwen3_5_moe/modeling_qwen3_5_moe.py`，与报错环境一致。它除了要求上述模态标记，还会将 `video_grid_thw` 按时间维重复展开，并将每帧时间维置为 1，适配帧间时间戳；本补丁继续调用这份原生函数，保留该处理。先前误贴的 Python 3.11 环境不作为本次修复依据。
-
-更新后的 `check_runtime.py` 会打印实际 Python 和 Transformers 路径/版本，并在训练环境中用图像加 1 秒/31 秒音频调用原生 RoPE。请在训练使用的容器里 source 对应环境后执行本文件前面的接口检查命令，无需为检查重新启动训练或加载模型权重。
-
-### 长度预算修复
-
-只调整本目录 `run_32card.sh`，长度预筛仍关闭；不删除样本、不截断媒体槽位。无环境变量覆盖时的默认值：
-
-| 环境变量 | 默认值 | 最终对应配置 |
-|---|---:|---|
-| MAX_PROMPT_LENGTH | 4096 | data.max_prompt_length |
-| ROLLOUT_PROMPT_LENGTH | 同 MAX_PROMPT_LENGTH | rollout.prompt_length |
-| MAX_RESPONSE_LENGTH | 2048 | data.max_response_length、rollout.response_length |
-| ROLLOUT_MAX_MODEL_LEN | prompt + response + 128，即 6272 | rollout.max_model_len、max_num_batched_tokens |
-| MAX_TOKEN_LEN_PER_GPU | 同 ROLLOUT_MAX_MODEL_LEN | actor 训练及 actor/ref log_prob token 预算 |
-
-入口保存这些值并作为最终 Hydra 覆盖传给后端，防止共享脚本的 DEBUG 分支重新把 prompt 设回 3072；不要再通过该入口的 CLI 参数覆盖上述长度键，应使用表中环境变量。已有 shell 若仍设置旧的 `ROLLOUT_PROMPT_LENGTH=3104`，会保留该显式值，需同时更新。
-
-启动前校验正整数及预算关系：rollout prompt 不大于训练 prompt；model length 至少覆盖 rollout prompt + response；训练 token 预算至少覆盖训练 prompt + response。4096 能容纳本次已知 3107-token 请求，不保证未预筛的全量数据没有更长样本；过长时继续报出真实长度，不能通过截断破坏对齐。更长上下文可能增加显存占用，本轮不调整 batch、TP 或 dtype。
-
-两节点同步本目录后，在已加载环境、Ray 已就绪的主节点运行（显式值避免继承旧 shell 的长度设置）：
+仅在 head 执行：
 
 ```bash
-MAX_PROMPT_LENGTH=4096 \
-ROLLOUT_PROMPT_LENGTH=4096 \
-MAX_RESPONSE_LENGTH=2048 \
-ROLLOUT_MAX_MODEL_LEN=6272 \
-MAX_TOKEN_LEN_PER_GPU=6272 \
-bash /opt/huawei/dataset/ccb_data/code/hufenyu/verl_omni_qwen36_gzq/verl_omni_ext/models/qwen3_6_huanyu/run_32card.sh
+bash "$SHELL_ROOT/run_huanyu_train.sh"
 ```
 
-如继续使用 4096-token response，将 `MAX_RESPONSE_LENGTH` 改为 4096，同时将 `ROLLOUT_MAX_MODEL_LEN` 和 `MAX_TOKEN_LEN_PER_GPU` 设为 8320。无需重建 parquet 或重算 cache。
-
-## 2026-10-19：old_log_prob 的 entropy 临时张量导致 OOM
-
-本次日志已经完成若干步训练，失败链为 `_compute_old_log_prob → actor_rollout_compute_log_prob → infer_batch(forward_only=True) → prepare_model_outputs → verl_F.entropy_from_logits`。NPU 0 已分配 48.37 GiB、保留 48.41 GiB、空闲 9.36 GiB，普通 entropy 运算再申请 9.58 GiB 失败。不是 Huanyu encoder 内部报错，也不是该步 `loss.backward()` 或 RM 生成报错；没有证据需要重新预计算 cache。
-
-启动参数已有 `entropy_coeff=0`、`entropy_from_logits_with_chunking=true` 和 `chunk_size=512`，但实际进入的仍是原始函数。熵正则系数为零不等于关闭 old_log_prob 阶段的熵统计。Whisper 的 `build_qwen36_forward_adapter()` 另装了 entropy 分块补丁；独立 Huanyu adapter 没有调用这个包含 Whisper 音频/cache 行为的 builder，因此此前没有该保护。仅靠本日志不能确定服务器原生 engine 分块开关为何未覆盖这条路径。
-
-修复仅在本目录新增 `entropy.py` 并由 Huanyu `configure_model()` 在模型配置成功后安装。它替换当前 Huanyu 模型 worker 内的 `verl.utils.torch_functional.entropy_from_logits` 函数引用，不修改公共 verl、Whisper 或 RM 源文件，也不在包导入或预计算时安装。无需新增启动参数：默认每块 512 个 token，每个 token 仍使用完整词表。
-
-- 同时支持 `[T,V]` 与 padded `[B,S,V]`，按 batch/sequence 切片；不先把非连续 logits 全量 reshape、复制或转 FP32。
-- FP16/BF16/FP32 分块使用 FP32 计算，FP64 保留；逐行减最大值后使用相同熵公式，降低共同大偏置引起的相减误差。输出形状仍为 `[T]` 或 `[B,S]`，不更改 logits、mask、奖励或 loss 系数。
-- 一阶反向保存原 logits 引用，逐块重算概率并使用 `dH/dz = -p * (z - E_p[z])`；不保存所有块的完整 softmax 中间结果。最终 logits 梯度本身仍需完整大小；不支持二阶求导。
-- 安装幂等，安装失败明确报错。每个进程只打印一次安装日志和一次首次实际调用日志，包含真实 shape/dtype/device/grad 状态。
-
-将更新后的 Huanyu 目录同步到所有训练节点，结束旧任务并启动新的训练任务。继续使用原有 parquet、`embed_cache_huanyu_sampleall_q128` 和原命令；无需删除 cache 或重新生成数据。例如，环境和 Ray 已由用户准备好后：
+可修改文件中的默认值、导出同名环境变量，或在命令末尾追加 Hydra 覆盖。关联长度、资源及精度开关建议通过脚本或环境变量设置，让派生值同步计算；`RAY_ADDRESS` 未设置时使用 `auto`，找不到已有集群会报错。默认日志位于 `$PROJECT_ROOT/runs/huanyu_<时间>_<PID>/console.log`。
 
 ```bash
-HUANYU_USE_PRECOMPUTE=1 \
-HUANYU_EMBED_CACHE_DIR=/opt/huawei/dataset/infra_data/data/embed_cache_huanyu_sampleall_q128 \
-bash /opt/huawei/dataset/ccb_data/code/hufenyu/verl_omni_qwen36_gzq/verl_omni_ext/models/qwen3_6_huanyu/run_32card.sh
+# 只查看最终启动参数，不加载模型、不连接 Ray、不创建输出目录。
+bash "$SHELL_ROOT/run_huanyu_train.sh" --dry-run
+
+# 两个训练 step，演示环境变量和末尾 Hydra 参数覆盖。
+TRAIN_BATCH_SIZE=16 PPO_MINI_BATCH_SIZE=16 TOTAL_TRAINING_STEPS=2 \
+  bash "$SHELL_ROOT/run_huanyu_train.sh" actor_rollout_ref.rollout.max_num_seqs=16
 ```
 
-检查该次训练日志应出现以下两类证据；仅有 installed 不能证明执行过 entropy：
+`HUANYU_REWARD_MODE=rule_based` 会关闭独立 GenRM 池，按数据行 `data_source` 分派已有规则；数据集必须有对应 scorer。使用 forward profiler 仍需先按 [forward profiling 说明](docs/forward_profile.md) 安装钩子，再设置 `HUANYU_FORWARD_PROFILE_DIR`。
 
-```text
-[huanyu-entropy] installed pid=... chunk_size=512 target=verl.utils.torch_functional.entropy_from_logits
-[huanyu-entropy] active pid=... shape=(...) dtype=... device=... chunk_size=512 grad_enabled=False requires_grad=False
-```
+GenRM 模式同时显式加载 `verl_omni_ext.models.qwen3_5_moe`（verl 适配器）和 `verl_omni_ext.models.qwen3_5_moe.vllm_omni`（原生 AR pipeline），并将模块列表写入本次 Ray runtime_env。原生 vLLM-Omni 必须支持当前安装约定的 `VLLM_OMNI_EXTERNAL_MODULES` 加载入口。若仍报 `Qwen3_5MoeForConditionalGeneration does not support request-level batching`，应检查报错进程的部署配置是否使用 `qwen3_5_moe_thinker_only`、stage 是否为 `llm_ar`，以及是否存在插件导入失败；降低 `max_num_seqs` 不能验证 AR pipeline 已正确选择。
 
-`grad_enabled` 和 `requires_grad` 以实际调用阶段为准。本修复限制 entropy 的概率/算术中间张量，不消除完整 logits、模型参数、梯度或优化器状态，因此不保证所有后续阶段均无 OOM。实际 NPU 峰值与完整训练仍需服务器重跑验证。
-
-本次完整 Huanyu CPU 回归 200 项通过（原 180 项加 20 项）。新增覆盖 FP16/BF16/FP32/FP64 熵值及加权梯度、FP64 gradcheck、真实 padded response 非连续切片、默认 512-token 前反向分块上限、原输入存储不被整块复制、autograd 不保存额外全量概率、空 token、首次调用日志与模型初始化接入。命令为 `python -B -m unittest discover -s verl_omni_ext/models/qwen3_6_huanyu/tests -p 'test_*_on_cpu.py' -q`；本地补齐临时测试依赖 mpmath，未修改服务器依赖。本地无 NPU，不将这些 CPU 结果当作服务器 OOM 已消失的证据。
-
-## 验证与边界
+### AQA：两节点各执行，Actor16 + GenRM16
 
 ```bash
-python3 -B -m unittest discover \
-  -s verl_omni_ext/models/qwen3_6_huanyu/tests -p 'test_*_on_cpu.py' -v
-bash -n verl_omni_ext/models/qwen3_6_huanyu/run_32card.sh
+export HUANYU_JOB_MODE=aqa_unfreeze
+export HUANYU_REWARD_MODE=RM
+export MODEL_PATH=/opt/huawei/dataset/model_gy/downloaded_models/2748
+export TRAIN_FILE=/opt/huawei/dataset/infra_data/data/aqa_dataset/train.parquet
+export VAL_FILE=/opt/huawei/dataset/infra_data/data/aqa_dataset/validation.parquet
+export TRAIN_BATCH_SIZE=4 PPO_MINI_BATCH_SIZE=4 ROLLOUT_N=4
+export NUM_NPUS=16 NNODES=1 ROLLOUT_TP=4
+export MAX_PROMPT_LENGTH=4096 MAX_RESPONSE_LENGTH=2048
+export AQA_DYNAMIC_BSZ=true MAX_TOKEN_LEN_PER_GPU=8192
+export ROLLOUT_MAX_NUM_BATCHED_TOKENS=16384 ROLLOUT_MAX_NUM_SEQS=16
+export ROLLOUT_GPU_MEM_UTIL=0.6 RM_GPU_MEM_UTIL=0.7
+export TOTAL_TRAINING_STEPS=2 TRAINER_LOGGER='[console]' WANDB_MODE=disabled
+bash "$SHELL_ROOT/run_huanyu_32card_job.sh"
 ```
 
-本轮 97 项 CPU 测试全部通过，Bash 语法检查通过；用外部命令替身执行启动器的默认、DEBUG、response=4096、prompt=5120、非法模型预算和非法训练预算六组检查均通过，未启动训练。新增 6 项 RoPE 回归测试覆盖必填模态参数、图像/音频混合序列、左右 padding、纯文本、显式参数透传、None 补齐、视频类型及无效 mask；旧接口与原生位置精度检查保留。
+只由 head 提交训练。AQA 默认 Actor `16×1`、rollout TP4（4 个副本）、GenRM `16×1`，合计需要32卡；默认 encoder/projector 都训练，视觉冻结。已有环境/Ray 时，可在 head 沿用上述 export 后直接执行 `bash "$SHELL_ROOT/run_huanyu_aqa_audio_train.sh"`，避免重复准备。
 
-另在内存中直接执行用户更正后的服务器 `get_rope_index` 函数，检查图片三轴位置、图像加音频及 padding、2055-token 纯文本、纯音频、带时间戳分隔的两帧视频，共五组均通过。该附件未包含 `get_vision_position_ids`，此项辅助函数使用空间网格测试替身；生产适配器绑定的是安装版本自己的 helper，因此这次检查不等于完成服务器完整 Transformers/NPU 数值验收。
+16卡、无GenRM实验使用已有Ray的 AQA直接入口，并 `export HUANYU_REWARD_MODE=rule_based`；奖励改为字符二元组 Dice 规则，训练目标随之改变。完整音频模式见[AQA 说明](AQA_AUDIO_TRAINING_ZH.md)。
 
-此前 91 项测试覆盖 AR 模式检查、异步 generate、Ray 类解包、原生导入来源、严格权重加载、FP32 Actor 主参数、真实长度与占位符、文本梯度、长音频和其他模型的 hook 分流。真实模型依赖使用测试替身，不能据此证明 NPU 上数值一致。
+### STEM：16 卡、短配置
 
-Windows 本地沙箱中的 asyncio 测试初始化曾阻塞，允许本地 IPC 后全部 86 项测试完成；这不是服务器训练测试。未在本地安装 Ray/cloudpickle，真实 Ray 远端序列化与服务器接口仍需服务器验收。
+单节点设置 `VC_WORKER_NUM=1`、`VC_TASK_INDEX=0`，`VC_WORKER_HOSTS` 只包含本机地址，再执行：
 
-默认冻结 audio encoder/projector；显式 `huanyu_freeze_audio=false` 支持 AQA 在线编码并训练音频，不能与预计算缓存同时启用，详见 [AQA 训练说明](AQA_AUDIO_TRAINING_ZH.md)。两种模式都采用 padded [B,S] 前向（use_remove_padding=false），可能比 packed 路径占用更多显存。音频计算保持原生 VGG FP32、Conformer BF16；参数仍未解分片或音频模块被独立 FSDP 包装时明确报错，不能在不同 rank 上临时发起不对称 collective 来绕过。
+```bash
+export MODEL_PATH=/opt/huawei/dataset/model_gy/downloaded_models/2748
+export TRAIN_FILE=/opt/huawei/dataset/infra_data/data/rl_stem_data/train.parquet
+export VAL_FILE=/opt/huawei/dataset/infra_data/data/rl_stem_data/val.parquet
+export TOTAL_NPUS=16 TRAIN_BATCH_SIZE=4 PPO_MINI_BATCH_SIZE=4 ROLLOUT_N=4
+export HUANYU_REWARD_MODE=rule_based
+export MAX_PROMPT_LENGTH=2048 MAX_RESPONSE_LENGTH=2048 STEM_IGNORE_EOS=false
+export STEM_DYNAMIC_BSZ=true MAX_TOKEN_LEN_PER_GPU=8192
+export ROLLOUT_MAX_NUM_BATCHED_TOKENS=16384 ROLLOUT_MAX_NUM_SEQS=8
+export TOTAL_TRAINING_STEPS=2 TRAINER_LOGGER='[console]' WANDB_MODE=disabled
+bash "$SHELL_ROOT/run_huanyu_stem_job.sh"
+```
 
-服务器验收顺序：接口检查通过；Huanyu 严格加载成功；纯文本、图像、短音频、跨 30 秒音频和视频样本完成 rollout/log_probs/loss；再对同一音频比较训练与推理的 token 数、embedding 和 log_probs。若真实服务器接口不同，保留原始错误继续在本目录适配，不能用补零、裁剪或 strict=False 掩盖。
+32卡使用两节点地址和节点数，把 `TOTAL_NPUS` 改为32，例如 BS8/mini8/N4，保证每次 mini 的轨迹数能被 Actor world size 整除。每节点运行job；已有集群时只需在head执行同样export后使用 `bash "$SHELL_ROOT/run_huanyu_stem_job.sh" --train-only`，它跳过环境准备和Ray启动。
+
+STEM job 默认全部卡做 Actor、规则奖励、TP8。**当前代码训练 TP=1、SP=1，所以规则模式下 32 张 Actor 卡的全局 DP 仍是 32；`fsdp_size=16` 仅限制分片组大小，不能把全局 DP 变成 16。** 直接 `run_huanyu_stem.sh` 默认是 Actor16 + GenRM16、TP4、BS4/mini4/N4、5K context；它与 scaled job 默认值不同。选择规模配置时优先使用 `run_huanyu_stem_job.sh`。
+
+STEM job 也接受 `export HUANYU_REWARD_MODE=RM`：32 张物理卡默认划分为 Actor16 + RM16；默认从物理节点中预留一台16卡节点给RM，其余节点做Actor。16张物理卡的scaled job不能按这种布局同时运行Actor和RM，会在启动前报错。切换奖励模式时重新设置或清理旧的 `NUM_NPUS`、`NNODES`、`RM_N_GPUS_PER_NODE`、`RM_NNODES`，避免沿用上次显式导出的资源池。
+
+### 通用多模态数据、冻结音频与视觉、GenRM
+
+使用 common job 时，在两节点各执行以下设置后启动；AQA 等原始媒体数据无需 embedding 缓存：
+
+```bash
+export HUANYU_JOB_MODE=frozen_cache
+export HUANYU_REWARD_MODE=RM
+export MODEL_PATH=/opt/huawei/dataset/model_gy/downloaded_models/2748
+export TRAIN_FILE=/opt/huawei/dataset/infra_data/data/train.parquet
+export VAL_FILE=/opt/huawei/dataset/infra_data/data/validation.parquet
+export HUANYU_FREEZE_AUDIO=true HUANYU_USE_PRECOMPUTE=0
+export HUANYU_EMBED_CACHE_DIR=""
+export TRAIN_BATCH_SIZE=16 PPO_MINI_BATCH_SIZE=16 ROLLOUT_N=8
+bash "$SHELL_ROOT/run_huanyu_32card_job.sh"
+```
+
+common job 在环境准备前后强制设置 `HUANYU_USE_PRECOMPUTE=0`、`MINICPMO_USE_PRECOMPUTE=0`、`HUANYU_AQA_USE_PRECOMPUTE=0`，清空对应缓存路径，并显式传给 Ray worker。旧环境或旧 raylet 中开启的缓存不会生效；音频冻结设置保持原有模式语义。已有环境/Ray时，head也可以直接运行后端，并明确覆盖 worker 的旧缓存值：
+
+```bash
+bash "$SHELL_ROOT/run_qwen36_huanyu_gspo_npu_omni_mix_genrm.sh" \
+  '++ray_kwargs.ray_init.runtime_env.env_vars.HUANYU_USE_PRECOMPUTE="0"' \
+  '++ray_kwargs.ray_init.runtime_env.env_vars.MINICPMO_USE_PRECOMPUTE="0"' \
+  '++ray_kwargs.ray_init.runtime_env.env_vars.HUANYU_EMBED_CACHE_DIR=""'
+```
+
+本次关闭的是 common job 的预计算 embedding 使用，其他训练直接入口仍保留显式缓存能力。缓存路径不能填写字符串 `null` 来关闭：应关闭开关并传入空字符串。
+
+OC-RL 4B 数据是纯图文数据，不能给要求每条样本都有音频的 AQA 入口；使用通用 GenRM 入口并指定实际 parquet，见[数据 Wiki](OC_RL_4B_DATASET_WIKI_ZH.md)。
+
+### 替代已删除的 35B frozen-cache job
+
+原 `run_huanyu_35b_frozen_cache_32card_job.sh` 的入口已删除。下面保留其模型、数据、资源池、batch、长度和动态批处理配置；按当前要求关闭 embedding，改为在线编码，因此不再与旧缓存实验完全等价。两个节点都执行，沿用当前作业的 `VC_WORKER_HOSTS` / `VC_WORKER_NUM=2`，并分别设置 `VC_TASK_INDEX=0` / `1`：
+
+```bash
+export PROJECT_ROOT=/opt/huawei/dataset/infra_data/code/verl_omni_qwen36_gzq_new
+export SHELL_ROOT="$PROJECT_ROOT/examples/qwen3_6_huanyu"
+export HUANYU_JOB_MODE=frozen_cache HUANYU_REWARD_MODE=RM
+export HUANYU_CLUSTER_NODES=2 VC_WORKER_NUM=2
+export MODEL_PATH=/opt/huawei/dataset/model_gy/downloaded_models/2748
+export TRAIN_FILE=/opt/huawei/dataset/infra_data/data/train.parquet
+export VAL_FILE=/opt/huawei/dataset/infra_data/data/validation.parquet
+export RM_MODEL_PATH=/opt/huawei/dataset/model_gy/downloaded_models/Qwen3.5-35B-A3B
+export HUANYU_EMBED_CACHE_DIR=""
+export HUANYU_USE_PRECOMPUTE=0 MINICPMO_USE_PRECOMPUTE=0
+export HUANYU_FREEZE_AUDIO=true
+export HUANYU_TRAIN_AUDIO_ENCODER=false HUANYU_TRAIN_AUDIO_PROJECTOR=false
+export NUM_NPUS=16 NNODES=1 ROLLOUT_TP=4
+export RM_N_GPUS_PER_NODE=16 RM_NNODES=1 RM_TP=4 RM_SPLIT_NODES=1
+export TRAIN_BATCH_SIZE=16 PPO_MINI_BATCH_SIZE=16 ROLLOUT_N=8
+export MAX_PROMPT_LENGTH=2048 MAX_RESPONSE_LENGTH=3072
+export ROLLOUT_PROMPT_LENGTH=2048 MINICPMO_MM_PROMPT_BUDGET=2048
+export ROLLOUT_MAX_MODEL_LEN=5248 ROLLOUT_MAX_NUM_BATCHED_TOKENS=5248
+export MAX_TOKEN_LEN_PER_GPU=5248
+export ROLLOUT_MAX_NUM_SEQS=64 ROLLOUT_NUM_WORKERS=4 UPDATE_WEIGHTS_BUCKET_MB=1024
+export ACTOR_DYNAMIC_BSZ=true ROLLOUT_LOG_PROB_DYNAMIC_BSZ=true REF_LOG_PROB_DYNAMIC_BSZ=true
+export ACTOR_MODEL_DTYPE=fp32 REF_MODEL_DTYPE=bfloat16
+export ACTOR_PARAM_OFFLOAD=true ACTOR_OPTIMIZER_OFFLOAD=false REF_PARAM_OFFLOAD=true
+export ACTOR_FORWARD_PREFETCH=false REF_FORWARD_PREFETCH=true
+export ACTOR_OFFLOAD_POLICY=false ACTIVATION_OFFLOAD=false
+export PPO_MICRO_BATCH_SIZE_PER_GPU=1 LOG_PROB_MICRO_BATCH_SIZE_PER_GPU=1
+export FILTER_OVERLONG=false
+export ROLLOUT_GPU_MEM_UTIL=0.6 RM_GPU_MEM_UTIL=0.7
+export ROLLOUT_FREE_CACHE_ENGINE=true HUANYU_PRECISION_PROFILE=full HUANYU_GRAPH_MODE=0
+export TOTAL_TRAINING_STEPS=-1
+bash "$SHELL_ROOT/run_huanyu_32card_job.sh"
+```
+
+这里的 `35b` 指既有实验配置与数据命名；实际Actor checkpoint由 `MODEL_PATH` 决定。模型和数据使用通用的 `MODEL_PATH` / `TRAIN_FILE` / `VAL_FILE`；此 job 不再使用 `HUANYU_35B_CACHE_DIR` 或其他 embedding 路径，也不读取缓存 manifest。需要两步验证时另加 `export TOTAL_TRAINING_STEPS=2`，正式运行可设 `-1`。
+
+## 5. 重要参数与覆盖方式
+
+### 奖励模式与资源池
+
+128/256 卡 STEM 切到 RM 时，默认分别为 Actor112/240 + RM16。原默认 batch 不一定整除新的 Actor DP；可对应设置 `TRAIN_BATCH_SIZE=PPO_MINI_BATCH_SIZE=112` 或 `240`，并保留 `ROLLOUT_N=16`。入口会检查 `mini_batch * N` 是否整除实际 Actor DP。
+
+统一通过 job 前的环境变量选择奖励，不需要修改脚本：
+
+```bash
+export HUANYU_REWARD_MODE=RM          # 独立 GenRM 奖励模型
+# 或
+export HUANYU_REWARD_MODE=rule_based  # 规则评分，不启动 RM 资源池
+```
+
+`ruled_based`、`rule` 是 `rule_based` 的兼容写法，`genrm` 是 `RM` 的兼容写法。显式 `HUANYU_REWARD_MODE` 优先于旧的 `RM_ENABLE` 和 `STEM_REWARD_MODE`；未指定统一变量时保留旧变量的兼容行为。最终会规范化 `RM_ENABLE`，并与实际奖励配置和资源池保持一致。环境准备和 job 的站点环境加载会保留调用方的奖励选择。
+
+| 入口/任务 | 未显式选模式时的默认 | `rule_based` 的评分方式 | 资源说明 |
+|---|---|---|---|
+| common job `frozen_cache` / OmniMix 后端 | RM | `naive` manager 按 parquet 的 `data_source` 调用已有规则 scorer | 默认Actor16；RM模式另用16卡，规则模式不创建RM池 |
+| common job `aqa_unfreeze` / AQA直接入口 | RM | `verl_omni_ext.models.qwen3_6_huanyu.rule_based_reward`，字符bigram Dice | 默认Actor16；RM模式另用16卡 |
+| `run_huanyu_stem_job.sh` | rule_based | STEM预处理的数据路由到 `math_dapo` | 规则模式默认全部物理卡做Actor；RM模式默认预留16卡给RM |
+| `run_huanyu_stem.sh`直接入口 | RM | `math_dapo` | 默认Actor16；RM模式另用16卡 |
+
+规则模式并不意味着任意数据集都能用同一种评分器。通用OmniMix模式要求实际 `data_source` 被已有规则dispatcher支持；自定义VL/开放问答数据通常仍需明确的评分实现或使用RM。AQA的Dice分数和GenRM语义判分不是同一个训练目标。
+
+common job 的物理集群仍为两台16卡机器。切到规则模式后，默认Actor16保持不变，释放的另16卡不会自动变成Actor；要让32卡都做Actor，可同时 `export NUM_NPUS=16 NNODES=2`，并按32卡重新校验BS/mini/N，例如AQA使用BS8/mini8/N4。STEM scaled job通过 `TOTAL_NPUS` 管理物理规模，不能把物理总卡数误当成Actor池大小。
+
+RM模式的重要参数也通过export透传：`RM_MODEL_PATH`、`RM_N_GPUS_PER_NODE`、`RM_NNODES`、`RM_TP`、`RM_GPU_MEM_UTIL`、`RM_PROMPT_LENGTH`、`RM_RESPONSE_LENGTH`、`RM_MAX_MODEL_LEN`、`RM_MAX_NUM_BATCHED_TOKENS`、`RM_MAX_NUM_SEQS`。改变奖励模式或池大小后，以启动摘要中的reward、Actor/RM卡数和最终Hydra的 `reward.reward_model.enable` / `enable_resource_pool` 为准。
+
+### 模型、数据、长度和 batch
+
+| 用途 | 推荐设置 | 说明 |
+|---|---|---|
+| Actor checkpoint | `MODEL_PATH` | 默认 `/opt/huawei/dataset/model_gy/downloaded_models/2748` |
+| GenRM checkpoint | `RM_MODEL_PATH` | 默认 `/opt/huawei/dataset/model_gy/downloaded_models/Qwen3.5-35B-A3B` |
+| 通用训练/验证数据 | `TRAIN_FILE` / `VAL_FILE` | 默认 `infra_data/data/train.parquet` / `validation.parquet` |
+| AQA 数据 | `TRAIN_FILE` / `VAL_FILE` | 显式通用路径优先；未设置时才使用 `HUANYU_AQA_TRAIN_FILE` / `HUANYU_AQA_VAL_FILE`，再回落到 `infra_data/data/aqa_dataset/` |
+| STEM 数据 | `TRAIN_FILE` / `VAL_FILE` | 显式通用路径优先；未设置时使用 `STEM_TRAIN_FILE` / `STEM_VAL_FILE` 或 `STEM_DATA_DIR`；默认 `rl_stem_data/train.parquet` / `val.parquet`，无默认val时回落到 `validation.parquet` |
+| 全局 prompt batch | `TRAIN_BATCH_SIZE` | 每 step 轨迹数约为 `BS × ROLLOUT_N` |
+| PPO mini batch | `PPO_MINI_BATCH_SIZE` | 按重复采样前 prompt 数计数；mini 轨迹数为 `mini × N` |
+| 每 prompt 回答数 | `ROLLOUT_N` | GRPO 需有效组内比较；AQA 要求 `N >= 2` |
+| prompt/response上限 | `MAX_PROMPT_LENGTH` / `MAX_RESPONSE_LENGTH` | AQA默认4096/2048；STEM也支持，显式通用值优先于STEM别名，并按两者之和重算总长度 |
+| STEM prompt/总长度回落值 | `STEM_PROMPT_LENGTH` / `STEM_CONTEXT_LENGTH` | job默认2048/12288；未显式指定response时，response=总长度−prompt；job默认slack=0 |
+| 推理引擎context | `ROLLOUT_MAX_MODEL_LEN` | 可独立export，必须覆盖prompt+response；默认AQA为两者之和+128，STEM job为两者之和 |
+| 长度预筛 | `FILTER_OVERLONG`（通用） | GenRM通用默认false；AQA强制false，STEM强制true |
+| EOS | STEM 用 `STEM_IGNORE_EOS=false` | false 允许 EOS 提前结束；true 可能显著增加生成 token 数 |
+| 总 step | `TOTAL_TRAINING_STEPS` | `2`表示两步短跑；`-1`或`null`表示按epoch运行 |
+
+AQA 默认 BS4/mini4/N4；STEM scaled job 默认 BS128/mini128/N16，直接使用默认配置可能很重。通用 GenRM 入口默认 BS32/mini32/N4、prompt3072/response2048、动态批处理开启。基本约束：`BS % mini == 0`，`mini × N` 能被 Actor 卡数整除。AQA 还要求 mini 能被 rollout 副本数整除。静态Actor批处理时，每rank轨迹数`mini × N / Actor卡数`还需能被`PPO_MICRO_BATCH_SIZE_PER_GPU`整除。输入路径、batch、TP 等会参与 shell 的前置校验，应在job前export，不要只修改下游Hydra值。
+
+### 并行、吞吐、显存
+
+| 用途 | 配置 | 区别/默认 |
+|---|---|---|
+| Actor 卡数 | `NUM_NPUS × NNODES` | 分别为每池节点卡数与池节点数，不是机器上的总 NPU 资源 |
+| STEM 总卡数 | `TOTAL_NPUS` | 物理总卡数；规则模式默认全部Actor，RM模式默认预留一台16卡节点给奖励池；Actor分片组上限16 |
+| rollout TP | `ROLLOUT_TP` | AQA/GenRM 通用入口默认4；STEM job默认8；副本数=Actor卡数/TP |
+| Actor 显存比例 | `ROLLOUT_GPU_MEM_UTIL` | 默认 `0.6`，映射 `actor_rollout_ref.rollout.gpu_memory_utilization` |
+| GenRM 显存比例 | `RM_GPU_MEM_UTIL` | 独立预算，默认 `0.7` |
+| 生成并发 | `ROLLOUT_MAX_NUM_SEQS` | 映射 `actor_rollout_ref.rollout.max_num_seqs`；AQA/GenRM默认64，STEM job默认8 |
+| 调度 token budget | `ROLLOUT_MAX_NUM_BATCHED_TOKENS` | 映射 `actor_rollout_ref.rollout.max_num_batched_tokens`；默认随引擎长度，不等于context或BS |
+| AQA三阶段动态批处理默认 | `AQA_DYNAMIC_BSZ` | 默认false，统一给下列三个阶段提供默认值 |
+| STEM三阶段动态批处理默认 | `STEM_DYNAMIC_BSZ` | job默认false、直接STEM默认true；可在job前export |
+| Actor动态批处理 | `ACTOR_DYNAMIC_BSZ` | 映射 `actor_rollout_ref.actor.use_dynamic_bsz`；显式设置优先于上述模式默认 |
+| Actor old log-prob动态批处理 | `ROLLOUT_LOG_PROB_DYNAMIC_BSZ` | 映射 `actor_rollout_ref.rollout.log_prob_use_dynamic_bsz`；不是生成引擎动态调度 |
+| Ref log-prob动态批处理 | `REF_LOG_PROB_DYNAMIC_BSZ` | 映射 `actor_rollout_ref.ref.log_prob_use_dynamic_bsz`；可单独设置 |
+| 静态Actor microbatch | `PPO_MICRO_BATCH_SIZE_PER_GPU` | 映射 `actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu`；AQA/STEM默认1，静态模式用于切分每rank的mini轨迹 |
+| 静态log-prob microbatch | `LOG_PROB_MICRO_BATCH_SIZE_PER_GPU` | 同时映射rollout/ref的`log_prob_micro_batch_size_per_gpu`；默认1 |
+| 动态批token上限 | `MAX_TOKEN_LEN_PER_GPU` | 映射actor PPO、rollout/ref log-prob三个 `*_max_token_len_per_gpu` |
+| 权重同步bucket | `UPDATE_WEIGHTS_BUCKET_MB` | 映射 `actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes`；单位MiB；base默认4096、GenRM/AQA默认1024、STEM job默认2048 |
+| AgentLoopWorker数 | `ROLLOUT_NUM_WORKERS` | 映射 `actor_rollout_ref.rollout.agent.num_workers`；AQA默认等于rollout副本数，STEM job默认128 |
+
+AQA在job前统一开启动态批处理，并设置生成调度预算：
+
+```bash
+export HUANYU_JOB_MODE=aqa_unfreeze
+export AQA_DYNAMIC_BSZ=true MAX_TOKEN_LEN_PER_GPU=8192
+export ROLLOUT_MAX_NUM_BATCHED_TOKENS=16384 ROLLOUT_MAX_NUM_SEQS=16
+export UPDATE_WEIGHTS_BUCKET_MB=2048
+bash "$SHELL_ROOT/run_huanyu_32card_job.sh"
+```
+
+如仅一个阶段需要不同设置，再export `ACTOR_DYNAMIC_BSZ`、`ROLLOUT_LOG_PROB_DYNAMIC_BSZ` 或 `REF_LOG_PROB_DYNAMIC_BSZ`。动态模式主要按`MAX_TOKEN_LEN_PER_GPU`划分microbatch；静态模式使用相应microbatch条数。`ROLLOUT_MAX_MODEL_LEN`、`ROLLOUT_MAX_NUM_BATCHED_TOKENS`和`MAX_TOKEN_LEN_PER_GPU`分别控制context、推理调度和训练/log-prob预算，可独立export。STEM job默认 `STEM_SYNC_EACH_MICROBATCH=true`，Actor参数/优化器offload和CPU offload policy均开启；直接STEM默认按引擎梯度同步。
+
+AgentLoopWorker 与 TP worker 不是一回事：AQA 默认 AgentLoop 数等于 rollout 副本数；STEM job 通过 `ROLLOUT_NUM_WORKERS` 设置，默认128。增加 AgentLoop 数不增加 NPU 容量，还会增加初始化和 CPU 开销。
+
+### 精度、图、音频和 offload
+
+| 配置 | 当前约定 |
+|---|---|
+| `HUANYU_PRECISION_PROFILE=full` | 默认；完整 reference 策略会将必需开关重置为1，单独 export 0 不能覆盖 full |
+| `HUANYU_PRECISION_PROFILE=custom` | AQA/STEM/通用入口均可用于显式数值/性能对照，保留单独开关；不等同于所有精度开关关闭 |
+| `HUANYU_GRAPH_MODE=0` | 各入口默认eager；可export为1，但必须同时选择custom，full仍拒绝graph=1 |
+| `HUANYU_FREEZE_AUDIO` | 旧整体冻结开关；显式 encoder/projector 开关优先，详见 AQA 文档 |
+| `HUANYU_TRAIN_AUDIO_ENCODER` / `HUANYU_TRAIN_AUDIO_PROJECTOR` | 可分别控制；只要一个训练，就不能使用冻结 embedding cache |
+| `HUANYU_USE_PRECOMPUTE` | common job 强制为0；直接训练入口保留显式 Huanyu 缓存能力，不可用旧 `MINICPMO_USE_PRECOMPUTE=1` 代替 |
+| AQA offload默认 | `param_offload=true`、`optimizer_offload=false`、`offload_policy=false`，关闭前向/反向prefetch和activation offload；可用下表支持的环境变量调整 |
+
+### 优化器、offload与训练周期：环境变量映射
+
+| job前export的变量 | 底层配置 | 默认/说明 |
+|---|---|---|
+| `ACTOR_LR` | `actor_rollout_ref.actor.optim.lr` | `1e-6` |
+| `ACTOR_WEIGHT_DECAY` | `actor_rollout_ref.actor.optim.weight_decay` | `0.1` |
+| `ACTOR_PARAM_OFFLOAD` | `actor_rollout_ref.actor.fsdp_config.param_offload` | 默认true |
+| `ACTOR_OPTIMIZER_OFFLOAD` | `actor_rollout_ref.actor.fsdp_config.optimizer_offload` | AQA默认false，STEM job默认true |
+| `ACTOR_OFFLOAD_POLICY` | `actor_rollout_ref.actor.fsdp_config.offload_policy` | AQA默认false，STEM job默认true；与param_offload不同 |
+| `REF_PARAM_OFFLOAD` | `actor_rollout_ref.ref.fsdp_config.param_offload` | 默认true |
+| `ACTOR_FORWARD_PREFETCH` / `REF_FORWARD_PREFETCH` | actor/ref `fsdp_config.forward_prefetch` | AQA/STEM job默认false |
+| `ACTIVATION_OFFLOAD` | `actor_rollout_ref.model.enable_activation_offload` | 默认false |
+| `TOTAL_EPOCHS` | `trainer.total_epochs` | 默认10；显式总step还会限制训练步数 |
+| `TOTAL_TRAINING_STEPS` | `trainer.total_training_steps` | 短跑设2；完整epoch用-1或null |
+| `SAVE_FREQ` / `TEST_FREQ` | `trainer.save_freq` / `trainer.test_freq` | 默认50/10 |
+| `TRAINER_LOGGER` | `trainer.logger` | 默认`[console]`；shell中用单引号包住列表 |
+
+AQA 关闭两个 GDN reference 的显式实验命令：
+
+```bash
+export HUANYU_JOB_MODE=aqa_unfreeze
+export HUANYU_PRECISION_PROFILE=custom HUANYU_GRAPH_MODE=0
+export MINICPMO_GDN_PREFILL_REFERENCE=0 MINICPMO_GDN_FP32_REFERENCE=0
+bash "$SHELL_ROOT/run_huanyu_32card_job.sh"
+```
+
+这会改变数值路径，应重新看 rollout/actor 对齐；不能把 full 的一致性结论直接沿用。设置图模式也只作用于推理端，不等于开启 FSDP 训练 `torch.compile`。
+
+### 参数优先级与生效核对
+
+1. **先export，再启动job。** 表中环境变量会传给后续脚本；job准备站点环境时应保留调用方显式值。未设置才采用入口默认值，旧终端遗留的export也算显式值。
+2. 模型用`MODEL_PATH`；数据统一用`TRAIN_FILE`/`VAL_FILE`。专用AQA/STEM路径别名仅作为未设置通用路径时的回落。STEM的`MAX_PROMPT_LENGTH`/`MAX_RESPONSE_LENGTH`同样优先于专用长度别名；切换任务时应重新export实际文件和长度，防止沿用上次任务设置。
+3. 奖励模式显式 `HUANYU_REWARD_MODE` 优先于旧 `RM_ENABLE` / `STEM_REWARD_MODE`。三阶段动态开关优先取各自显式变量，再取AQA/STEM模式默认。full precision、Huanyu模型适配、SP/资源合法性和音频缓存契约仍是强制约束；不能用矛盾的环境值绕过。
+4. 末尾Hydra参数保留给临时高级调试，部分键会被下游约束再次覆盖；日常重要参数以本页export接口为准。实际生效值以最终Hydra配置为准。
+5. 最终后端统一锁定Huanyu adapter/dataset/pipeline，并将有效precision/graph/runtime环境传给新Ray worker。运行中的训练进程不会自动应用后来在另一个终端export的值。
+
+启动后核对 `[huanyu-aqa]` / `[huanyu-stem]` 的模型资源、BS/N、长度，`[huanyu-precision]` 的profile/实际TP，以及 Hydra 最终配置；不要只看中间 `set -x` 的某一次赋值。
+
+## 6. 日志、检查点和诊断
+
+每次训练创建唯一 `$PROJECT_ROOT/runs/huanyu_<时间>_<随机后缀>/`。`[huanyu-output] console=...` 给出本次 `console.log`；嵌套入口沿用同一运行目录，不重复tee。`HUANYU_RUN_DIR`、`HUANYU_CONSOLE_LOG`、`GENRM_DUMP_DIR`由脚本生成，不作为用户自定义输出入口；可通过下表的checkpoint和回答目录变量指定产物位置。prepare单独写`runs/environment/prepare_*/prepare.log`和`activate.sh`。
+
+| 用途 | 变量/参数 |
+|---|---|
+| 检查点目录 | `DEFAULT_LOCAL_DIR` 或 `trainer.default_local_dir` |
+| rollout/验证回答 | `ROLLOUT_DATA_DIR` / `VALIDATION_DATA_DIR` 或 `trainer.rollout_data_dir` / `trainer.validation_data_dir` |
+| 保存/验证频率 | `SAVE_FREQ`、`TEST_FREQ` 或 `trainer.save_freq`、`trainer.test_freq`，以具体入口最终约束为准 |
+| 关闭 wandb | `export WANDB_MODE=disabled TRAINER_LOGGER='[console]'`；offline仍是wandb离线记录 |
+| gen 分段计时 | `HUANYU_GEN_TIMING=1`，见[计时说明](docs/gen_timing.md) |
+| forward 内部 NPU profiler | 见[forward profile](docs/forward_profile.md)，包含GDN/Attention/MoE/HCCL分析限制 |
+| 已有性能结果与瓶颈分析 | 见[训练、rollout 与 forward 分析记录](docs/profile_analysis_20261110.md)，包含阶段占比、16 进程对照、算子统计及采集限制 |
+
+音频短尾的最新处理策略、旧缓存失效与原生验证命令见[短尾修复说明](docs/audio_short_tails.md)。短尾、视频配对等语义变化后要使用新 embedding 缓存目录；不能手工改 manifest 复用旧缓存。外部审计失败缓存也应更新命名空间并重筛。

@@ -14,10 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 EXAMPLES = ROOT / "examples"
 LAUNCHER = EXAMPLES / "run_huanyu_32card_job.sh"
 DEFAULT_PROJECT_ROOT = "/opt/huawei/dataset/infra_data/verl_omni_qwen36_gzq_new"
-DEFAULT_MODEL_PATH = (
-    "/opt/huawei/dataset/model_gy/downloaded_models/"
-    "Qwen3.6-35B-A3B-huanyu06b-iter2000-omni4b-hf-huanyu7tokens"
-)
+DEFAULT_MODEL_PATH = "/opt/huawei/dataset/model_gy/downloaded_models/2748"
 DEFAULT_RM_MODEL_PATH = "/opt/huawei/dataset/model_gy/downloaded_models/Qwen3.5-35B-A3B"
 DEFAULT_TRAIN_FILE = "/opt/huawei/dataset/infra_data/data/train.parquet"
 DEFAULT_VAL_FILE = "/opt/huawei/dataset/infra_data/data/validation.parquet"
@@ -70,6 +67,10 @@ def record(kind, args, **extra):
         "RAY_worker_maximum_startup_concurrency", "RAY_prestart_worker_first_driver",
         "RAY_enable_worker_prestart", "HUANYU_JOB_PREFLIGHT", "HUANYU_RAY_READINESS_CHECK",
     )}
+    item["cache_env"] = {key: os.environ.get(key) for key in (
+        "HUANYU_USE_PRECOMPUTE", "MINICPMO_USE_PRECOMPUTE", "HUANYU_AQA_USE_PRECOMPUTE",
+        "HUANYU_EMBED_CACHE_DIR", "MINICPMO_EMBED_CACHE_DIR", "HUANYU_AQA_CACHE_DIR",
+    )}
     with Path(os.environ["HUANYU_TEST_EVENTS"]).open("a", encoding="utf-8") as stream:
         stream.write(json.dumps(item) + "\\n")
 """
@@ -91,9 +92,7 @@ class HuanyuJobLauncherTests(unittest.TestCase):
         self.examples.mkdir(parents=True)
         self.entry = self.examples / LAUNCHER.name
         shutil.copyfile(LAUNCHER, self.entry)
-        shutil.copyfile(EXAMPLES / "precision_mode.sh", self.examples / "precision_mode.sh")
-        shutil.copyfile(EXAMPLES / "audio_train_mode.sh", self.examples / "audio_train_mode.sh")
-        shutil.copyfile(EXAMPLES / "native_source.sh", self.examples / "native_source.sh")
+        shutil.copyfile(EXAMPLES / "prepare_huanyu_env.sh", self.examples / "prepare_huanyu_env.sh")
         self.native_source = self.project / "fake vllm source"
         for relative in (
             "vllm_omni/__init__.py",
@@ -103,7 +102,6 @@ class HuanyuJobLauncherTests(unittest.TestCase):
             target = self.native_source / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text("# native fixture\n", encoding="utf-8")
-        shutil.copyfile(EXAMPLES / "check_native_runtime.py", self.examples / "check_native_runtime.py")
         self.package = self.project / "verl_omni_ext/models/qwen3_6_huanyu"
         self.package.mkdir(parents=True)
         (self.project / "pyproject.toml").write_text("# fixture only\n", encoding="utf-8")
@@ -118,7 +116,7 @@ class HuanyuJobLauncherTests(unittest.TestCase):
             RECORDER + """
 operation = sys.argv[1]
 record("helper", sys.argv[1:])
-if operation == "clear-superpod-bashrc":
+if operation in ("clear-superpod-bashrc", "check-aqa"):
     import runpy
     runpy.run_path(os.environ["HUANYU_TEST_REAL_BOOTSTRAP"], run_name="__main__")
 elif operation == "resolve":
@@ -146,10 +144,11 @@ elif operation not in ("sync", "check-devices"):
 record("train", sys.argv[1:])
 keys = (
     "HUANYU_USE_PRECOMPUTE", "HUANYU_EMBED_CACHE_DIR", "HUANYU_FREEZE_AUDIO",
+    "HUANYU_AQA_USE_PRECOMPUTE", "HUANYU_AQA_CACHE_DIR", "MINICPMO_EMBED_CACHE_DIR",
     "HUANYU_TRAIN_AUDIO_ENCODER", "HUANYU_TRAIN_AUDIO_PROJECTOR",
     "HUANYU_AQA_AUDIO_TRAIN", "MINICPMO_USE_PRECOMPUTE", "MINICPMO_TUNE_AUDIO",
     "MINICPMO_TUNE_VISION", "WANDB_MODE", "HUANYU_TEST_ENV_SOURCED",
-    "NNODES", "NUM_NPUS", "REWARD_POOL_NPUS", "RM_ENABLE", "RAY_ADDRESS", "LD_PRELOAD",
+    "NNODES", "NUM_NPUS", "REWARD_POOL_NPUS", "RM_ENABLE", "HUANYU_REWARD_MODE", "RAY_ADDRESS", "LD_PRELOAD",
     "PROJECT_ROOT", "MODEL_PATH", "RM_MODEL_PATH", "TRAIN_FILE", "VAL_FILE",
     "HUANYU_STEM_TEXT_TRAIN", "HUANYU_CLUSTER_NODES", "RM_NNODES", "ROLLOUT_TP",
     "HUANYU_RAY_READINESS_CHECK", "HUANYU_JOB_PREFLIGHT",
@@ -164,12 +163,13 @@ Path(os.environ["HUANYU_TEST_CAPTURE"]).write_text(
 """,
             encoding="utf-8",
         )
-        (self.examples / "run_huanyu.sh").write_text(
+        (self.examples / "run_qwen36_huanyu_gspo_npu_omni_mix_genrm.sh").write_text(
             '#!/usr/bin/env bash\nexec "$HUANYU_TEST_PYTHON" '
             '"$HUANYU_TEST_TRAIN_CAPTURE" "$@"\n',
             encoding="utf-8",
         )
-        shutil.copyfile(self.examples / "run_huanyu.sh", self.examples / "run_huanyu_stem.sh")
+        for name in ("run_huanyu_stem.sh", "run_qwen36_huanyu_gspo_npu.sh"):
+            shutil.copyfile(self.examples / "run_qwen36_huanyu_gspo_npu_omni_mix_genrm.sh", self.examples / name)
         self.command_stub = self.project / "command_stub.py"
         self.command_stub.write_text(
             RECORDER + """
@@ -179,6 +179,8 @@ if command == "flock" and os.environ.get("HUANYU_TEST_LOCK_BUSY") == "1":
     raise SystemExit(1)
 if command == "ray" and "start" in sys.argv[2:]:
     raise SystemExit(int(os.environ.get("HUANYU_TEST_RAY_START_EXIT", "0")))
+if command == "pip":
+    raise SystemExit(int(os.environ.get("HUANYU_TEST_PIP_EXIT", "0")))
 if command == "pgrep":
     events = [json.loads(line) for line in Path(os.environ["HUANYU_TEST_EVENTS"]).read_text().splitlines()]
     if os.environ.get("HUANYU_TEST_RAY_LIVE") == "once":
@@ -249,6 +251,7 @@ if command not in ("ray", "git", "pip", "flock", "env-source", "sleep"):
             VC_TASK_INDEX="0",
             VC_WORKER_NUM="2",
             VC_WORKER_HOSTS="node-zero,node-one",
+            HUANYU_ENV_FILE=shell_path(self.examples / "env_export_huanyu.sh"),
             HUANYU_TEST_PYTHON=sys.executable,
             HUANYU_TEST_COMMAND_STUB=str(self.command_stub),
             HUANYU_TEST_TRAIN_CAPTURE=str(train_capture),
@@ -342,6 +345,31 @@ if command not in ("ray", "git", "pip", "flock", "env-source", "sleep"):
 
     def assert_success(self, result):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_embedded_site_environment_runs_without_removed_helper_files(self):
+        # Existing site-override tests use an explicit fixture file. Also run
+        # the production default branch so inlining cannot hide a missing source.
+        (self.project / "verl_omni_ext/__init__.py").write_text("# fixture\n", encoding="utf-8")
+        self.write_executable(
+            "pip", '#!/usr/bin/env bash\nexec "$HUANYU_TEST_PYTHON" '
+            '"$HUANYU_TEST_COMMAND_STUB" pip "$@"\n',
+        )
+        self.write_executable("getent", '#!/usr/bin/env bash\nprintf "192.0.2.10 head\\n"\n')
+        (self.examples / "env_export_huanyu.sh").unlink()
+        for name in ("precision_mode.sh", "native_source.sh", "graph_mode.sh", "audio_train_mode.sh"):
+            self.assertFalse((self.examples / name).exists())
+        # Node resolution is already provided by the bootstrap stub. Avoid a
+        # second DNS pipeline under MSYS's fixture LD_PRELOAD library.
+        result = self.run_launcher({"HUANYU_ENV_FILE": None, "VC_WORKER_HOSTS": "", "MASTER_ADDR": ""})
+        self.assert_success(result)
+        self.assertFalse(self.events("env-source"))
+        self.assertEqual(len(self.events("train")), 1)
+        self.assertEqual(len(self.events("ray")), 1)
+        for event in self.events("ray"):
+            self.assertEqual(event["ray_startup_env"]["RAY_worker_maximum_startup_concurrency"], "32")
+            self.assertEqual(event["ray_startup_env"]["RAY_prestart_worker_first_driver"], "1")
+            self.assertEqual(event["ray_startup_env"]["RAY_enable_worker_prestart"], "0")
+            self.assertIsNone(event["hccl_logic_superpod_id"])
 
     def seed_superpod_bashrc(self):
         before = b'export USER_SETTING="keep me"\n'
@@ -450,7 +478,7 @@ if command not in ("ray", "git", "pip", "flock", "env-source", "sleep"):
         self.assertEqual(event["precision"]["VLLM_OMNI_EXTERNAL_MODULES"],
                          "verl_omni_ext.models.qwen3_6_huanyu.engine_hooks", event)
         self.assertEqual(event["precision"]["MINICPMO_HUANYU_ROLLOUT_TP"], "4", event)
-        self.assertEqual(event["precision"]["HUANYU_USE_PRECOMPUTE"], "1", event)
+        self.assertEqual(event["precision"]["HUANYU_USE_PRECOMPUTE"], "0", event)
 
     def test_default_job_skips_extra_probes_and_starts_training(self):
         result = self.run_launcher({
@@ -527,10 +555,11 @@ if command not in ("ray", "git", "pip", "flock", "env-source", "sleep"):
         events = [json.loads(line) for line in self.events_file.read_text().splitlines()]
         self.assertLess(events.index(ray[0]), events.index(waits[0]))
         self.assertLess(events.index(waits[0]), events.index(self.events("train")[0]))
-        self.assertEqual(len(self.events("pip")), 1)
+        self.assertEqual(len(self.events("pip")), 2)
         self.assertEqual(self.events("pip")[0]["args"][:4], [
             "install", "--no-build-isolation", "--no-deps", "-e",
         ])
+        self.assertEqual(self.events("pip")[1]["args"], ["install", "mathruler", "zarr"])
         self.assertEqual(len(self.events("runtime")), 1)
         for kind in ("runtime", "ray", "train"):
             for event in self.events(kind):
@@ -579,7 +608,7 @@ if command not in ("ray", "git", "pip", "flock", "env-source", "sleep"):
             "VC_WORKER_NUM": "8", "VC_WORKER_HOSTS": ",".join(f"node-{i}" for i in range(8)),
             "NNODES": "8", "RM_ENABLE": "0", "RM_NNODES": "0", "ROLLOUT_TP": "16",
             "STEM_CONTEXT_LENGTH": "12k", "STEM_PROMPT_LENGTH": "2048",
-            "STEM_DATA_DIR": "/stem/data", "TRAIN_FILE": "/stale/aqa.parquet",
+            "STEM_DATA_DIR": "/stem/data", "TRAIN_FILE": "/custom/stem.parquet",
             "TRAIN_BATCH_SIZE": "128", "PPO_MINI_BATCH_SIZE": "128", "ROLLOUT_N": "16",
             "ROLLOUT_MAX_NUM_SEQS": "4", "ACTOR_OFFLOAD_POLICY": "true",
             "ROLLOUT_NUM_WORKERS": "128", "HUANYU_CHECKPOINT_VALIDATION_MODE": "", "HUANYU_FULL_WEIGHT_AUDIT_DIR": "",
@@ -597,7 +626,7 @@ if command not in ("ray", "git", "pip", "flock", "env-source", "sleep"):
             "ROLLOUT_NUM_WORKERS": "128", "HUANYU_CHECKPOINT_VALIDATION_MODE": "", "HUANYU_FULL_WEIGHT_AUDIT_DIR": "",
         }.items():
             self.assertEqual(capture["env"][name], value, name)
-        self.assertTrue(capture["env"]["TRAIN_FILE"].endswith("/stem/data/train.parquet"))
+        self.assertTrue(capture["env"]["TRAIN_FILE"].endswith("/custom/stem.parquet"))
         actual = dict(arg.lstrip("+").split("=", 1) for arg in capture["argv"])
         self.assertEqual(json.loads(actual["ray_kwargs.ray_init.runtime_env.env_vars.HUANYU_STEM_TEXT_TRAIN"]), "1")
         self.assertFalse(any(event["args"][0] == "wait-cluster" for event in self.events("helper")))
@@ -620,13 +649,40 @@ if command not in ("ray", "git", "pip", "flock", "env-source", "sleep"):
     def test_stem_invalid_topology_rejected_before_setup(self):
         base = {"HUANYU_JOB_MODE": "stem", "HUANYU_CLUSTER_NODES": "8", "NNODES": "8", "RM_ENABLE": "0",
                 "VC_WORKER_NUM": "8", "VC_WORKER_HOSTS": ",".join(f"node-{i}" for i in range(8))}
-        for extra in ({"NNODES": "7"}, {"RM_ENABLE": "1"}, {"VC_TASK_INDEX": "8"},
+        for extra in ({"NNODES": "9"}, {"RM_ENABLE": "1"}, {"VC_TASK_INDEX": "8"},
                       {"VC_WORKER_NUM": "16"}, {"HUANYU_CLUSTER_NODES": "4"}, {"ROLLOUT_TP": "3"}):
             with self.subTest(extra=extra):
                 result = self.run_launcher(dict(base, **extra))
                 self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
                 for kind in ("helper", "pip", "env-source", "ray", "train"):
                     self.assertFalse(self.events(kind), kind)
+
+    def test_rule_mode_disables_rm_pool_and_survives_site_env(self):
+        with (self.examples / "env_export_huanyu.sh").open("a", encoding="utf-8") as stream:
+            stream.write('export HUANYU_REWARD_MODE=RM RM_ENABLE=1 RM_NNODES=1\n')
+        result = self.run_launcher({"HUANYU_REWARD_MODE": "ruled_based", "RM_ENABLE": "1"})
+        self.assert_success(result)
+        env = json.loads(self.capture_file.read_text(encoding="utf-8"))["env"]
+        for key, expected in {"HUANYU_REWARD_MODE": "rule_based", "RM_ENABLE": "0",
+                              "RM_NNODES": "0", "REWARD_POOL_NPUS": "0", "NNODES": "1"}.items():
+            self.assertEqual(env[key], expected, key)
+        args = json.loads(self.capture_file.read_text(encoding="utf-8"))["argv"]
+        self.assertIn('++ray_kwargs.ray_init.runtime_env.env_vars.HUANYU_REWARD_MODE="rule_based"', args)
+
+    def test_stem_rm_uses_one_actor_node_and_one_reward_node(self):
+        result = self.run_launcher({"HUANYU_JOB_MODE": "stem", "HUANYU_REWARD_MODE": "RM",
+                                    "RM_ENABLE": "0", "NNODES": "1", "RM_NNODES": "1"})
+        self.assert_success(result)
+        env = json.loads(self.capture_file.read_text(encoding="utf-8"))["env"]
+        for key, expected in {"HUANYU_REWARD_MODE": "RM", "RM_ENABLE": "1",
+                              "RM_NNODES": "1", "REWARD_POOL_NPUS": "16", "NNODES": "1"}.items():
+            self.assertEqual(env[key], expected, key)
+
+    def test_invalid_reward_mode_fails_before_setup(self):
+        result = self.run_launcher({"HUANYU_REWARD_MODE": "unknown"})
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        for kind in ("helper", "pip", "env-source", "ray", "train"):
+            self.assertFalse(self.events(kind), kind)
 
     def test_site_env_cannot_override_precision_defaults_or_explicit_opt_out(self):
         self.env["HUANYU_JOB_PREFLIGHT"] = "1"
@@ -671,7 +727,7 @@ if command not in ("ray", "git", "pip", "flock", "env-source", "sleep"):
         env_file.write_text(
             env_file.read_text(encoding="utf-8")
             + "export HCCL_OP_EXPANSION_MODE=AIV HCCL_DETERMINISTIC=true\n"
-            + "export ROLLOUT_TP=4 HUANYU_USE_PRECOMPUTE=0\n",
+            + "export ROLLOUT_TP=4 HUANYU_USE_PRECOMPUTE=1\n",
             encoding="utf-8",
         )
         result = self.run_launcher(
@@ -683,7 +739,7 @@ if command not in ("ray", "git", "pip", "flock", "env-source", "sleep"):
         capture = json.loads(self.capture_file.read_text())
         actual = dict(arg.lstrip("+").split("=", 1) for arg in capture["argv"])
         expected = {
-            "MINICPMO_HUANYU_ROLLOUT_TP": "8", "HUANYU_USE_PRECOMPUTE": "1",
+            "MINICPMO_HUANYU_ROLLOUT_TP": "8", "HUANYU_USE_PRECOMPUTE": "0",
             "HCCL_OP_EXPANSION_MODE": "AIV", "HCCL_DETERMINISTIC": "true",
             "MINICPMO_HUANYU_GDN_FP32_TRAINING": "1",
             "MINICPMO_GDN_FP32_REFERENCE": "1", "MINICPMO_HUANYU_LAYERWISE_RELOAD": "1",
@@ -877,13 +933,13 @@ if command not in ("ray", "git", "pip", "flock", "env-source", "sleep"):
                 for kind in ("helper", "git", "pip", "ray", "train"):
                     self.assertFalse(self.events(kind), kind)
 
-    def test_missing_cache_manifest_prevents_ray_and_training_start(self):
+    def test_missing_cache_manifest_does_not_block_online_job(self):
         (self.cache / "manifest.json").unlink()
         result = self.run_launcher()
-        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("cache manifest not readable", result.stdout + result.stderr)
-        self.assertFalse(self.events("ray"))
-        self.assertFalse(self.events("train"))
+        self.assert_success(result)
+        self.assertEqual(len(self.events("ray")), 1)
+        self.assertEqual(len(self.events("train")), 1)
+        self.assertEqual(self.events("train")[0]["cache_env"]["HUANYU_USE_PRECOMPUTE"], "0")
 
     def test_filters_scheduler_metadata_and_preserves_hydra_argument_boundaries(self):
         kept = (
@@ -904,12 +960,22 @@ if command not in ("ray", "git", "pip", "flock", "env-source", "sleep"):
         self.assertFalse(any(arg.startswith(("--dataset_mount=", "--scheduler_name=")) for arg in actual))
 
     def test_cache_and_freeze_settings_reach_training_and_ray_runtime_environment(self):
+        env_file = self.examples / "env_export_huanyu.sh"
+        env_file.write_text(env_file.read_text(encoding="utf-8") +
+                            'export HUANYU_USE_PRECOMPUTE=1 MINICPMO_USE_PRECOMPUTE=1 HUANYU_AQA_USE_PRECOMPUTE=1\n'
+                            'export HUANYU_EMBED_CACHE_DIR=/stale/site MINICPMO_EMBED_CACHE_DIR=/stale/whisper HUANYU_AQA_CACHE_DIR=/stale/aqa\n',
+                            encoding="utf-8")
+        (self.cache / "manifest.json").unlink()
         result = self.run_launcher(
             {"HUANYU_FREEZE_AUDIO": "false", "MINICPMO_TUNE_AUDIO": "1",
-             "HUANYU_TRAIN_AUDIO_ENCODER": "true", "HUANYU_TRAIN_AUDIO_PROJECTOR": "true"},
+             "HUANYU_TRAIN_AUDIO_ENCODER": "true", "HUANYU_TRAIN_AUDIO_PROJECTOR": "true",
+             "HUANYU_USE_PRECOMPUTE": "1", "MINICPMO_USE_PRECOMPUTE": "1", "HUANYU_AQA_USE_PRECOMPUTE": "1"},
             arguments=("++actor_rollout_ref.model.override_config.huanyu_freeze_audio=false",
                        "++actor_rollout_ref.model.override_config.huanyu_train_audio_encoder=true",
-                       "++actor_rollout_ref.model.override_config.huanyu_train_audio_projector=true"),
+                       "++actor_rollout_ref.model.override_config.huanyu_train_audio_projector=true",
+                       '++ray_kwargs.ray_init.runtime_env.env_vars.HUANYU_USE_PRECOMPUTE="1"',
+                       '++ray_kwargs.ray_init.runtime_env.env_vars.HUANYU_AQA_USE_PRECOMPUTE="1"',
+                       '++ray_kwargs.ray_init.runtime_env.env_vars.HUANYU_EMBED_CACHE_DIR="stale"'),
         )
         self.assert_success(result)
         capture = json.loads(self.capture_file.read_text())
@@ -918,12 +984,14 @@ if command not in ("ray", "git", "pip", "flock", "env-source", "sleep"):
         self.assertEqual(actual["actor_rollout_ref.model.override_config.huanyu_train_audio_encoder"], "false")
         self.assertEqual(actual["actor_rollout_ref.model.override_config.huanyu_train_audio_projector"], "false")
         for key, expected in {
-            "HUANYU_USE_PRECOMPUTE": "1",
+            "HUANYU_USE_PRECOMPUTE": "0",
             "HUANYU_FREEZE_AUDIO": "true",
             "HUANYU_TRAIN_AUDIO_ENCODER": "false",
             "HUANYU_TRAIN_AUDIO_PROJECTOR": "false",
-            # Git Bash translates this environment path for the native Python stub.
-            "HUANYU_EMBED_CACHE_DIR": self.cache.as_posix(),
+            "HUANYU_EMBED_CACHE_DIR": "",
+            "MINICPMO_EMBED_CACHE_DIR": "",
+            "HUANYU_AQA_USE_PRECOMPUTE": "0",
+            "HUANYU_AQA_CACHE_DIR": "",
             "HUANYU_AQA_AUDIO_TRAIN": "0",
             "MINICPMO_USE_PRECOMPUTE": "0",
             "MINICPMO_TUNE_AUDIO": "0",
@@ -940,6 +1008,9 @@ if command not in ("ray", "git", "pip", "flock", "env-source", "sleep"):
             "RM_ENABLE": "1", "HUANYU_TEST_ENV_SOURCED": "1",
         }.items():
             self.assertEqual(capture["env"][key], expected)
+        for event in self.events("ray"):
+            for key, value in event["cache_env"].items():
+                self.assertEqual(value, "0" if key.endswith("USE_PRECOMPUTE") else "", event)
 
     def test_existing_ray_uses_source_without_copy_reinstall_or_restart(self):
         self.seed_superpod_bashrc()

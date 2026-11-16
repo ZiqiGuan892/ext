@@ -55,3 +55,10 @@ print(
     f"ipc_signature={inspect.signature(vLLMOmniColocateWorkerExtension.update_weights_from_ipc)}",
     flush=True,
 )
+
+# huanyu-forward-profile:begin
+import os as _huanyu_profile_os
+if _huanyu_profile_os.environ.get("HUANYU_FORWARD_PROFILE_DIR"):
+    from .forward_profile import install as _install_huanyu_forward_profile
+    _install_huanyu_forward_profile()
+# huanyu-forward-profile:end

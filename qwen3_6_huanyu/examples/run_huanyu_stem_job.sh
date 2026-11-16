@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Run this SAME entry on every 16-NPU node. Only VC_TASK_INDEX=0 submits training.
-# TOTAL_NPUS=16/32/128/256 (1/2/8/16 nodes); all devices serve Actor/rollout.
-# CPU math_dapo rule reward, no GenRM. Defaults: BS128, mini128, N16, 2K+10K.
+# TOTAL_NPUS=16/32/128/256 (1/2/8/16 physical nodes).
+# HUANYU_REWARD_MODE=rule_based (default) uses CPU math_dapo; RM reserves one
+# 16-NPU node by default (32 cards: Actor16 + RM16). BS128, mini128, N16, 2K+10K.
 # Reuses the common job's vLLM-Omni source selection, editable install, site
 # environment, native checks and Ray head/worker startup.
 # Extra job probes default off; HUANYU_JOB_PREFLIGHT=1 opts in.
@@ -41,14 +42,15 @@
 #
 # VC_WORKER_HOSTS must list all nodes, head first (one host for 16 cards).
 # Set these VC_* variables yourself only if the platform does not supply them.
-# TOTAL_NPUS is global; NUM_NPUS stays 16 per node. RM is always disabled:
-# RM_ENABLE=0, REWARD_POOL_NPUS=0, rule reward=math_dapo. No RM_MODEL_PATH needed.
+# TOTAL_NPUS is physical capacity; NUM_NPUS stays 16 per Actor node.
+# NNODES is Actor nodes; RM_NNODES is reward nodes (default 1 in RM mode).
+# RM_MODEL_PATH selects the reward checkpoint; rule_based needs no RM model.
 # TRAIN_BATCH_SIZE -> data.train_batch_size (global prompt count)
 # PPO_MINI_BATCH_SIZE -> actor.ppo_mini_batch_size (prompt count before N repeats)
 # ROLLOUT_N -> rollout.n (responses per prompt); trajectories per step = BS*N.
 # Required: TRAIN_BATCH_SIZE % PPO_MINI_BATCH_SIZE == 0 and
-# (PPO_MINI_BATCH_SIZE * ROLLOUT_N) % TOTAL_NPUS == 0.
-# ROLLOUT_TP=4/8/16 (default 8); replicas = TOTAL_NPUS/ROLLOUT_TP.
+# (PPO_MINI_BATCH_SIZE * ROLLOUT_N) % (NUM_NPUS * NNODES) == 0.
+# ROLLOUT_TP=4/8/16 (default 8); replicas = Actor cards/ROLLOUT_TP.
 # Batch/card settings use these environment variables, not Hydra overrides.
 # If environment and Ray are ALREADY prepared, run only on the head:
 # TOTAL_NPUS=32 TRAIN_BATCH_SIZE=16 PPO_MINI_BATCH_SIZE=8 ROLLOUT_N=4 RAY_ADDRESS=auto \
@@ -68,7 +70,7 @@ case "$HUANYU_RAY_READINESS_CHECK" in
     0|1) ;;
     *) echo 'FATAL: HUANYU_JOB_PREFLIGHT (or HUANYU_RAY_READINESS_CHECK) must be 0 or 1' >&2; exit 2 ;;
 esac
-for _file in run_huanyu_32card_job.sh run_huanyu_stem.sh run_huanyu.sh; do
+for _file in run_huanyu_32card_job.sh run_huanyu_stem.sh run_qwen36_huanyu_gspo_npu.sh; do
     [[ -r "$_STEM_JOB_EXAMPLES/$_file" ]] || { echo "FATAL: missing $_STEM_JOB_EXAMPLES/$_file" >&2; exit 2; }
 done
 if [[ -z "${TOTAL_NPUS:-}" ]]; then
@@ -89,9 +91,43 @@ if (( _STEM_TRAIN_ONLY )); then
         echo 'FATAL: --train-only must run once on VC_TASK_INDEX=0, without per-device launchers' >&2; exit 2;
     }
 fi
-export HUANYU_JOB_MODE=stem STEM_SCALED_JOB=1 STEM_REWARD_MODE=rule
-export NUM_NPUS=16 NNODES="$HUANYU_CLUSTER_NODES" NPUS_PER_NODE=16
-export RM_ENABLE=0 RM_NNODES=0 RM_N_GPUS_PER_NODE=16 RM_TP=4 RM_SPLIT_NODES=0 REWARD_POOL_NPUS=0
+export HUANYU_JOB_MODE=stem STEM_SCALED_JOB=1
+_STEM_JOB_REWARD="${HUANYU_REWARD_MODE:-${STEM_REWARD_MODE:-}}"
+if [[ -z "$_STEM_JOB_REWARD" ]]; then
+    case "${RM_ENABLE:-0}" in
+        0) _STEM_JOB_REWARD=rule_based ;;
+        1) _STEM_JOB_REWARD=RM ;;
+        *) echo 'FATAL: RM_ENABLE must be 0 or 1' >&2; exit 2 ;;
+    esac
+fi
+case "${_STEM_JOB_REWARD,,}" in
+    rm|genrm) export HUANYU_REWARD_MODE=RM STEM_REWARD_MODE=genrm RM_ENABLE=1 ;;
+    rule_based|ruled_based|rule) export HUANYU_REWARD_MODE=rule_based STEM_REWARD_MODE=rule RM_ENABLE=0 ;;
+    *) echo 'FATAL: HUANYU_REWARD_MODE must be RM or rule_based; STEM_REWARD_MODE accepts genrm or rule' >&2; exit 2 ;;
+esac
+export NUM_NPUS=16 NPUS_PER_NODE=16
+if [[ "$RM_ENABLE" == 1 ]]; then
+    export RM_NNODES="${RM_NNODES:-1}" RM_N_GPUS_PER_NODE="${RM_N_GPUS_PER_NODE:-16}" RM_TP="${RM_TP:-4}" RM_SPLIT_NODES=1
+    for _key in RM_NNODES RM_N_GPUS_PER_NODE RM_TP; do
+        [[ "${!_key}" =~ ^[1-9][0-9]{0,4}$ ]] || { echo "FATAL: invalid $_key" >&2; exit 2; }
+    done
+    [[ "$RM_N_GPUS_PER_NODE" == 16 ]] && (( RM_N_GPUS_PER_NODE % RM_TP == 0 )) || {
+        echo 'FATAL: scaled STEM RM uses complete 16-NPU nodes and RM_TP must divide 16' >&2; exit 2;
+    }
+    (( HUANYU_CLUSTER_NODES > RM_NNODES )) || {
+        echo 'FATAL: STEM RM mode needs at least one Actor node plus one RM node (at least 32 NPUs)' >&2; exit 2;
+    }
+    export REWARD_POOL_NPUS=$((RM_NNODES * RM_N_GPUS_PER_NODE))
+    export NNODES="${NNODES:-$((HUANYU_CLUSTER_NODES - RM_NNODES))}"
+else
+    export NNODES="${NNODES:-$HUANYU_CLUSTER_NODES}"
+    export RM_NNODES=0 RM_N_GPUS_PER_NODE=16 RM_TP=4 RM_SPLIT_NODES=0 REWARD_POOL_NPUS=0
+fi
+[[ "$NNODES" =~ ^[1-9][0-9]{0,4}$ ]] || { echo 'FATAL: NNODES must be positive Actor node count' >&2; exit 2; }
+_STEM_JOB_ACTOR_NPUS=$((NUM_NPUS * NNODES))
+(( _STEM_JOB_ACTOR_NPUS + REWARD_POOL_NPUS <= TOTAL_NPUS )) || {
+    echo 'FATAL: Actor + RM pools exceed TOTAL_NPUS; NNODES counts Actor nodes only' >&2; exit 2;
+}
 export ROLLOUT_TP="${ROLLOUT_TP:-8}" ROLLOUT_MAX_NUM_SEQS="${ROLLOUT_MAX_NUM_SEQS:-8}"
 case "$ROLLOUT_TP" in 4|8|16) ;; *) echo 'FATAL: ROLLOUT_TP must be 4, 8 or 16' >&2; exit 2 ;; esac
 export TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-128}" PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-128}" ROLLOUT_N="${ROLLOUT_N:-16}"
@@ -99,17 +135,19 @@ for _key in TRAIN_BATCH_SIZE PPO_MINI_BATCH_SIZE ROLLOUT_N ROLLOUT_MAX_NUM_SEQS;
     [[ "${!_key}" =~ ^[1-9][0-9]{0,5}$ ]] || { echo "FATAL: invalid $_key" >&2; exit 2; }
 done
 (( TRAIN_BATCH_SIZE % PPO_MINI_BATCH_SIZE == 0 &&
-   PPO_MINI_BATCH_SIZE * ROLLOUT_N % TOTAL_NPUS == 0 )) || {
+   PPO_MINI_BATCH_SIZE * ROLLOUT_N % _STEM_JOB_ACTOR_NPUS == 0 )) || {
     echo 'FATAL: BS must divide into PPO minibatches, and mini_batch*N must divide Actor DP' >&2; exit 2;
 }
 export MODEL_PATH="${MODEL_PATH:-/opt/huawei/dataset/model_gy/downloaded_models/2748}"
 export STEM_DATA_DIR="${STEM_DATA_DIR:-/opt/huawei/dataset/infra_data/data/rl_stem_data}"
-export TRAIN_FILE="${STEM_TRAIN_FILE:-$STEM_DATA_DIR/train.parquet}"
-export VAL_FILE="${STEM_VAL_FILE:-$STEM_DATA_DIR/val.parquet}"
-if [[ -z "${STEM_VAL_FILE:-}" && ! -f "$VAL_FILE" && -f "$STEM_DATA_DIR/validation.parquet" ]]; then
+export TRAIN_FILE="${TRAIN_FILE:-${STEM_TRAIN_FILE:-$STEM_DATA_DIR/train.parquet}}"
+_STEM_EXPLICIT_VAL="${VAL_FILE:-${STEM_VAL_FILE:-}}"
+export VAL_FILE="${VAL_FILE:-${STEM_VAL_FILE:-$STEM_DATA_DIR/val.parquet}}"
+if [[ -z "$_STEM_EXPLICIT_VAL" && ! -f "$VAL_FILE" && -f "$STEM_DATA_DIR/validation.parquet" ]]; then
     export VAL_FILE="$STEM_DATA_DIR/validation.parquet"
 fi
-export STEM_CONTEXT_LENGTH="${STEM_CONTEXT_LENGTH:-12k}" STEM_PROMPT_LENGTH="${STEM_PROMPT_LENGTH:-2048}"
+export STEM_PROMPT_LENGTH="${STEM_PROMPT_LENGTH:-${MAX_PROMPT_LENGTH:-2048}}"
+export STEM_CONTEXT_LENGTH="${STEM_CONTEXT_LENGTH:-12k}"
 # Maps to actor_rollout_ref.rollout.ignore_eos in run_huanyu_stem.sh.
 # Set the default before job setup so site env files cannot change it.
 export STEM_IGNORE_EOS="${STEM_IGNORE_EOS:-false}"
@@ -117,12 +155,28 @@ case "$STEM_IGNORE_EOS" in
     true|false) ;;
     *) echo 'FATAL: STEM_IGNORE_EOS must be true or false' >&2; exit 2 ;;
 esac
-export STEM_CONTEXT_SLACK=0 STEM_DYNAMIC_BSZ=false STEM_SYNC_EACH_MICROBATCH=true
-export PPO_MICRO_BATCH_SIZE_PER_GPU=1 ACTOR_MODEL_DTYPE=fp32 REF_MODEL_DTYPE=bfloat16
-export ACTOR_FORWARD_PREFETCH=false ACTIVATION_OFFLOAD=false
+export STEM_CONTEXT_SLACK="${STEM_CONTEXT_SLACK:-0}" STEM_DYNAMIC_BSZ="${STEM_DYNAMIC_BSZ:-false}" STEM_SYNC_EACH_MICROBATCH="${STEM_SYNC_EACH_MICROBATCH:-true}"
+# Resolve the length profile before site setup so its defaults cannot replace
+# either exported generic lengths or the selected STEM context.
+huanyu_stem_job_tokens() {
+    local value="${1,,}" factor=1
+    if [[ "$value" == *k ]]; then value="${value%k}"; factor=1024; fi
+    [[ "$value" =~ ^[1-9][0-9]{0,6}$ ]] || { echo "FATAL: invalid token budget '$1'" >&2; return 2; }
+    printf '%s' "$((value * factor))"
+}
+MAX_PROMPT_LENGTH="$(huanyu_stem_job_tokens "${MAX_PROMPT_LENGTH:-$STEM_PROMPT_LENGTH}")"
+_STEM_JOB_CONTEXT="$(huanyu_stem_job_tokens "$STEM_CONTEXT_LENGTH")"
+MAX_RESPONSE_LENGTH="$(huanyu_stem_job_tokens "${MAX_RESPONSE_LENGTH:-$((_STEM_JOB_CONTEXT - MAX_PROMPT_LENGTH))}")"
+export MAX_PROMPT_LENGTH MAX_RESPONSE_LENGTH
+export STEM_PROMPT_LENGTH="$MAX_PROMPT_LENGTH" STEM_CONTEXT_LENGTH=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))
+[[ "$STEM_CONTEXT_SLACK" =~ ^(0|[1-9][0-9]{0,4})$ ]] || { echo 'FATAL: invalid STEM_CONTEXT_SLACK' >&2; exit 2; }
+export ROLLOUT_MAX_MODEL_LEN="${ROLLOUT_MAX_MODEL_LEN:-$((STEM_CONTEXT_LENGTH + STEM_CONTEXT_SLACK))}"
+export MAX_TOKEN_LEN_PER_GPU="${MAX_TOKEN_LEN_PER_GPU:-$ROLLOUT_MAX_MODEL_LEN}"
+export PPO_MICRO_BATCH_SIZE_PER_GPU="${PPO_MICRO_BATCH_SIZE_PER_GPU:-1}" ACTOR_MODEL_DTYPE="${ACTOR_MODEL_DTYPE:-fp32}" REF_MODEL_DTYPE="${REF_MODEL_DTYPE:-bfloat16}"
+export ACTOR_FORWARD_PREFETCH="${ACTOR_FORWARD_PREFETCH:-false}" ACTIVATION_OFFLOAD="${ACTIVATION_OFFLOAD:-false}"
 export ROLLOUT_GPU_MEM_UTIL="${ROLLOUT_GPU_MEM_UTIL:-0.6}"
 export ROLLOUT_NUM_WORKERS="${ROLLOUT_NUM_WORKERS:-128}"
-export HUANYU_PRECISION_PROFILE=full HUANYU_GRAPH_MODE=0
+export HUANYU_PRECISION_PROFILE="${HUANYU_PRECISION_PROFILE:-full}" HUANYU_GRAPH_MODE="${HUANYU_GRAPH_MODE:-0}"
 export HUANYU_FREEZE_AUDIO=true HUANYU_TRAIN_AUDIO_ENCODER=false HUANYU_TRAIN_AUDIO_PROJECTOR=false
 export HUANYU_USE_PRECOMPUTE=0 MINICPMO_USE_PRECOMPUTE=0 HUANYU_EMBED_CACHE_DIR=""
 export HUANYU_STEM_TEXT_TRAIN=1 HUANYU_AQA_AUDIO_TRAIN=0
@@ -143,9 +197,9 @@ for _key in HUANYU_CHECKPOINT_VALIDATION_MODE HUANYU_FULL_WEIGHT_AUDIT_DIR HUANY
     export "$_key="
     _STEM_JOB_ARGS+=("++ray_kwargs.ray_init.runtime_env.env_vars.$_key=\"\"")
 done
-echo "[huanyu-stem-job] physical=${NNODES}x16=$TOTAL_NPUS actor=$TOTAL_NPUS GenRM=0 reward=math_dapo"
-echo "[huanyu-stem-job] training DP=$TOTAL_NPUS SP=1 TP=1; rollout TP=$ROLLOUT_TP replicas=$((TOTAL_NPUS / ROLLOUT_TP)) max_num_seqs=$ROLLOUT_MAX_NUM_SEQS"
-echo "[huanyu-stem-job] BS=$TRAIN_BATCH_SIZE mini=$PPO_MINI_BATCH_SIZE N=$ROLLOUT_N trajectories=$((TRAIN_BATCH_SIZE * ROLLOUT_N)) microbatch=1 sync_each=true"
+echo "[huanyu-stem-job] physical=${HUANYU_CLUSTER_NODES}x16=$TOTAL_NPUS actor=$_STEM_JOB_ACTOR_NPUS GenRM=$REWARD_POOL_NPUS reward=$HUANYU_REWARD_MODE"
+echo "[huanyu-stem-job] training DP=$_STEM_JOB_ACTOR_NPUS SP=1 TP=1; rollout TP=$ROLLOUT_TP replicas=$((_STEM_JOB_ACTOR_NPUS / ROLLOUT_TP)) max_num_seqs=$ROLLOUT_MAX_NUM_SEQS"
+echo "[huanyu-stem-job] BS=$TRAIN_BATCH_SIZE mini=$PPO_MINI_BATCH_SIZE N=$ROLLOUT_N trajectories=$((TRAIN_BATCH_SIZE * ROLLOUT_N)) microbatch=$PPO_MICRO_BATCH_SIZE_PER_GPU sync_each=$STEM_SYNC_EACH_MICROBATCH"
 echo "[huanyu-stem-job] context=$STEM_CONTEXT_LENGTH prompt=$STEM_PROMPT_LENGTH ignore_eos=$STEM_IGNORE_EOS EOS_allowed=$([[ "$STEM_IGNORE_EOS" == true ]] && echo false || echo true)"
 
 _STEM_ENTRY=run_huanyu_32card_job.sh
@@ -160,11 +214,11 @@ if (( _STEM_TRAIN_ONLY )); then
     echo "[huanyu-stem-job] train-only head=$VC_TASK_INDEX Ray=${RAY_ADDRESS:-auto}; setup and Ray startup skipped"
 fi
 exec bash "$_STEM_JOB_EXAMPLES/$_STEM_ENTRY" \
-    actor_rollout_ref.actor.fsdp_config.param_offload=true \
-    actor_rollout_ref.actor.fsdp_config.optimizer_offload=true \
-    actor_rollout_ref.actor.fsdp_config.offload_policy=true \
-    actor_rollout_ref.actor.fsdp_config.forward_prefetch=false \
-    actor_rollout_ref.ref.fsdp_config.forward_prefetch=false \
-    actor_rollout_ref.rollout.free_cache_engine=true \
-    actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=512 \
+    "actor_rollout_ref.actor.fsdp_config.param_offload=${ACTOR_PARAM_OFFLOAD:-true}" \
+    "actor_rollout_ref.actor.fsdp_config.optimizer_offload=${ACTOR_OPTIMIZER_OFFLOAD:-true}" \
+    "actor_rollout_ref.actor.fsdp_config.offload_policy=${ACTOR_OFFLOAD_POLICY:-true}" \
+    "actor_rollout_ref.actor.fsdp_config.forward_prefetch=${ACTOR_FORWARD_PREFETCH}" \
+    "actor_rollout_ref.ref.fsdp_config.forward_prefetch=${REF_FORWARD_PREFETCH:-false}" \
+    "actor_rollout_ref.rollout.free_cache_engine=${ROLLOUT_FREE_CACHE_ENGINE:-true}" \
+    "actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=${UPDATE_WEIGHTS_BUCKET_MB:-2048}" \
     "$@" "${_STEM_JOB_ARGS[@]}"

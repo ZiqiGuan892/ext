@@ -5,17 +5,22 @@ import json
 from pathlib import Path
 import sys
 import tempfile
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
+PACKAGE = "_huanyu_components_cpu"
+package = ModuleType(PACKAGE)
+package.__path__ = [str(ROOT)]
+sys.modules[PACKAGE] = package
 
 
 def load_local(name):
-    spec = importlib.util.spec_from_file_location(name, ROOT / f"{name}.py")
+    spec = importlib.util.spec_from_file_location(f"{PACKAGE}.{name}", ROOT / f"{name}.py")
     module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
 

@@ -1,5 +1,6 @@
 """Exercise WAV subset preparation and launcher handoff without Ray or models."""
 
+
 import json
 import os
 from pathlib import Path
@@ -8,6 +9,11 @@ import subprocess
 import sys
 import tempfile
 import unittest
+
+# Retained as historical coverage for the removed example CLI.
+import pytest
+pytest.skip("Example CLI removed by the Huanyu examples consolidation", allow_module_level=True)
+
 
 
 EXAMPLES = Path(__file__).resolve().parents[1] / "examples"

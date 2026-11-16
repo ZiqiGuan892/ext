@@ -73,10 +73,28 @@ class Qwen36HuanyuThinkerAdapter(OmniModelBase):
     @classmethod
     def configure_tokenizer(cls, model_path, model_config):
         from verl.utils import hf_tokenizer
-        from .checkpoint_validation import install_checkpoint_validation
 
         validate_huanyu_config(model_config.hf_config)
-        install_checkpoint_validation()
+        try:
+            from .checkpoint_validation import install_checkpoint_validation
+        except ModuleNotFoundError as error:
+            # 上游的 checkpoint_validation.py 被 .gitignore 的 *checkpoint* 吞掉，从未入库。
+            # 只在没声明校验模式时放行；声明了模式却没有实现必须炸。
+            if error.name != f"{__package__}.checkpoint_validation":
+                raise
+            mode = os.environ.get("HUANYU_CHECKPOINT_VALIDATION_MODE", "").strip()
+            if mode:
+                raise RuntimeError(
+                    f"HUANYU_CHECKPOINT_VALIDATION_MODE={mode} requires checkpoint_validation.py, "
+                    "which is not in this checkout (ignored by .gitignore '*checkpoint*')"
+                ) from error
+            print(
+                "[huanyu-checkpoint-validation] WARNING module missing from checkout "
+                "(.gitignore '*checkpoint*'); validation hook NOT installed",
+                flush=True,
+            )
+        else:
+            install_checkpoint_validation()
         return hf_tokenizer(model_path, trust_remote_code=model_config.trust_remote_code)
 
     @classmethod
@@ -97,6 +115,10 @@ class Qwen36HuanyuThinkerAdapter(OmniModelBase):
         from .gen_timing import install as install_gen_timing
 
         install_gen_timing()
+        # R3 传输补丁：与 prompt 收缩钩子同处 Ray server actor（HUANYU_EXPERT_REPLAY=1 门控）。
+        from .expert_replay.server_patch import maybe_install_server_patch
+
+        maybe_install_server_patch()
         return processor
 
     @classmethod
@@ -118,8 +140,16 @@ class Qwen36HuanyuThinkerAdapter(OmniModelBase):
         from .fsdp_offload import install_huanyu_fsdp_offload
         from .precision import install_huanyu_actor_precision
         from .precision_policy import report_policy, install_fsdp_pin_audit
+        from verl_omni_ext.models.qwen3_6_whisper.position_ids import install_tq_position_ids_patch
 
         validate_huanyu_config(module.config)
+        # HCCL 策略自检：每个训练 rank 都过 configure_model。声明的 profile 与
+        # worker env（raylet 快照）不一致时立刻炸——worker 里 AIV 被静默回退成
+        # AICPU RPC 曾是 trainer 69% kernel 时间的形态（2026-11-10 诊断）。
+        # 未声明 HUANYU_HCCL_PROFILE 时为 no-op（CPU 契约安全）。
+        from verl_omni_ext.probes.hccl_policy import assert_hccl_policy
+
+        assert_hccl_policy()
         if report_policy("actor/ref") == "full":
             install_fsdp_pin_audit()
         if _value(model_config, "use_remove_padding", True):
@@ -137,12 +167,18 @@ class Qwen36HuanyuThinkerAdapter(OmniModelBase):
             vision_config = _value(module.config, "vision_config")
             if _value(vision_config, "deepstack_visual_indexes", []):
                 raise ValueError("Huanyu precompute does not support deepstack visual features")
+        # This adapter inherits OmniModelBase directly, so it does not run
+        # Whisper's TQ restore hook. Video/image positions must keep all four
+        # axes, with nested offsets describing tokens rather than channels.
+        install_tq_position_ids_patch()
         module = super().configure_model(module, model_config)
         _flatten_text_config(module.config)
         token_ids = _audio_token_ids(_value(model_config, "tokenizer"), module.config)
         attach_huanyu_audio(module, model_config)
         # FSDP2 re-pads partial shards on the CPU inside Module.to(). The D2H
         # transfer must finish before that host copy, including initial load.
+        # 默认由包 import 期的 fsdp2_pad_sync 保护；这里是整次 offload 串行化的
+        # 备选方案，仅 HUANYU_FSDP_BLOCKING_OFFLOAD=1 时生效。
         install_huanyu_fsdp_offload(module)
         if os.environ.get("HUANYU_WEIGHT_SYNC_AUDIT_DIR", "").strip():
             from .weight_sync_audit import start_actor_audit
@@ -188,6 +224,17 @@ class Qwen36HuanyuThinkerAdapter(OmniModelBase):
             from .microbatch_sync import install_huanyu_microbatch_sync
 
             install_huanyu_microbatch_sync(module)
+        # 融合 MoE kernel / R3 路由回放：env 默认全关，开启时整体替换
+        # Qwen3_5MoeSparseMoeBlock.forward（replay 仅内建于该 kernel）。放在
+        # microbatch_sync 之后：两者都可能包 FSDPEngine.forward_backward_batch。
+        from .expert_replay.moe_kernel import install_huanyu_expert_replay
+
+        install_huanyu_expert_replay(module)
+        # NaN/Inf 溯源探针（HUANYU_FINITE_PROBE=1，默认关）：装在所有 kernel /
+        # replay 替换之后，hook 才覆盖实际执行的实现。
+        from .kernel_perf.finite_probe import install_finite_probe
+
+        install_finite_probe(module)
         logger.info("Huanyu training adapter selected: alias=%s, HF architecture=%s, huanyu_freeze_audio=%s, "
                     "train_encoder=%s, train_projector=%s, cache=%s",
                     TRAINING_ARCHITECTURE, module.config.architectures, freeze_audio,

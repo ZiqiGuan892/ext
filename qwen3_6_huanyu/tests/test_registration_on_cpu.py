@@ -76,6 +76,9 @@ class RegistrationTests(unittest.TestCase):
         visual = ModuleType("verl_omni_ext.models.qwen3_6_whisper.forward")
         self.visual_patch = Mock()
         visual.patch_visual_fsdp_unshard = self.visual_patch
+        positions = ModuleType("verl_omni_ext.models.qwen3_6_whisper.position_ids")
+        self.install_tq_positions = Mock()
+        positions.install_tq_position_ids_patch = self.install_tq_positions
         self.modules_patch = patch.dict(sys.modules, {
             PACKAGE: package,
             base.__name__: base,
@@ -86,6 +89,7 @@ class RegistrationTests(unittest.TestCase):
             entropy.__name__: entropy,
             sync_policy.__name__: sync_policy,
             visual.__name__: visual,
+            positions.__name__: positions,
         })
         self.modules_patch.start()
         self.addCleanup(self.modules_patch.stop)
@@ -157,6 +161,7 @@ class RegistrationTests(unittest.TestCase):
 
     def test_valid_model_uses_huanyu_loader_freezes_audio_and_installs_new_forward(self):
         result = self.adapter.configure_model(self.model, self.config)
+        self.install_tq_positions.assert_called_once_with()
         self.install_entropy.assert_called_once_with()
         self.install_precision.assert_called_once_with(self.model)
         self.install_sync.assert_not_called()
@@ -172,6 +177,13 @@ class RegistrationTests(unittest.TestCase):
             self.assertTrue(all(not parameter.requires_grad for parameter in part.parameters()))
         self.assertEqual(self.model.config.architectures, [HF_ARCHITECTURE])
         self.assertEqual(self.model.config.hidden_size, 6)
+
+    def test_position_restore_failure_stops_before_model_setup(self):
+        self.install_tq_positions.side_effect = RuntimeError("unsupported position restore hook")
+        with self.assertRaisesRegex(RuntimeError, "unsupported position restore hook"):
+            self.adapter.configure_model(self.model, self.config)
+        self.base_configure.assert_not_called()
+        self.attach.assert_not_called()
 
     def test_job_determinism_is_configured_before_audio_loading_and_errors_propagate(self):
         policy = ModuleType(f"{PACKAGE}.job_determinism")
@@ -200,13 +212,14 @@ class RegistrationTests(unittest.TestCase):
 
     def test_huanyu_cache_mode_uses_separate_switch_and_injection(self):
         self.model.config.image_token_id = 13
+        self.model.config.video_token_id = 16
         self.model.config.vision_config = SimpleNamespace(spatial_merge_size=2, deepstack_visual_indexes=[])
         with patch.dict(os.environ, {"HUANYU_USE_PRECOMPUTE": "1", "HUANYU_EMBED_CACHE_DIR": "huanyu-cache"}):
             self.adapter.configure_model(self.model, self.config)
         self.install_entropy.assert_called_once_with()
         self.install_forward.assert_called_once_with(
             self.model, start_token_id=10, end_token_id=11, placeholder_token_id=12,
-            use_precompute=True, image_token_id=13, spatial_merge_size=2,
+            use_precompute=True, image_token_id=13, video_token_id=16, spatial_merge_size=2,
         )
 
     def test_explicit_unfreeze_enables_both_audio_modules_before_optimizer(self):

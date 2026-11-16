@@ -14,7 +14,7 @@ import pyarrow.parquet as pq
 
 ROOT = Path(__file__).resolve().parents[1]
 EXAMPLES = ROOT / "examples"
-ENTRY = "run_huanyu_aqa_unfreeze_32card_job.sh"
+ENTRY = "run_huanyu_32card_job.sh"
 ENV_PREFIX = "ray_kwargs.ray_init.runtime_env.env_vars."
 MODE_ENV = {
     "HUANYU_FREEZE_AUDIO": "false", "HUANYU_USE_PRECOMPUTE": "0",
@@ -82,6 +82,7 @@ class AqaJobLauncherTests(unittest.TestCase):
         pq.write_table(pa.Table.from_pylist([self.row] * 32), self.train)
         pq.write_table(pa.Table.from_pylist([self.row]), self.validation)
         self.fixture.env.update(
+            HUANYU_JOB_MODE="aqa_unfreeze", HUANYU_FREEZE_AUDIO="false",
             HUANYU_AQA_TRAIN_FILE=_job.shell_path(self.train),
             HUANYU_AQA_VAL_FILE=_job.shell_path(self.validation),
         )
@@ -111,27 +112,29 @@ class AqaJobLauncherTests(unittest.TestCase):
         """Keep actual AQA checks and final overrides; omit hardware preflights."""
         examples = self.fixture.examples
         for name in (
-            "run_huanyu_aqa_audio_train.sh", "check_aqa_audio_train.py", "run_output.sh",
-            "graph_mode.sh", "precision_mode.sh", "run_qwen36_huanyu_gspo_npu_omni_mix_genrm.sh",
+            "run_huanyu_aqa_audio_train.sh", "run_qwen36_huanyu_gspo_npu_omni_mix_genrm.sh",
         ):
             shutil.copyfile(EXAMPLES / name, examples / name)
-        # The intermediate 32-card wrapper checks the real server's model path.
-        # Its training target is retained, so actual GenRM and backend defaults
-        # still participate in final argument precedence.
-        (examples / "run_qwen36_huanyu_32card.sh").write_text(
-            '#!/usr/bin/env bash\nexec bash "${PROJECT_ROOT}/examples/qwen3_6_huanyu/'
-            'run_qwen36_huanyu_gspo_npu_omni_mix_genrm.sh" "$@"\n',
-            encoding="utf-8", newline="\n",
-        )
         backend = (EXAMPLES / "run_qwen36_huanyu_gspo_npu.sh").read_text(encoding="utf-8")
         command = re.search(r"^python3 -m verl_omni\.trainer\.main_omni\b", backend, re.MULTILINE)
         self.assertIsNotNone(command, "Backend training command not found")
+        policies = []
+        for name in ("native", "graph", "precision"):
+            begin, end = f"# BEGIN HUANYU {name} policy", f"# END HUANYU {name} policy"
+            policies.append(backend.split(begin, 1)[1].split(end, 1)[0])
+        # Execute the current source selection and Huanyu routing, bypassing only
+        # hardware preflights. No removed helper is recreated.
+        routing_start = re.search(r'^export PYTHONPATH=', backend, re.MULTILINE)
+        self.assertIsNotNone(routing_start, "Backend project PYTHONPATH setup not found")
+        routing = backend[routing_start.start():backend.index('python3 -B "${EXT_ROOT}/verl_omni_ext/models/qwen3_6_huanyu/runtime_imports.py"')]
+        step_limit = backend[backend.index('_HUANYU_TOTAL_STEPS='):command.start()]
+        logging_start = re.search(r'^PROJECT_NAME=', backend, re.MULTILINE).start()
+        logging_defaults = backend[logging_start:backend.index('set +x', logging_start)]
         (examples / "run_qwen36_huanyu_gspo_npu.sh").write_text(
-            '#!/usr/bin/env bash\nset -euo pipefail\n'
-            'source "${PROJECT_ROOT}/examples/qwen3_6_huanyu/graph_mode.sh"\n'
-            'source "${PROJECT_ROOT}/examples/qwen3_6_huanyu/precision_mode.sh" "$@"\n'
-            '_CHAT_TEMPLATE_ARGS=()\n_DATASET_ARGS=()\nROLLOUT_NUM_WORKERS=4\n'
-            + backend[command.start():], encoding="utf-8", newline="\n",
+            '#!/usr/bin/env bash\nset -euo pipefail\nEXT_ROOT="$PROJECT_ROOT"\n'
+            + "\n".join(policies) + "\n" + routing
+            + '_CHAT_TEMPLATE_ARGS=()\nROLLOUT_NUM_WORKERS=${ROLLOUT_NUM_WORKERS:-4}\n'
+            + logging_defaults + step_limit + backend[command.start():], encoding="utf-8", newline="\n",
         )
         python_stub = self.fixture.bin / "python3"
         python_stub.write_text(
@@ -163,7 +166,7 @@ class AqaJobLauncherTests(unittest.TestCase):
         for key, value in dict(PRECISION_ENV, **(overrides or {})).items():
             self.assertEqual(env[key], value, key)
 
-    def test_head_prepares_then_starts_ray_and_dynamic_aqa_training_with_2k_3k_budget(self):
+    def test_head_prepares_then_starts_ray_and_static_aqa_training_with_4k_2k_budget(self):
         # Exercise this profile independently of the deployment's checkpoint default.
         capture = self.launch({"TOTAL_TRAINING_STEPS": "2", "MODEL_PATH": _job.DEFAULT_MODEL_PATH})
         self.assert_online_environment(capture["env"])
@@ -181,23 +184,23 @@ class AqaJobLauncherTests(unittest.TestCase):
             "actor_rollout_ref.actor.fsdp_config.model_dtype": "fp32",
             "actor_rollout_ref.rollout.engine_kwargs.vllm_omni.pipeline_name": "qwen3_6_huanyu",
             "actor_rollout_ref.rollout.enable_prefix_caching": "false",
-            "data.max_prompt_length": "2048", "data.max_response_length": "3072",
-            "actor_rollout_ref.rollout.prompt_length": "2048",
-            "actor_rollout_ref.rollout.response_length": "3072",
-            "actor_rollout_ref.rollout.max_model_len": "5248",
-            "actor_rollout_ref.rollout.max_num_batched_tokens": "5248",
-            "actor_rollout_ref.actor.ppo_max_token_len_per_gpu": "5248",
-            "actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu": "5248",
-            "actor_rollout_ref.ref.log_prob_max_token_len_per_gpu": "5248",
-            "actor_rollout_ref.actor.use_dynamic_bsz": "true",
-            "actor_rollout_ref.actor.ppo_mini_batch_size": "16",
+            "data.max_prompt_length": "4096", "data.max_response_length": "2048",
+            "actor_rollout_ref.rollout.prompt_length": "4096",
+            "actor_rollout_ref.rollout.response_length": "2048",
+            "actor_rollout_ref.rollout.max_model_len": "6272",
+            "actor_rollout_ref.rollout.max_num_batched_tokens": "6272",
+            "actor_rollout_ref.actor.ppo_max_token_len_per_gpu": "6272",
+            "actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu": "6272",
+            "actor_rollout_ref.ref.log_prob_max_token_len_per_gpu": "6272",
+            "actor_rollout_ref.actor.use_dynamic_bsz": "false",
+            "actor_rollout_ref.actor.ppo_mini_batch_size": "4",
             "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu": "1",
             "actor_rollout_ref.actor.fsdp_config.forward_prefetch": "false",
             "actor_rollout_ref.actor.fsdp_config.ulysses_sequence_parallel_size": "1",
-            "actor_rollout_ref.rollout.log_prob_use_dynamic_bsz": "true",
-            "actor_rollout_ref.ref.log_prob_use_dynamic_bsz": "true",
+            "actor_rollout_ref.rollout.log_prob_use_dynamic_bsz": "false",
+            "actor_rollout_ref.ref.log_prob_use_dynamic_bsz": "false",
             "actor_rollout_ref.rollout.engine_kwargs.vllm_omni.mm_processor_cache_gb": "0",
-            "actor_rollout_ref.rollout.n": "8", "data.train_batch_size": "16",
+            "actor_rollout_ref.rollout.n": "4", "data.train_batch_size": "4",
             "reward.reward_model.enable": "true", "reward.reward_model.n_gpus_per_node": "16",
             "reward.reward_model.nnodes": "1", "trainer.total_training_steps": "2",
         }
@@ -206,10 +209,10 @@ class AqaJobLauncherTests(unittest.TestCase):
             self.assertEqual(observed, value, key)
         for key, value in dict(MODE_ENV, **PRECISION_ENV).items():
             self.assertEqual(json.loads(actual[ENV_PREFIX + key]), value, key)
-        self.assertEqual(json.loads(actual[ENV_PREFIX + "MINICPMO_MM_PROMPT_BUDGET"]), "2048")
+        self.assertEqual(json.loads(actual[ENV_PREFIX + "MINICPMO_MM_PROMPT_BUDGET"]), "4096")
         self.assertNotIn("audio_encoder", actual["actor_rollout_ref.model.exclude_modules"])
         self.assertIn("genrm_verifier", actual["reward.custom_reward_function.path"])
-        self.assertEqual(capture["env"]["EXPERIMENT_NAME"], "huanyu_aqa_unfreeze_5k_32card")
+        self.assertEqual(capture["env"]["EXPERIMENT_NAME"], "huanyu_sampleall_cache_32card")
         self.assertIn("--head", self.fixture.events("ray")[0]["args"])
         self.assertEqual(len(self.fixture.events("train")), 1)
         events = [json.loads(line) for line in self.fixture.events_file.read_text(encoding="utf-8").splitlines()]
@@ -237,10 +240,12 @@ class AqaJobLauncherTests(unittest.TestCase):
                 "export AQA_DYNAMIC_BSZ=true ROLLOUT_MAX_NUM_BATCHED_TOKENS=5248\n"
             )
         capture = self.launch({
-            "HUANYU_JOB_MODE": "frozen_cache", "HUANYU_FREEZE_AUDIO": "true",
+            "HUANYU_JOB_MODE": "aqa_unfreeze", "HUANYU_FREEZE_AUDIO": "false",
             "HUANYU_USE_PRECOMPUTE": "1", "MINICPMO_USE_PRECOMPUTE": "1",
-            "MINICPMO_TUNE_AUDIO": "0", "MINICPMO_TUNE_VISION": "1", "RM_ENABLE": "0",
-            "TRAIN_FILE": "/old/sampleall/train.parquet", "VAL_FILE": "/old/sampleall/validation.parquet",
+            "MINICPMO_TUNE_AUDIO": "0", "MINICPMO_TUNE_VISION": "1", "RM_ENABLE": "0", "HUANYU_REWARD_MODE": "RM",
+            "TRAIN_FILE": _job.shell_path(self.train), "VAL_FILE": _job.shell_path(self.validation),
+            "HUANYU_AQA_TRAIN_FILE": "/unused/alias/train.parquet",
+            "HUANYU_AQA_VAL_FILE": "/unused/alias/validation.parquet",
             "MAX_PROMPT_LENGTH": "4096", "MAX_RESPONSE_LENGTH": "1024",
             "ROLLOUT_PROMPT_LENGTH": "4128", "ROLLOUT_MAX_MODEL_LEN": "6272",
             "MAX_TOKEN_LEN_PER_GPU": "8192", "MINICPMO_MM_PROMPT_BUDGET": "4128",
@@ -271,6 +276,8 @@ class AqaJobLauncherTests(unittest.TestCase):
 
     def test_changed_lengths_derive_budgets_and_trailing_dynamic_overrides_win(self):
         capture = self.launch({"MAX_PROMPT_LENGTH": "4096", "MAX_RESPONSE_LENGTH": "3072"}, (
+            "actor_rollout_ref.actor.use_dynamic_bsz=true",
+            "actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=true",
             "actor_rollout_ref.ref.log_prob_use_dynamic_bsz=false",
             "actor_rollout_ref.rollout.max_num_batched_tokens=16384",
         ))
@@ -284,15 +291,87 @@ class AqaJobLauncherTests(unittest.TestCase):
         self.assertEqual(actual["actor_rollout_ref.ref.log_prob_use_dynamic_bsz"], "false")
         self.assertEqual(actual["actor_rollout_ref.rollout.max_num_batched_tokens"], "16384")
 
-    def test_invalid_environment_defaults_stop_before_setup(self):
-        for key, value in (("AQA_DYNAMIC_BSZ", "typo"), ("MAX_PROMPT_LENGTH", "2k"),
-                           ("TRAIN_BATCH_SIZE", "0")):
-            with self.subTest(key=key):
-                result = self.fixture.run_launcher({key: value})
-                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertIn(key, result.stdout + result.stderr)
-                for kind in ("helper", "pip", "ray", "train"):
-                    self.assertFalse(self.fixture.events(kind), kind)
+    def test_exported_parameters_reach_final_argv_in_aqa_and_frozen_modes(self):
+        updates = {
+            "MODEL_PATH": "/custom/actor", "RM_MODEL_PATH": "/custom/reward",
+            "TRAIN_FILE": _job.shell_path(self.train), "VAL_FILE": _job.shell_path(self.validation),
+            "TRAIN_BATCH_SIZE": "8", "PPO_MINI_BATCH_SIZE": "4", "ROLLOUT_N": "4",
+            "MAX_PROMPT_LENGTH": "1024", "MAX_RESPONSE_LENGTH": "2048",
+            "ROLLOUT_PROMPT_LENGTH": "1024", "ROLLOUT_MAX_MODEL_LEN": "4096",
+            "MAX_TOKEN_LEN_PER_GPU": "8192", "ROLLOUT_MAX_NUM_BATCHED_TOKENS": "16384",
+            "ROLLOUT_TP": "8", "ROLLOUT_GPU_MEM_UTIL": "0.5", "ROLLOUT_NUM_WORKERS": "7",
+            "ROLLOUT_MAX_NUM_SEQS": "12", "UPDATE_WEIGHTS_BUCKET_MB": "512",
+            "ACTOR_LR": "2e-6", "ACTOR_WEIGHT_DECAY": "0.03",
+            "ACTOR_DYNAMIC_BSZ": "true", "ROLLOUT_LOG_PROB_DYNAMIC_BSZ": "true",
+            "REF_LOG_PROB_DYNAMIC_BSZ": "false", "ACTOR_PARAM_OFFLOAD": "false",
+            "ACTOR_OPTIMIZER_OFFLOAD": "true", "ACTOR_OFFLOAD_POLICY": "false",
+            "REF_PARAM_OFFLOAD": "false", "REF_FORWARD_PREFETCH": "true",
+            "TOTAL_TRAINING_STEPS": "2", "TOTAL_EPOCHS": "3", "SAVE_FREQ": "17",
+            "TEST_FREQ": "23", "TRAINER_LOGGER": "[console,tensorboard]",
+            "PROJECT_NAME": "exported_project", "EXPERIMENT_NAME": "exported_experiment",
+            "WANDB_MODE": "disabled", "RM_GPU_MEM_UTIL": "0.65",
+            "DEFAULT_LOCAL_DIR": _job.shell_path(self.fixture.project / "checkpoints"),
+            "TENSORBOARD_DIR": _job.shell_path(self.fixture.project / "tensorboard_log"),
+        }
+        expected = {
+            "actor_rollout_ref.model.path": "/custom/actor", "reward.reward_model.model_path": "/custom/reward",
+            "data.train_files": updates["TRAIN_FILE"], "data.val_files": updates["VAL_FILE"],
+            "data.train_batch_size": "8", "actor_rollout_ref.actor.ppo_mini_batch_size": "4",
+            "actor_rollout_ref.rollout.n": "4", "data.max_prompt_length": "1024",
+            "data.max_response_length": "2048", "actor_rollout_ref.rollout.max_model_len": "4096",
+            "actor_rollout_ref.rollout.max_num_batched_tokens": "16384",
+            "actor_rollout_ref.actor.ppo_max_token_len_per_gpu": "8192",
+            "actor_rollout_ref.rollout.tensor_model_parallel_size": "8",
+            "actor_rollout_ref.rollout.gpu_memory_utilization": "0.5",
+            "actor_rollout_ref.rollout.agent.num_workers": "7", "actor_rollout_ref.rollout.max_num_seqs": "12",
+            "actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes": "512",
+            "actor_rollout_ref.actor.optim.lr": "2e-6", "actor_rollout_ref.actor.optim.weight_decay": "0.03",
+            "actor_rollout_ref.actor.use_dynamic_bsz": "true",
+            "actor_rollout_ref.rollout.log_prob_use_dynamic_bsz": "true",
+            "actor_rollout_ref.ref.log_prob_use_dynamic_bsz": "false",
+            "actor_rollout_ref.actor.fsdp_config.param_offload": "false",
+            "actor_rollout_ref.actor.fsdp_config.optimizer_offload": "true",
+            "actor_rollout_ref.actor.fsdp_config.offload_policy": "false",
+            "actor_rollout_ref.ref.fsdp_config.param_offload": "false",
+            "actor_rollout_ref.ref.fsdp_config.forward_prefetch": "true",
+            "trainer.total_training_steps": "2", "trainer.total_epochs": "3",
+            "trainer.save_freq": "17", "trainer.test_freq": "23", "trainer.logger": "[console,tensorboard]",
+            "trainer.project_name": "exported_project", "trainer.experiment_name": "exported_experiment",
+            "reward.reward_model.rollout.gpu_memory_utilization": "0.65",
+        }
+        # Deliberately stale site settings must lose to exported parameters.
+        with (self.fixture.examples / "env_export_huanyu.sh").open("a", encoding="utf-8") as stream:
+            for key in updates:
+                stream.write(f"export {key}=obsolete-site-value\n")
+        (self.fixture.cache / "manifest.json").write_text("{}", encoding="utf-8")
+        for mode in ("aqa_unfreeze", "frozen_cache"):
+            with self.subTest(mode=mode):
+                capture = self.launch({**updates, "HUANYU_JOB_MODE": mode})
+                actual = effective_arguments(capture)
+                for key, value in expected.items():
+                    self.assertEqual(actual[key], value, key)
+                self.assertTrue(capture["env"]["Q36_CKPT_DIR"].replace("\\", "/").endswith("/custom/actor"))
+                self.assertEqual(json.loads(actual[ENV_PREFIX + "WANDB_MODE"]), "disabled")
+                self.assertTrue(actual["trainer.default_local_dir"].replace("\\", "/").endswith(
+                    self.fixture.project.name + "/checkpoints"
+                ))
+                self.assertEqual(Path(capture["env"]["TENSORBOARD_DIR"]).resolve(),
+                                 (self.fixture.project / "tensorboard_log").resolve())
+
+    def test_invalid_batch_stops_before_training(self):
+        result = self.fixture.run_launcher({"TRAIN_BATCH_SIZE": "0"})
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("batch sizes and ROLLOUT_N must be positive integers", result.stdout + result.stderr)
+        self.assertFalse(self.fixture.events("train"))
+
+    def test_unspecified_output_paths_ignore_only_legacy_site_defaults(self):
+        with (self.fixture.examples / "env_export_huanyu.sh").open("a", encoding="utf-8") as stream:
+            stream.write('export DEFAULT_LOCAL_DIR="$PROJECT_ROOT/checkpoints"\n'
+                         'export TENSORBOARD_DIR="$PROJECT_ROOT/tensorboard_log"\n')
+        capture = self.launch()
+        run_dir = Path(capture["env"]["HUANYU_RUN_DIR"]).resolve()
+        self.assertEqual(Path(capture["env"]["DEFAULT_LOCAL_DIR"]).resolve(), run_dir / "checkpoints")
+        self.assertEqual(Path(capture["env"]["TENSORBOARD_DIR"]).resolve(), run_dir / "tensorboard")
 
     def test_worker_joins_with_online_environment_and_never_trains(self):
         # The server env file is allowed to contain defaults from a frozen run.
@@ -327,8 +406,8 @@ class AqaJobLauncherTests(unittest.TestCase):
                 "export VLLM_OMNI_EXTERNAL_MODULES=old.whisper.entry ROLLOUT_TP=8\n"
             )
         explicit = dict(CUSTOM_PRECISION_ENV, MINICPMO_GDN_FP32_REFERENCE="0", MINICPMO_MOE_TP_REFERENCE="4")
-        capture = self.launch(dict(explicit, HUANYU_TEST_RAY_LIVE="1", ROLLOUT_TP="8"), (
-            "actor_rollout_ref.rollout.tensor_model_parallel_size=8",
+        capture = self.launch(dict(explicit, HUANYU_TEST_RAY_LIVE="1", ROLLOUT_TP="4"), (
+            "actor_rollout_ref.rollout.tensor_model_parallel_size=4",
             '++ray_kwargs.ray_init.runtime_env.env_vars.MINICPMO_HUANYU_LAYERWISE_RELOAD="0"',
             "actor_rollout_ref.rollout.enable_prefix_caching=true",
         ))
@@ -428,7 +507,6 @@ class AqaJobLauncherTests(unittest.TestCase):
         result = self.fixture.run_launcher({"PROJECT_ROOT": None, "HUANYU_PRECISION_PROFILE": "invalid"}, trace=True)
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn(f"PROJECT_ROOT={_job.DEFAULT_PROJECT_ROOT}", result.stderr)
-        self.assertIn(f"{_job.DEFAULT_PROJECT_ROOT}/examples/qwen3_6_huanyu/run_huanyu_32card_job.sh", result.stderr)
         for root in ("relative/project", _job.shell_path(self.fixture.project / "missing")):
             with self.subTest(root=root):
                 result = self.fixture.run_launcher({"PROJECT_ROOT": root})

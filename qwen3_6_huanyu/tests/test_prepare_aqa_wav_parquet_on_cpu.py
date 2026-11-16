@@ -1,5 +1,6 @@
 """Exercise WAV-backed AQA subsets using real tiny WAVs and Parquet files."""
 
+
 import copy
 import hashlib
 import importlib.util
@@ -10,10 +11,17 @@ import random
 import tempfile
 import unittest
 
+# Retained as historical coverage for the removed example CLI.
+import pytest
+pytest.skip("Example CLI removed by the Huanyu examples consolidation", allow_module_level=True)
+
+# Optional audio dependencies below belong to the retired CLI tests.
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import soundfile as sf
+
+
 
 
 EXAMPLES = Path(__file__).resolve().parents[1] / "examples"

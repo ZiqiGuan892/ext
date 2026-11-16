@@ -44,22 +44,47 @@ class Model(torch.nn.Module):
 
 
 class BoundaryTests(unittest.TestCase):
-    def run_reload(self, directory, corrupt=False):
+    def run_reload(self, directory, corrupt=False, replace_conv=False):
         model = Model()
+        api = ModuleType(reload._RELOAD_MODULE)
+        layerwise = ModuleType(api.__name__ + ".layerwise")
+        infos = {}
+
+        def get_info(layer):
+            return infos.setdefault(layer, SimpleNamespace(restore_metadata=({}, {}), can_load=lambda: False))
+
+        def capture(layer):
+            params = {k: p.detach().to("meta") for k, p in layer.named_parameters(recurse=False)}
+            buffers = {k: b.detach().to("meta") for k, b in layer.named_buffers(recurse=False)}
+            return params, buffers
+
+        layerwise.LAYERWISE_INFO = infos
+        layerwise.get_layerwise_info = get_info
+        layerwise.capture_layer_to_meta = capture
+        for layer in model.modules():
+            get_info(layer).restore_metadata = capture(layer)
+        projection_metadata = get_info(model.thinker.audio_projection_layer).restore_metadata
+        if replace_conv:
+            conv = torch.nn.Conv2d(1, 2, 3).to(torch.bfloat16)
+            model.thinker.apm.conv_layers[0].layers[0] = conv
+            original_weight = conv.weight
         incoming = []
         for prefix, module in (("model.audio_encoder.", model.thinker.apm),
                                ("model.audio_projection.", model.thinker.audio_projection_layer)):
             for name, param in module.named_parameters():
                 incoming.append((prefix + name, torch.full_like(param, 0.25)))
         originals, pending = {}, []
-        api = ModuleType(reload._RELOAD_MODULE)
 
         def initialize(current):
             for path, param in list(current.named_parameters()):
                 parent, _, leaf = path.rpartition(".")
                 layer = current.get_submodule(parent)
                 originals[path] = param
-                meta = torch.nn.Parameter(torch.empty_like(param, device="meta"), requires_grad=False)
+                delattr(layer, leaf)
+                saved = get_info(layer).restore_metadata[0].get(leaf)
+                if saved is None:
+                    continue
+                meta = torch.nn.Parameter(saved, requires_grad=False)
                 meta.weight_loader = lambda p, value, path=path: pending.append((path, value))
                 setattr(layer, leaf, meta)
 
@@ -82,9 +107,15 @@ class BoundaryTests(unittest.TestCase):
 
         env = {"HUANYU_WEIGHT_SYNC_AUDIT_DIR": directory,
                "HUANYU_WEIGHT_SYNC_AUDIT_MAX_UPDATES": "1"}
-        with patch.dict(sys.modules, {api.__name__: api}), patch.dict(os.environ, env):
+        with patch.dict(sys.modules, {api.__name__: api, layerwise.__name__: layerwise}), patch.dict(os.environ, env):
             reload.receive_layerwise_weights(model, SimpleNamespace(),
                                              SimpleNamespace(receive_weights=receive))
+        self.assertIs(get_info(model.thinker.audio_projection_layer).restore_metadata, projection_metadata)
+        if replace_conv:
+            self.assertIs(conv.weight, original_weight)
+            self.assertEqual(get_info(conv).restore_device, conv.weight.device)
+            for param in (conv.weight, conv.bias):
+                torch.testing.assert_close(param, torch.full_like(param, 0.25), rtol=0, atol=0)
         return model
 
     def records(self, directory):
@@ -104,6 +135,10 @@ class BoundaryTests(unittest.TestCase):
         actual = {r["name"]: r["tensor"]["float32_sha256"] for r in records if r["stage"] == "after_finalize"}
         self.assertEqual(expected, actual)
         self.assertEqual(model._huanyu_weight_sync_update_id, 1)
+
+    def test_new_audio_convolution_receives_both_parameters_across_buckets(self):
+        with tempfile.TemporaryDirectory(dir=os.environ.get("HUANYU_TEST_TMPDIR")) as directory:
+            self.run_reload(directory, replace_conv=True)
 
     def test_bad_finalize_is_recorded_before_guard_rejects_it(self):
         with tempfile.TemporaryDirectory(dir=os.environ.get("HUANYU_TEST_TMPDIR")) as directory:

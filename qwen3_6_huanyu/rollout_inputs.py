@@ -11,6 +11,7 @@ from functools import wraps
 import inspect
 import logging
 from numbers import Integral
+import os
 
 from .audio_chunking import plan_audio_chunks, prepare_audio_waveform
 
@@ -344,6 +345,11 @@ def _install_on_server_class(server_class):
             else:
                 bound.arguments["audio_data"] = prepared_media["audio"]
         original_ids = bound.arguments["prompt_ids"]
+        if os.environ.get("HUANYU_EXPERT_REPLAY", "0") == "1":
+            # R3：登记训练侧展开 prompt 长度，server_patch 据此校验 vLLM 重展开的长度。
+            from .expert_replay.server_patch import TRAINING_PROMPT_LEN
+
+            TRAINING_PROMPT_LEN.set(len(original_ids))
         contracted = contract_rollout_prompt(processor, original_ids, prepared_media)
         if _media_items(prepared_media, "video") and not getattr(self, "_huanyu_video_hooks_ready", False):
             # Tokenization runs in the server process, whereas engine_hooks

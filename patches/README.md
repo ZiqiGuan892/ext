@@ -1,5 +1,30 @@
 # 主仓库及其他插件脚本补丁
 
+## new 分支：同步的算子优化、HCCL 探针与 replay 插件
+
+本次同步包括 `qwen3_6_huanyu/` 和其 `examples/`。examples 中不再存在的旧
+可执行入口已删除；历史 Markdown 记录保留。新的 16 卡 AQA 五组吞吐入口与部署说明见
+[算子对照说明](../qwen3_6_huanyu/docs/aqa_operator_ablation.md)。
+
+此外必须将本仓库 `probes/hccl_policy.py` 放到训练项目的
+`verl_omni_ext/probes/hccl_policy.py`，训练与 rollout 的校验调用均已保留。
+它检查环境声明一致性，不测量设备通信算法。
+
+`huanyu-r3-entrypoint.patch` 为完整训练项目根目录的 `pyproject.toml` 添加
+`vllm.general_plugins.huanyu_r3`。服务器若已有同名同目标声明，不重复应用。
+检查、应用后使用训练所用的 Python 更新安装元数据：
+
+```bash
+cd "$PROJECT_ROOT"
+git apply --check /path/to/ext/patches/huanyu-r3-entrypoint.patch
+git apply /path/to/ext/patches/huanyu-r3-entrypoint.patch
+python3 -m pip install --no-build-isolation --no-deps -e "$PROJECT_ROOT"
+python3 "$PROJECT_ROOT/verl_omni_ext/models/qwen3_6_huanyu/aqa_ablation.py" plugins
+```
+
+若服务器 pyproject 内容与补丁上下文不同，按上述算子对照说明中的 TOML 小节添加，
+仍需执行安装与 metadata 检查。单纯复制 Python 源码或设置 PYTHONPATH 不会生成入口元数据。
+
 ## o5 视觉 checkpoint 环境变量
 
 `o5-q36-checkpoint-env.patch` 修改两个 o5 基础启动脚本：

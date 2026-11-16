@@ -1,0 +1,14 @@
+diff --git a/pyproject.toml b/pyproject.toml
+index 0440324..84cad52 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -49,6 +49,9 @@ dependencies = [
+     "TransferQueue==0.1.8",
+ ]
+ 
++[project.entry-points."vllm.general_plugins"]
++huanyu_r3 = "verl_omni_ext.models.qwen3_6_huanyu.expert_replay.plugin:register"
++
+ [project.optional-dependencies]
+ # Rollout engine (install in step 2, after gpu step 1).
+ vllm-omni = [

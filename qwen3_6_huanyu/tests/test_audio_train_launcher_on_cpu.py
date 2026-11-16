@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import subprocess
 import sys
@@ -36,7 +37,7 @@ CUSTOM_PRECISION_ENV = dict(PRECISION_ENV, HUANYU_PRECISION_PROFILE="custom", **
     "MINICPMO_GDN_L2NORM_REFERENCE", "MINICPMO_GDN_CONV_REFERENCE", "MINICPMO_GDN_GATING_REFERENCE",
     "MINICPMO_PRIVATE_HYBRID_CACHE",
 ), "0"))
-SPEC = importlib.util.spec_from_file_location("huanyu_aqa_preflight", EXAMPLES / "check_aqa_audio_train.py")
+SPEC = importlib.util.spec_from_file_location("huanyu_aqa_preflight", EXAMPLES / "job_bootstrap.py")
 checker = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(checker)
 
@@ -141,17 +142,7 @@ class AudioTrainingLauncherTests(unittest.TestCase):
         self.project = Path(self.temporary.name)
         self.examples = self.project / "examples" / "qwen3_6_huanyu"
         self.examples.mkdir(parents=True)
-        for name in (
-            "run_huanyu_aqa_audio_train.sh",
-            "run_huanyu_aqa_audio_train_16card.sh",
-            "check_aqa_audio_train.py",
-            "check_native_runtime.py",
-            "run_output.sh",
-            "precision_mode.sh",
-            "graph_mode.sh",
-            "audio_train_mode.sh",
-            "native_source.sh",
-        ):
+        for name in ("run_huanyu_aqa_audio_train.sh", "job_bootstrap.py"):
             shutil.copyfile(EXAMPLES / name, self.examples / name)
         self.model = self.project / "verl_omni_ext" / "models" / "qwen3_6_huanyu"
         self.model.mkdir(parents=True)
@@ -178,10 +169,9 @@ class AudioTrainingLauncherTests(unittest.TestCase):
             "pathlib.Path(os.environ['HUANYU_TEST_CAPTURE']).write_text("
             "json.dumps({'argv':sys.argv[1:], 'env':dict(os.environ)}))"
         )
-        for name in ("run_qwen36_huanyu_32card.sh", "run_qwen36_huanyu_gspo_npu.sh"):
+        for name in ("run_qwen36_huanyu_gspo_npu_omni_mix_genrm.sh", "run_qwen36_huanyu_gspo_npu.sh"):
             (self.examples / name).write_text(
                 '#!/usr/bin/env bash\n'
-                'source "${PROJECT_ROOT}/examples/qwen3_6_huanyu/run_output.sh" || exit $?\n'
                 'echo "backend stdout marker"\n'
                 'echo "backend stderr marker" >&2\n'
                 'python3 - "$@" <<\'PY\'\n' + capture + "\nPY\n", encoding="utf-8"
@@ -195,7 +185,9 @@ class AudioTrainingLauncherTests(unittest.TestCase):
         self.env = dict(os.environ)
         # Avoid caller training settings changing the tests' baseline.
         for key in list(self.env):
-            if key.startswith(("HUANYU_", "MINICPMO_", "ROLLOUT_", "PPO_", "DEBUG_")):
+            if key.startswith(("HUANYU_", "MINICPMO_", "ROLLOUT_", "PPO_", "DEBUG_",
+                               "ACTOR_", "REF_", "AQA_", "TRAIN_", "MAX_", "LOG_PROB_")) or key in (
+                    "ACTIVATION_OFFLOAD", "TRAINER_LOGGER", "MODEL_PATH", "VAL_FILE", "NUM_NPUS", "NNODES"):
                 self.env.pop(key)
         self.env.update(
             HUANYU_VLLM_SOURCE=shell_path(self.project / "native source"),
@@ -228,8 +220,17 @@ class AudioTrainingLauncherTests(unittest.TestCase):
 
     def run_script(self, updates=None, arguments=(), entry="run_huanyu_aqa_audio_train.sh"):
         env = dict(self.env, **(updates or {}))
+        env = {key: value for key, value in env.items() if value is not None}
+        # Windows list2cmdline escaping is not Bash quoting. Put literal Hydra
+        # arguments in a shell file so quoted env values stay separate argv.
+        invocation = self.project / "invoke-test.sh"
+        invocation.write_text(
+            "#!/usr/bin/env bash\nexec "
+            + shlex.join(["bash", shell_path(self.examples / entry), *arguments]) + "\n",
+            encoding="utf-8",
+        )
         return subprocess.run(
-            [find_bash(), shell_path(self.examples / entry), *arguments],
+            [find_bash(), shell_path(invocation)],
             env=env, text=True, capture_output=True, timeout=60,
         )
 
@@ -370,48 +371,93 @@ class AudioTrainingLauncherTests(unittest.TestCase):
         self.assertEqual(actual["actor_rollout_ref.model.override_config.huanyu_freeze_audio"], "false")
         self.assertEqual(capture["env"]["MINICPMO_TUNE_AUDIO"], "1")
 
-    def test_run_outputs_are_unique_and_override_inherited_genrm_path(self):
-        previous_logs = {}
-        stale_dump = self.project / "genrm_dump"
-        for entry in ("run_huanyu_aqa_audio_train.sh", "run_huanyu_aqa_audio_train_16card.sh"):
-            for repeat in range(2):
-                with self.subTest(entry=entry, repeat=repeat):
-                    result = self.run_script(
-                        {"GENRM_DUMP_DIR": shell_path(stale_dump)}, entry=entry,
-                        arguments=('++ray_kwargs.ray_init.runtime_env.env_vars.GENRM_DUMP_DIR="stale"',),
-                    )
-                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                    capture = json.loads(self.capture.read_text())
-                    env = capture["env"]
-                    actual = dict(item.lstrip("+").split("=", 1) for item in capture["argv"])
-                    # Git Bash converts exported paths for native Python on
-                    # Windows. Compare resolved paths, not their shell spelling.
-                    run = self.project / "runs" / env["HUANYU_RUN_DIR"].rsplit("/", 1)[-1]
-                    self.assertTrue(run.is_dir())
-                    self.assertEqual(Path(env["HUANYU_RUN_DIR"]).resolve(), run.resolve())
-                    self.assertEqual(Path(env["HUANYU_CONSOLE_LOG"]).resolve(), (run / "console.log").resolve())
-                    self.assertEqual(Path(env["GENRM_DUMP_DIR"]).resolve(), (run / "genrm_dump").resolve())
-                    self.assertTrue((run / "genrm_dump").is_dir())
-                    self.assertEqual(
-                        json.loads(actual["ray_kwargs.ray_init.runtime_env.env_vars.GENRM_DUMP_DIR"]),
-                        env["GENRM_DUMP_DIR"],
-                    )
-                    log = run / "console.log"
-                    self.assertNotIn(log, previous_logs)
-                    contents = log.read_text(encoding="utf-8")
-                    for marker in ("[huanyu-output] run_dir=", "[huanyu-aqa-check] OK", "backend stdout marker", "backend stderr marker"):
-                        self.assertIn(marker, contents)
-                    self.assertEqual(contents.count("[huanyu-output] run_dir="), 1)
-                    self.assertEqual(contents.count("backend stdout marker"), 1)
-                    previous_logs[log] = log.read_bytes()
-                    for previous, expected in previous_logs.items():
-                        self.assertEqual(previous.read_bytes(), expected)
-        self.assertEqual(len(list((self.project / "runs").iterdir())), 4)
-        self.assertFalse(stale_dump.exists())
-        self.assertFalse((self.project / "run_qwen36_huanyu_gspo_npu.log").exists())
+    def test_cached_audio_reaches_workers_and_preserves_reward_pool_selection(self):
+        cache = self.project / "aqa embedding cache"
+        cache.mkdir()
+        # Only exercise launcher preflight here. The real cache reader validates
+        # the checkpoint/frontend contract and entries when the processor loads.
+        (cache / "manifest.json").write_text("{}", encoding="utf-8")
+        pq.write_table(pa.Table.from_pylist([aqa_row(self.audio)] * 16), self.train)
+        for reward, nodes in (("0", "2"), ("1", "1")):
+            with self.subTest(reward=reward, nodes=nodes):
+                result = self.run_script({
+                    "HUANYU_AQA_USE_PRECOMPUTE": "1", "HUANYU_AQA_CACHE_DIR": shell_path(cache),
+                    "HUANYU_FREEZE_AUDIO": "false", "HUANYU_TRAIN_AUDIO_ENCODER": "true",
+                    "HUANYU_TRAIN_AUDIO_PROJECTOR": "true", "MINICPMO_TUNE_AUDIO": "1",
+                    "RM_ENABLE": reward, "NUM_NPUS": "16", "NNODES": nodes, "ROLLOUT_TP": "4",
+                    "TRAIN_BATCH_SIZE": "16", "PPO_MINI_BATCH_SIZE": "16", "ROLLOUT_N": "8",
+                }, arguments=(
+                    "++actor_rollout_ref.model.override_config.huanyu_freeze_audio=false",
+                    "++actor_rollout_ref.model.override_config.huanyu_train_audio_encoder=true",
+                    "++actor_rollout_ref.model.override_config.huanyu_train_audio_projector=true",
+                    '++ray_kwargs.ray_init.runtime_env.env_vars.HUANYU_USE_PRECOMPUTE="0"',
+                    '++ray_kwargs.ray_init.runtime_env.env_vars.HUANYU_EMBED_CACHE_DIR="stale"',
+                    "actor_rollout_ref.actor.use_dynamic_bsz=true",
+                    "actor_rollout_ref.ref.log_prob_use_dynamic_bsz=true",
+                    "actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=true",
+                    "actor_rollout_ref.actor.fsdp_config.fsdp_size=16",
+                    "actor_rollout_ref.ref.fsdp_config.fsdp_size=16",
+                ))
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                capture = json.loads(self.capture.read_text())
+                native = json.loads(self.native_capture.read_text())
+                actual = dict(item.lstrip("+").split("=", 1) for item in capture["argv"])
+                for key, value in {
+                    "HUANYU_USE_PRECOMPUTE": "1", "MINICPMO_USE_PRECOMPUTE": "0",
+                    "HUANYU_FREEZE_AUDIO": "true", "HUANYU_TRAIN_AUDIO_ENCODER": "false",
+                    "HUANYU_TRAIN_AUDIO_PROJECTOR": "false", "MINICPMO_TUNE_AUDIO": "0",
+                    "MINICPMO_TUNE_VISION": "0", "HUANYU_AQA_AUDIO_TRAIN": "1",
+                }.items():
+                    self.assertEqual(native[key], value, key)
+                    self.assertEqual(capture["env"][key], value, key)
+                    self.assertEqual(json.loads(actual["ray_kwargs.ray_init.runtime_env.env_vars." + key]), value, key)
+                # Git Bash converts exported paths for native Python on Windows.
+                for value in (native["HUANYU_EMBED_CACHE_DIR"], capture["env"]["HUANYU_EMBED_CACHE_DIR"],
+                              json.loads(actual["ray_kwargs.ray_init.runtime_env.env_vars.HUANYU_EMBED_CACHE_DIR"])):
+                    self.assertEqual(Path(value).resolve(), cache.resolve())
+                self.assertEqual(actual["actor_rollout_ref.model.override_config.huanyu_freeze_audio"], "true")
+                for component in ("encoder", "projector"):
+                    self.assertEqual(actual["actor_rollout_ref.model.override_config.huanyu_train_audio_" + component], "false")
+                self.assertEqual(actual["trainer.n_gpus_per_node"], "16")
+                self.assertEqual(actual["trainer.nnodes"], nodes)
+                self.assertEqual(actual["actor_rollout_ref.rollout.tensor_model_parallel_size"], "4")
+                self.assertEqual(actual["actor_rollout_ref.rollout.agent.num_workers"], str(4 * int(nodes)))
+                self.assertEqual(actual["data.train_batch_size"], "16")
+                self.assertEqual(actual["actor_rollout_ref.actor.ppo_mini_batch_size"], "16")
+                self.assertEqual(actual["actor_rollout_ref.rollout.n"], "8")
+                for key in ("actor.use_dynamic_bsz", "ref.log_prob_use_dynamic_bsz", "rollout.log_prob_use_dynamic_bsz"):
+                    self.assertEqual(actual["actor_rollout_ref." + key], "true", key)
+                for role in ("actor", "ref"):
+                    self.assertEqual(actual[f"actor_rollout_ref.{role}.fsdp_config.fsdp_size"], "16")
+                self.assertIn("mode=cached cache=1", result.stdout)
+                self.assertIn("audio_freeze_true_cached", capture["env"]["EXPERIMENT_NAME"])
+                if reward == "0":
+                    self.assertEqual(actual["reward.reward_model.enable"], "false")
+                    self.assertEqual(actual["reward.reward_model.enable_resource_pool"], "false")
+                    self.assertEqual(capture["env"]["REWARD_POOL_NPUS"], "0")
+                    self.assertEqual(actual["reward.custom_reward_function.path"],
+                                     "pkg://verl_omni_ext.models.qwen3_6_huanyu.rule_based_reward")
+                    self.assertIn("actor=32NPU RM=0NPU", result.stdout)
+                    self.assertIn("rule_based_32card", capture["env"]["EXPERIMENT_NAME"])
+                else:
+                    self.assertEqual(actual["reward.reward_model.n_gpus_per_node"], "16")
+                    self.assertEqual(actual["reward.reward_model.nnodes"], "1")
+                    self.assertEqual(capture["env"]["REWARD_POOL_NPUS"], "16")
+
+    def test_cache_mode_requires_manifest_before_native_import_or_training(self):
+        missing = self.project / "missing cache"
+        result = self.run_script({
+            "HUANYU_AQA_USE_PRECOMPUTE": "1", "HUANYU_AQA_CACHE_DIR": shell_path(missing),
+        })
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn(shell_path(missing) + "/manifest.json", result.stdout + result.stderr)
+        self.assertIn("precompute first", result.stdout + result.stderr)
+        self.assertFalse(self.native_capture.exists())
+        self.assertFalse(self.capture.exists())
+
 
     def test_backend_failure_is_logged_and_retains_exit_code(self):
-        (self.examples / "run_qwen36_huanyu_32card.sh").write_text(
+        (self.examples / "run_qwen36_huanyu_gspo_npu_omni_mix_genrm.sh").write_text(
             '#!/usr/bin/env bash\necho "backend failure marker" >&2\nexit 23\n', encoding="utf-8",
         )
         result = self.run_script()
@@ -421,94 +467,38 @@ class AudioTrainingLauncherTests(unittest.TestCase):
         self.assertIn("backend failure marker", logs[0].read_text(encoding="utf-8"))
         self.assertFalse(self.capture.exists())
 
-    def test_16card_entry_disables_rm_pool_and_overrides_stale_reward_options(self):
-        result = self.run_script(
-            {"RM_ENABLE": "1", "REWARD_POOL_NPUS": "16", "NNODES": "2", "NUM_NPUS": "32"},
-            arguments=(
-                "reward.reward_model.enable=true",
-                "reward.reward_model.enable_resource_pool=true",
-                "reward.reward_model.n_gpus_per_node=16",
-                "reward.custom_reward_function.path=pkg://verl_omni_ext.reward.genrm_verifier",
-                "reward.custom_reward_function.name=old_score",
-            ),
-            entry="run_huanyu_aqa_audio_train_16card.sh",
-        )
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        capture = json.loads(self.capture.read_text())
-        actual = dict(item.lstrip("+").split("=", 1) for item in capture["argv"])
-        for key, value in (
-            ("reward.reward_model.enable", "false"),
-            ("reward.reward_model.enable_resource_pool", "false"),
-            ("reward.reward_model.n_gpus_per_node", "0"),
-            ("reward.reward_model.nnodes", "0"),
-            ("reward.reward_model.model_path", "null"),
-            ("reward.custom_reward_function.name", "compute_score"),
-            ("reward.custom_reward_function.reward_kwargs.require_think_end", "true"),
-            ("data.apply_chat_template_kwargs.enable_thinking", "true"),
-            ("trainer.n_gpus_per_node", "16"),
-            ("trainer.nnodes", "1"),
-            ("actor_rollout_ref.rollout.tensor_model_parallel_size", "4"),
-            ("actor_rollout_ref.model.override_config.huanyu_freeze_audio", "false"),
-            ("actor_rollout_ref.actor.use_dynamic_bsz", "false"),
-            ("data.filter_overlong_prompts", "false"),
-        ):
-            self.assertEqual(actual[key], value, key)
-        self.assertEqual(
-            actual["reward.custom_reward_function.path"],
-            "pkg://verl_omni_ext.models.qwen3_6_huanyu.rule_based_reward",
-        )
-        self.assertEqual(capture["env"]["RM_ENABLE"], "0")
-        self.assertEqual(capture["env"]["REWARD_POOL_NPUS"], "0")
-        self.assertEqual(
-            actual["trainer.rollout_data_dir"],
-            "${trainer.default_local_dir}/../rollout_dump",
-        )
-        self.assertEqual(actual["trainer.logger"], "[console]")
-        requested_npus = (
-            int(capture["env"]["NUM_NPUS"]) * int(capture["env"]["NNODES"])
-            + int(capture["env"]["REWARD_POOL_NPUS"])
-        )
-        self.assertEqual(requested_npus, 16)
-        self.assertIn("rule_based_16card", capture["env"]["EXPERIMENT_NAME"])
-        self.assertIn("RM=0NPU RM_ENABLE=0", result.stdout)
-        self.assertNotIn("qwen3_5_moe", " ".join(capture["argv"]))
 
-    def test_16card_frozen_control_still_disables_cache(self):
-        rollout_dir = (self.project / "frozen_rollouts").as_posix()
-        result = self.run_script(
-            {
-                "HUANYU_FREEZE_AUDIO": "true",
-                "ENABLE_THINKING": "0",
-                "ROLLOUT_DATA_DIR": rollout_dir,
-            },
-            arguments=("trainer.logger=[console,tensorboard]",),
-            entry="run_huanyu_aqa_audio_train_16card.sh",
-        )
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        capture = json.loads(self.capture.read_text())
-        actual = dict(item.lstrip("+").split("=", 1) for item in capture["argv"])
-        self.assertEqual(actual["actor_rollout_ref.model.override_config.huanyu_freeze_audio"], "true")
-        self.assertEqual(capture["env"]["MINICPMO_TUNE_AUDIO"], "0")
-        self.assertEqual(capture["env"]["HUANYU_USE_PRECOMPUTE"], "0")
-        self.assertEqual(capture["env"]["MINICPMO_USE_PRECOMPUTE"], "0")
-        self.assertEqual(actual["data.apply_chat_template_kwargs.enable_thinking"], "false")
-        self.assertEqual(actual["reward.custom_reward_function.reward_kwargs.require_think_end"], "false")
-        self.assertEqual(actual["trainer.rollout_data_dir"], rollout_dir)
-        self.assertEqual(actual["trainer.logger"], "[console,tensorboard]")
+
+    def test_canonical_reward_mode_wins_over_legacy_switch(self):
+        for mode, legacy, expected in (("RM", "0", "1"), ("rule_based", "1", "0"),
+                                       ("ruled_based", "1", "0")):
+            with self.subTest(mode=mode):
+                result = self.run_script({"HUANYU_REWARD_MODE": mode, "RM_ENABLE": legacy},
+                                         arguments=("reward.reward_model.enable=" + ("false" if expected == "1" else "true"),))
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                capture = json.loads(self.capture.read_text())
+                self.assertEqual(capture["env"]["RM_ENABLE"], expected)
+                self.assertEqual(capture["env"]["HUANYU_REWARD_MODE"], "RM" if expected == "1" else "rule_based")
+                actual = dict(item.lstrip("+").split("=", 1) for item in capture["argv"])
+                self.assertEqual(actual["reward.reward_model.enable"], "true" if expected == "1" else "false")
+                if expected == "0":
+                    self.assertEqual(actual["reward.custom_reward_function.path"],
+                                     "pkg://verl_omni_ext.models.qwen3_6_huanyu.rule_based_reward")
+                    self.assertEqual(capture["env"]["REWARD_POOL_NPUS"], "0")
+                else:
+                    self.assertEqual(actual["reward.reward_model.nnodes"], "1")
+
+    def test_invalid_canonical_reward_stops_before_backend(self):
+        result = self.run_script({"HUANYU_REWARD_MODE": "typo"})
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("HUANYU_REWARD_MODE must be RM or rule_based", result.stdout + result.stderr)
+        self.assertFalse(self.capture.exists())
 
     def test_no_rm_path_preserves_genrm_paths_non_reward_omnimix_settings(self):
         # Exercise the real OmniMix wrapper, stubbing only the heavy base backend.
         source = EXAMPLES
         name = "run_qwen36_huanyu_gspo_npu_omni_mix_genrm.sh"
         (self.examples / name).write_text((source / name).read_text(encoding="utf-8"), encoding="utf-8")
-        (self.examples / "run_qwen36_huanyu_32card.sh").write_text(
-            '#!/usr/bin/env bash\n'
-            # This stub replaces the upper pool owner as well as its path
-            # checks. Supply the same pool contract to the real lower wrapper.
-            'export RM_TP=4 RM_N_GPUS_PER_NODE=16 RM_NNODES=1 RM_SPLIT_NODES=1\n'
-            'exec bash "$(dirname "$0")/'
-            + name + '" "$@"\n', encoding="utf-8",
-        )
         result = self.run_script({"RM_ENABLE": "1"})
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         reference = json.loads(self.capture.read_text())
@@ -517,8 +507,8 @@ class AudioTrainingLauncherTests(unittest.TestCase):
         actual = json.loads(self.capture.read_text())
         reference_args = dict(item.lstrip("+").split("=", 1) for item in reference["argv"])
         actual_args = dict(item.lstrip("+").split("=", 1) for item in actual["argv"])
-        self.assertEqual(reference_args["reward.reward_model.enable"], "True")
-        self.assertEqual(reference_args["reward.reward_model.enable_resource_pool"], "True")
+        self.assertEqual(reference_args["reward.reward_model.enable"].lower(), "true")
+        self.assertEqual(reference_args["reward.reward_model.enable_resource_pool"].lower(), "true")
         for key, value in reference_args.items():
             if key.startswith(("actor_rollout_ref.", "data.")):
                 self.assertEqual(actual_args.get(key), value, key)
@@ -559,6 +549,90 @@ class AudioTrainingLauncherTests(unittest.TestCase):
             self.assertEqual(actual[key], value, key)
         self.assertIn("mini_batch_trajectories=64 sequences_per_actor_rank=4", result.stdout)
 
+    def test_explicit_generic_dataset_paths_win_and_aqa_aliases_are_fallbacks(self):
+        alias_train = self.project / "alias train.parquet"
+        alias_val = self.project / "alias validation.parquet"
+        shutil.copyfile(self.train, alias_train)
+        shutil.copyfile(self.validation, alias_val)
+        aliases = {"HUANYU_AQA_TRAIN_FILE": shell_path(alias_train),
+                   "HUANYU_AQA_VAL_FILE": shell_path(alias_val)}
+        for generic in (True, False):
+            with self.subTest(generic=generic):
+                config = dict(aliases)
+                if not generic:
+                    config.update(TRAIN_FILE=None, VAL_FILE=None)
+                result = self.run_script(config)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                capture = json.loads(self.capture.read_text())
+                actual = dict(item.lstrip("+").split("=", 1) for item in capture["argv"])
+                for key, expected in (("data.train_files", self.train if generic else alias_train),
+                                      ("data.val_files", self.validation if generic else alias_val)):
+                    self.assertEqual(Path(actual[key]).resolve(), expected.resolve(), key)
+
+    def test_exported_runtime_parameters_reach_backend_argv_and_environment(self):
+        config = {
+            "TRAIN_BATCH_SIZE": "8", "PPO_MINI_BATCH_SIZE": "8", "ROLLOUT_N": "8",
+            "PPO_MICRO_BATCH_SIZE_PER_GPU": "2", "LOG_PROB_MICRO_BATCH_SIZE_PER_GPU": "2",
+            "ACTOR_PARAM_OFFLOAD": "false", "ACTOR_OPTIMIZER_OFFLOAD": "true",
+            "ACTOR_OFFLOAD_POLICY": "true", "REF_PARAM_OFFLOAD": "false",
+            "ACTIVATION_OFFLOAD": "true", "ACTOR_FORWARD_PREFETCH": "true", "REF_FORWARD_PREFETCH": "true",
+            "AQA_DYNAMIC_BSZ": "true", "ACTOR_DYNAMIC_BSZ": "false", "REF_LOG_PROB_DYNAMIC_BSZ": "false",
+            "ROLLOUT_LOG_PROB_DYNAMIC_BSZ": "false", "ROLLOUT_NUM_WORKERS": "7",
+            "ROLLOUT_MAX_NUM_BATCHED_TOKENS": "16384", "TRAINER_LOGGER": "[console,tensorboard]",
+            "MAX_PROMPT_LENGTH": "2048", "MAX_RESPONSE_LENGTH": "1024", "ROLLOUT_MAX_MODEL_LEN": "4096",
+            "MAX_TOKEN_LEN_PER_GPU": "8192", "UPDATE_WEIGHTS_BUCKET_MB": "2048", "RM_ENABLE": "0",
+        }
+        result = self.run_script(config)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        capture = json.loads(self.capture.read_text())
+        actual = dict(item.lstrip("+").split("=", 1) for item in capture["argv"])
+        for key, value in config.items():
+            self.assertEqual(capture["env"][key], value, key)
+        expected = {
+            "data.train_batch_size": "8", "actor_rollout_ref.actor.ppo_mini_batch_size": "8",
+            "actor_rollout_ref.rollout.n": "8", "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu": "2",
+            "actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu": "2",
+            "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu": "2",
+            "actor_rollout_ref.actor.fsdp_config.param_offload": "false",
+            "actor_rollout_ref.actor.fsdp_config.optimizer_offload": "true",
+            "actor_rollout_ref.actor.fsdp_config.offload_policy": "true",
+            "actor_rollout_ref.model.enable_activation_offload": "true",
+            "actor_rollout_ref.actor.fsdp_config.forward_prefetch": "true",
+            "actor_rollout_ref.ref.fsdp_config.forward_prefetch": "true",
+            "actor_rollout_ref.actor.use_dynamic_bsz": "false",
+            "actor_rollout_ref.ref.log_prob_use_dynamic_bsz": "false",
+            "actor_rollout_ref.rollout.log_prob_use_dynamic_bsz": "false",
+            "actor_rollout_ref.rollout.max_num_batched_tokens": "16384",
+            "actor_rollout_ref.rollout.agent.num_workers": "7", "trainer.logger": "[console,tensorboard]",
+            "actor_rollout_ref.rollout.response_length": "1024",
+            "actor_rollout_ref.actor.ppo_max_token_len_per_gpu": "8192",
+            "actor_rollout_ref.ref.log_prob_max_token_len_per_gpu": "8192",
+            "actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu": "8192",
+            "actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes": "2048",
+        }
+        for key, value in expected.items():
+            self.assertEqual(actual[key], value, key)
+
+    def test_uniform_dynamic_batching_and_cli_overrides(self):
+        for cli in (False, True):
+            with self.subTest(cli=cli):
+                arguments = (
+                    "actor_rollout_ref.actor.use_dynamic_bsz=false",
+                    "actor_rollout_ref.ref.log_prob_use_dynamic_bsz=false",
+                    "actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=false",
+                    "actor_rollout_ref.rollout.max_num_batched_tokens=12288", "trainer.logger=[console]",
+                ) if cli else ()
+                result = self.run_script({"AQA_DYNAMIC_BSZ": "true",
+                                          "ROLLOUT_MAX_NUM_BATCHED_TOKENS": "16384",
+                                          "TRAINER_LOGGER": "[console,tensorboard]"}, arguments)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                actual = dict(item.lstrip("+").split("=", 1)
+                              for item in json.loads(self.capture.read_text())["argv"])
+                for key in ("actor.use_dynamic_bsz", "ref.log_prob_use_dynamic_bsz", "rollout.log_prob_use_dynamic_bsz"):
+                    self.assertEqual(actual["actor_rollout_ref." + key], "false" if cli else "true", key)
+                self.assertEqual(actual["actor_rollout_ref.rollout.max_num_batched_tokens"], "12288" if cli else "16384")
+                self.assertEqual(actual["trainer.logger"], "[console]" if cli else "[console,tensorboard]")
+
     def test_rejects_unequal_rank_batching_debug_mode_and_bad_hyperparameter(self):
         for updates, error in (
             ({"PPO_MINI_BATCH_SIZE": "8"}, "ppo_mini_batch"),
@@ -570,6 +644,7 @@ class AudioTrainingLauncherTests(unittest.TestCase):
             ({"HUANYU_TRAIN_AUDIO_ENCODER": "yes"}, "HUANYU_TRAIN_AUDIO_ENCODER"),
             ({"HUANYU_TRAIN_AUDIO_PROJECTOR": "0"}, "HUANYU_TRAIN_AUDIO_PROJECTOR"),
             ({"RM_ENABLE": "maybe"}, "RM_ENABLE must be 0 or 1"),
+            ({"HUANYU_AQA_USE_PRECOMPUTE": "true"}, "HUANYU_AQA_USE_PRECOMPUTE must be 0 or 1"),
         ):
             with self.subTest(updates=updates):
                 result = self.run_script(updates)

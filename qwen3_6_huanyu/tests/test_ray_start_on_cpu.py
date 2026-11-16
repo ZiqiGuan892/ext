@@ -34,7 +34,7 @@ class HuanyuRayStartTests(unittest.TestCase):
         )
         # The entry must work with just Ray, Bash and its bootstrap helper.
         for name in ("env_export_huanyu.sh", "check_native_runtime.py", "run_huanyu.sh"):
-            (self.fixture.examples / name).unlink()
+            (self.fixture.examples / name).unlink(missing_ok=True)
         for key in ("PROJECT_ROOT", "MODEL_PATH", "HUANYU_VLLM_SOURCE"):
             self.fixture.env.pop(key, None)
 

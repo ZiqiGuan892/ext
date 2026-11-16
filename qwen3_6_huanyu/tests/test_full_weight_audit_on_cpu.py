@@ -342,20 +342,6 @@ class FullWeightAuditTests(unittest.TestCase):
         self.assertEqual(process["engine_group"], "tcp://actual-engine:1234/tp=0,1,2,3")
         self.assertEqual(process["engine_group_source"], "worker_distributed_init_method")
 
-    def test_actual_worker_report_passes_actual_aggregator(self):
-        spec = importlib.util.spec_from_file_location(
-            "huanyu_actual_full_weight_compare_cpu", ROOT / "examples" / "compare_huanyu_full_weights.py")
-        compare = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(compare)
-        model = FusedTPModel(self.weights)
-        process = {"host": "cpu-test", "pid": 123, "rank": 0, "tp_rank": 0,
-                   "tp_world_size": 1, "engine_group": "cpu-test:1234/tp=0"}
-        with patch.object(audit, "_identity", return_value=process):
-            initial = audit.snapshot_initial_disk(model, self.model_config, self.worker)
-            self.execute(model, initial)
-        report = compare.compare(self.root / "reports", expected_workers=1, tp_size=1)
-        self.assertEqual(report["status"], "PASS", report)
-
 
 if __name__ == "__main__":
     unittest.main()

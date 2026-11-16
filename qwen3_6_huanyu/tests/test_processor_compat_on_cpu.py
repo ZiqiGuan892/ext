@@ -114,6 +114,18 @@ class ProcessorCompatTests(unittest.TestCase):
         info.get_tokenizer.assert_not_called()
         self.assertEqual(result.pool_step, 5)
 
+    def test_audio_only_processor_during_rollout_budgeting(self):
+        audio = object()
+        processor = SimpleNamespace(tokenizer=Tokenizer(), audio_processor=audio, pool_step=2)
+        self.install()
+        result = self.info(processor).get_hf_processor(chunk_input=True)
+
+        self.assertIs(result, processor)
+        self.assertIs(result.audio_processor, audio)
+        self.assertFalse(hasattr(result, "image_processor"))
+        self.assertEqual(result.tokenizer.audio_start_id, 100)
+        self.assertEqual(result.pool_step, 5)
+
     def test_worker_lazy_tokenizer_uses_cached_factory_and_forwards_kwargs(self):
         processor = qwen_processor()
         info = self.info(processor, lazy=True)

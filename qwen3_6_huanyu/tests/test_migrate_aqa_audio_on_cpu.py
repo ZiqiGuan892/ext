@@ -1,5 +1,6 @@
 """Exercise audio relocation with real, tiny Arrow parquet files and media bytes."""
 
+
 import errno
 import importlib.util
 import io
@@ -14,6 +15,11 @@ from unittest import mock
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+
+# Retained as historical coverage for the removed example CLI.
+import pytest
+pytest.skip("Example CLI removed by the Huanyu examples consolidation", allow_module_level=True)
+
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "examples" / "migrate_aqa_audio.py"

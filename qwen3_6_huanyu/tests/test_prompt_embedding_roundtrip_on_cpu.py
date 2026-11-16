@@ -1,5 +1,6 @@
 """Real producer -> BF16 NPZ -> strict comparator -> text A/B output integration."""
 
+
 import contextlib
 import importlib.util
 import io
@@ -8,6 +9,11 @@ from pathlib import Path
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
+
+# Retained as historical coverage for the removed example CLI.
+import pytest
+pytest.skip("Example CLI removed by the Huanyu examples consolidation", allow_module_level=True)
+
 
 
 ROOT = Path(__file__).resolve().parents[1]

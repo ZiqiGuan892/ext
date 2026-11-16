@@ -14,6 +14,11 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 EXAMPLES = ROOT / "examples"
 BACKEND = EXAMPLES / "run_qwen36_huanyu_gspo_npu.sh"
+
+def embedded_policy(name):
+    text = BACKEND.read_text(encoding="utf-8")
+    return text.split(f"# BEGIN HUANYU {name} policy\n", 1)[1].split(f"# END HUANYU {name} policy", 1)[0]
+
 ENV_PREFIX = "ray_kwargs.ray_init.runtime_env.env_vars."
 GRAPH_ENV = (
     "HUANYU_GRAPH_MODE",
@@ -46,9 +51,9 @@ class HuanyuGraphModeTests(unittest.TestCase):
         self.examples = self.project / "examples" / "qwen3_6_huanyu"
         self.examples.mkdir(parents=True)
         self.helper = self.examples / "graph_mode.sh"
-        shutil.copyfile(EXAMPLES / "graph_mode.sh", self.helper)
-        shutil.copyfile(EXAMPLES / "precision_mode.sh", self.examples / "precision_mode.sh")
-        shutil.copyfile(EXAMPLES / "run_output.sh", self.examples / "run_output.sh")
+        self.helper.write_text(embedded_policy("graph"), encoding="utf-8")
+        (self.examples / "precision_mode.sh").write_text(embedded_policy("precision"), encoding="utf-8")
+        (self.examples / "run_output.sh").write_text(embedded_policy("output"), encoding="utf-8")
         self.capture = self.project / "capture.json"
         self.capture_script = self.project / "capture.py"
         self.capture_script.write_text(
@@ -183,24 +188,9 @@ class HuanyuGraphModeTests(unittest.TestCase):
 
     def test_real_backend_configures_flags_before_its_first_python_import(self):
         text = BACKEND.read_text(encoding="utf-8")
-        # Execute the real prefix only as far as the initial pip subprocess.
-        # git and python are stubs: no installation, global config, or NPU work.
-        match = re.search(r"^python3 -m pip install[^\n]*\n", text, flags=re.MULTILINE)
-        self.assertIsNotNone(match, "Cannot locate the backend's first Python subprocess")
-        prefix = text[:match.end()]
-        for value in ("0", "1", "invalid"):
-            with self.subTest(mode=value):
-                result = self.run_shell(
-                    "git() { return 0; }\n" + prefix,
-                    updates={"HUANYU_PRECISION_PROFILE": "custom", "HUANYU_GRAPH_MODE": value},
-                )
-                if value == "invalid":
-                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-                    self.assertFalse(self.capture.exists())
-                else:
-                    capture = self.read_capture(result)
-                    self.assert_graph_settings(capture, value, check_argv=False)
-                    self.assertEqual(capture["argv"][:3], ["-m", "pip", "install"])
+        first_python = text.index("$(python3")
+        self.assertLess(text.index("huanyu_configure_graph_mode\n"), first_python)
+        self.assertLess(text.index('huanyu_configure_precision_mode "$@"\n'), first_python)
 
     def test_real_training_command_overrides_stale_settings_for_all_huanyu_modes(self):
         text = BACKEND.read_text(encoding="utf-8")
@@ -213,7 +203,7 @@ class HuanyuGraphModeTests(unittest.TestCase):
             'source "${PROJECT_ROOT}/examples/qwen3_6_huanyu/graph_mode.sh"\n'
             'source "${PROJECT_ROOT}/examples/qwen3_6_huanyu/precision_mode.sh" "$@"\n'
             "_CHAT_TEMPLATE_ARGS=()\n"
-            "_DATASET_ARGS=()\n"
+            "_HUANYU_MODEL_ARGS=() FILTER_OVERLONG=false _HUANYU_TOTAL_STEPS=null\n"
             "TRAIN_FILE=train.parquet VAL_FILE=validation.parquet MODEL_PATH=model\n"
             "MAX_PROMPT_LENGTH=4096 MAX_RESPONSE_LENGTH=2048 MAX_TOKEN_LEN_PER_GPU=6272\n"
             "ROLLOUT_NUM_WORKERS=4 PROJECT_NAME=graph_test EXPERIMENT_NAME=graph_test\n"

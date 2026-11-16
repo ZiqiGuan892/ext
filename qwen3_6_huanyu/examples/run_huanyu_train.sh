@@ -9,8 +9,8 @@ set -eo pipefail
 PROJECT_ROOT="${PROJECT_ROOT:-/opt/huawei/dataset/infra_data/code/verl_omni_qwen36_gzq_new}" # 当前插件仓库根目录。
 PYTHON_BIN="${PYTHON_BIN:-python3}" # 沿用已准备的 Python，可指定解释器绝对路径。
 RAY_ADDRESS="${RAY_ADDRESS:-auto}" # 连接已有集群，auto 找不到集群时失败而不新建 Ray。
-TRAIN_FILE="${TRAIN_FILE:-/opt/huawei/dataset/infra_data/data/train.parquet}" # 通用多模态训练集。
-VAL_FILE="${VAL_FILE:-/opt/huawei/dataset/infra_data/data/validation.parquet}" # 通用多模态验证集。
+TRAIN_FILE="${TRAIN_FILE:-/opt/huawei/dataset/infra_data/data/aqa_dataset/train.parquet}" # 通用多模态训练集。
+VAL_FILE="${VAL_FILE:-/opt/huawei/dataset/infra_data/data/aqa_dataset/validation.parquet}" # 通用多模态验证集。
 MODEL_PATH="${MODEL_PATH:-/opt/huawei/dataset/model_gy/downloaded_models/2748}" # Huanyu Actor/Ref 及 rollout 的初始权重。
 RM_MODEL_PATH="${RM_MODEL_PATH:-/opt/huawei/dataset/model_gy/downloaded_models/Qwen3.5-35B-A3B}" # GenRM 评分模型权重。
 
@@ -52,7 +52,6 @@ RUNTIME_ENV=(
     "HUANYU_VLLM_OMNI_ROOT=${HUANYU_VLLM_OMNI_ROOT:-/vllm-workspace/vllm-omni}" # 校验已安装原生 Huanyu 实现的来源。
     "HUANYU_VLLM_SOURCE=${HUANYU_VLLM_OMNI_ROOT:-/vllm-workspace/vllm-omni}" # 推理 worker 使用相同的原生源码校验路径。
     "VLLM_WORKER_MULTIPROC_METHOD=spawn" # 推理子进程使用 spawn 启动方式。
-    "VLLM_USE_V1=0" # 沿用当前 OmniMix 后端的版本兼容开关。
     "USE_OPTIMIZED_MODEL=0" # 关闭镜像中的替代模型实现。
     "ASCEND_SECURITY_CHECK_DISABLED=1" # 沿用 Ascend 镜像的安全检查兼容设置。
     "VERL_DATAPROTO_SERIALIZATION_METHOD=numpy" # DataProto 跨进程序列化方式。
@@ -379,6 +378,15 @@ ARGS+=(
 
 # ===== 执行部分：将同一配置同时应用于 driver 与 Ray worker =====
 for _entry in "${RUNTIME_ENV[@]}"; do export "$_entry"; done
+# 本脚本把精度开关平铺在上面的 RUNTIME_ENV 里，没有 huanyu_configure_precision_mode
+# 那套 kernel 档案逻辑（MINICPMO_GDN_NPU_KERNEL / MINICPMO_NPU_RMS_NORM /
+# HUANYU_KERNEL_BISECT 一个都不设）。不拦住就会「声明了 kernel、实际一个 kernel
+# 都没换」地静默跑完——这正是后端那套互斥校验要防的形态。
+case "$HUANYU_PRECISION_PROFILE" in
+    full|custom) ;;
+    kernel|kernel_graph) echo "FATAL: run_huanyu_train.sh 不实现 $HUANYU_PRECISION_PROFILE 档案（不会设置任何 kernel 开关）；请改用 run_qwen36_huanyu_gspo_npu.sh" >&2; exit 2 ;;
+    *) echo "FATAL: HUANYU_PRECISION_PROFILE 必须为 full 或 custom，收到 '$HUANYU_PRECISION_PROFILE'" >&2; exit 2 ;;
+esac
 case "$HUANYU_GRAPH_MODE" in
     0|false) _eager=true; _compile=0; _disable=1 ;;
     1|true) _eager=false; _compile=1; _disable=0 ;;

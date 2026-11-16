@@ -1,5 +1,6 @@
 """Exercise the Whisper comparison profile through Huanyu's real shell argv chain."""
 
+
 import importlib.util
 import json
 from pathlib import Path
@@ -7,6 +8,11 @@ import re
 import shutil
 import tempfile
 import unittest
+
+# Retained as historical coverage for the removed example CLI.
+import pytest
+pytest.skip("Example CLI removed by the Huanyu examples consolidation", allow_module_level=True)
+
 
 
 ROOT = Path(__file__).resolve().parents[1]

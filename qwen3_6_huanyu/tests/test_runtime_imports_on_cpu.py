@@ -343,9 +343,6 @@ class RuntimeImportsCLITests(unittest.TestCase):
         (self.project / "verl_omni_ext/__init__.py").write_text(
             "raise AssertionError('EXT_INITIALIZER_IMPORTED')\n", encoding="utf-8"
         )
-        self.example = self.project / "examples/qwen3_6_huanyu/check_native_runtime.py"
-        self.example.parent.mkdir(parents=True)
-        shutil.copyfile(ROOT / "examples/check_native_runtime.py", self.example)
         self.checkout = self.directory / "selected-checkout"
         self.native_path = self.write_checkout(self.checkout)
 
@@ -393,14 +390,11 @@ class RuntimeImportsCLITests(unittest.TestCase):
     def test_direct_cli_ignores_stale_sibling_and_loads_selected_checkout(self):
         self.assert_valid_native_selected(self.run_check(self.runtime))
 
-    def test_runpy_job_check_uses_project_root_without_ext_initialization(self):
-        self.assert_valid_native_selected(self.run_check(self.example))
-
     def test_wrong_real_checkout_is_rejected_instead_of_force_selected(self):
         wrong_checkout = self.directory / "wrong-checkout"
         wrong_native = self.write_checkout(wrong_checkout)
         wrong_native.write_text("raise AssertionError('WRONG_NATIVE_IMPORTED')\n", encoding="utf-8")
-        for entrypoint in (self.runtime, self.example):
+        for entrypoint in (self.runtime,):
             with self.subTest(entrypoint=entrypoint.name):
                 result = self.run_check(entrypoint, checkout=wrong_checkout)
                 output = result.stdout + result.stderr

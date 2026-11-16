@@ -1,5 +1,6 @@
 """Export real tiny Zarr ZIP/Parquet fixtures without a model or serving endpoint."""
 
+
 import base64
 import importlib.util
 import json
@@ -10,11 +11,18 @@ import tempfile
 import unittest
 import zipfile
 
+# Retained as historical coverage for the removed example CLI.
+import pytest
+pytest.skip("Example CLI removed by the Huanyu examples consolidation", allow_module_level=True)
+
+# Optional audio dependencies below belong to the retired CLI tests.
 import numpy as np
 from numcodecs import Zlib
 import pyarrow as pa
 import pyarrow.parquet as pq
 import soundfile as sf
+
+
 
 
 EXAMPLES = Path(__file__).resolve().parents[1] / "examples"

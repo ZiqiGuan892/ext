@@ -163,17 +163,10 @@ class PrecisionModeTests(unittest.TestCase):
 
     def test_backend_exports_before_first_python_import(self):
         text = (EXAMPLES / "run_qwen36_huanyu_gspo_npu.sh").read_text(encoding="utf-8")
-        first_python = re.search(r"^\s*python3 -m pip install[^\n]*\n", text, re.MULTILINE)
-        self.assertIsNotNone(first_python)
-        # Installation lives in a case statement; include the matching esac.
-        setup_end = text.index("\nesac\n", first_python.end()) + len("\nesac\n")
-        capture = self.capture("git() { return 0; }\n" + text[:setup_end],
-                               updates={"HUANYU_SKIP_EDITABLE_INSTALL": "0"})
-        self.assertEqual(capture["argv"][:3], ["-m", "pip", "install"])
-        for key in CORE:
-            self.assertEqual(capture["env"][key], "1")
-        environment = (EXAMPLES / "env_export_huanyu.sh").read_text(encoding="utf-8")
-        self.assertLess(environment.index('/precision_mode.sh"'), environment.index("pip install"))
+        self.assertLess(text.index('huanyu_configure_precision_mode "$@"\n'), text.index("$(python3"))
+        environment = (EXAMPLES / "run_huanyu_32card_job.sh").read_text(encoding="utf-8")
+        self.assertLess(environment.index('huanyu_configure_precision_mode "$@" || {'),
+                        environment.index("pip install"))
 
     def test_final_training_argv_overrides_stale_ray_precision_for_all_modes(self):
         text = (EXAMPLES / "run_qwen36_huanyu_gspo_npu.sh").read_text(encoding="utf-8")
@@ -181,7 +174,7 @@ class PrecisionModeTests(unittest.TestCase):
         self.assertIsNotNone(start)
         setup = (
             SOURCE + 'source "${PROJECT_ROOT}/examples/qwen3_6_huanyu/graph_mode.sh"\n'
-            + "_CHAT_TEMPLATE_ARGS=()\n_DATASET_ARGS=()\n"
+            + "_CHAT_TEMPLATE_ARGS=()\n_HUANYU_MODEL_ARGS=() FILTER_OVERLONG=false\n"
             + "TRAIN_FILE=train.parquet VAL_FILE=validation.parquet MODEL_PATH=model\n"
             + "MAX_PROMPT_LENGTH=4096 MAX_RESPONSE_LENGTH=2048 MAX_TOKEN_LEN_PER_GPU=6272\n"
             + "ROLLOUT_NUM_WORKERS=4 PROJECT_NAME=test EXPERIMENT_NAME=test\n"

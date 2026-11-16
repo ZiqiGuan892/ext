@@ -15,7 +15,7 @@ import numpy as np
 import torch
 
 
-SCRIPT = Path(__file__).resolve().parents[1] / "examples/huanyu_audio_probe.py"
+SCRIPT = Path(__file__).resolve().parents[1] / "audio_probe.py"
 spec = importlib.util.spec_from_file_location("huanyu_audio_probe_cpu", SCRIPT)
 probe = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(probe)
