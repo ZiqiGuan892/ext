@@ -2,8 +2,8 @@
 
 Variable-size batches change BF16 encoder arithmetic. Audio padding also changes
 the encoder boundary unless each chunk is cropped before convolution. Frozen
-towers stay unsharded through these local calls; the outer actor hook releases
-them uniformly across ranks.
+towers stay unsharded through these local calls; the base-forward FSDP guard
+releases them uniformly across ranks (also for direct PEFT forward calls).
 """
 from functools import wraps
 import os

@@ -61,6 +61,9 @@ class RegistrationTests(unittest.TestCase):
         forward = ModuleType(f"{PACKAGE}.forward")
         self.install_forward = Mock()
         forward.install_huanyu_forward = self.install_forward
+        vision_fsdp = ModuleType(f"{PACKAGE}.vision_fsdp")
+        self.install_vision_fsdp = Mock()
+        vision_fsdp.install_frozen_vision_fsdp = self.install_vision_fsdp
         offload = ModuleType(f"{PACKAGE}.fsdp_offload")
         self.install_offload = Mock()
         offload.install_huanyu_fsdp_offload = self.install_offload
@@ -84,6 +87,7 @@ class RegistrationTests(unittest.TestCase):
             base.__name__: base,
             audio_runtime.__name__: audio_runtime,
             forward.__name__: forward,
+            vision_fsdp.__name__: vision_fsdp,
             offload.__name__: offload,
             precision.__name__: precision,
             entropy.__name__: entropy,
@@ -170,6 +174,7 @@ class RegistrationTests(unittest.TestCase):
         self.attach.assert_called_once_with(self.model, self.config)
         self.install_offload.assert_called_once_with(self.model)
         self.visual_patch.assert_called_once_with(self.model)
+        self.install_vision_fsdp.assert_called_once_with(self.model)
         self.install_forward.assert_called_once_with(
             self.model, start_token_id=10, end_token_id=11, placeholder_token_id=12)
         for part in (self.model.model.audio_encoder, self.model.model.audio_projection, self.model.model.visual):
@@ -217,6 +222,7 @@ class RegistrationTests(unittest.TestCase):
         with patch.dict(os.environ, {"HUANYU_USE_PRECOMPUTE": "1", "HUANYU_EMBED_CACHE_DIR": "huanyu-cache"}):
             self.adapter.configure_model(self.model, self.config)
         self.install_entropy.assert_called_once_with()
+        self.install_vision_fsdp.assert_not_called()
         self.install_forward.assert_called_once_with(
             self.model, start_token_id=10, end_token_id=11, placeholder_token_id=12,
             use_precompute=True, image_token_id=13, video_token_id=16, spatial_merge_size=2,

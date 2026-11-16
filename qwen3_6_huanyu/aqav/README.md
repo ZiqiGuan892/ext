@@ -303,6 +303,59 @@ FSDP reshard 策略、各 rank 图像/视觉块调用次数和未完成 collecti
 本地 16 项 CPU 回归通过，含真实定时抓栈、两类入口计数、梯度和 OOM/视觉异常保留；
 发布目录内与媒体边界、forward、注册一起验证共 67 项通过。尚未验证本次 NPU 训练卡点已解决。
 
+### 冻结视觉塔在逐张编码时的 FSDP 参数生命周期
+
+同一作业后续补充的服务器源码和配置确认：`reshard_after_forward=True`，
+`apply_fsdp2` 对所选子模块传入这一设置；视觉隔离包装会逐张直接调用原生视觉前向。
+原有视觉 pre-hook 只在进入整个视觉塔时 unshard 一次，内部视觉块却会在每张图后
+重新分片。因此，一张图的 rank 可以进入语言层，而多张图的 rank 再次聚合视觉块参数；
+零图片的 rank 还会跳过整个视觉 pre-hook。这构成实际的集合通信顺序风险。
+此前的 Python 栈与这个风险相符，但尚未由 NPU 重跑证实它就是本次卡死的全部原因。
+
+`vision_fsdp.py` 的修复在在线 Huanyu 基础模型的 `forward` 方法上管理冻结视觉参数：
+
+1. 每次前向按相同模块名顺序发现视觉 FSDP 单元，先统一回到分片状态，再 unshard；
+   无图片的 rank 也走这一步。发现放在运行时，因为 PEFT/FSDP 包装晚于 adapter 配置。
+2. 仅这些冻结视觉单元设置 `set_reshard_after_forward(False, recurse=False)`，
+   让同次前向中的多张图片、视频共享已聚合的参数，不在每张图之间重新聚合。
+3. 整次基础模型前向结束或抛错时，显式 reshard 释放视觉参数。原始异常继续传播；
+   清理失败会附在原异常上，不能用清理错误掩盖图片错误或 OOM。
+
+普通 `model(...)` 和 PEFT 的 `model.forward(...)` 都覆盖。缓存媒体模式不安装此包装，
+可训练视觉塔不由它管理。语言层和音频的 FSDP 策略、原生视觉数值计算、GDN/RMS/MoE、
+图模式、LoRA 和 replay 配置保持原值；不是全模型关闭 `reshard_after_forward`。
+代价是完整冻结视觉参数驻留到基础模型前向结束，无图 rank 也需聚合，可能增加显存峰值。
+因此仍须观察本次 NPU 单步的内存及 forward 是否返回，不能仅凭 CPU 测试宣告修复成功。
+
+更新 `thinker_adapter.py`、新增的 `vision_fsdp.py` 后启动新作业，无需新增开关。
+前两次受管理的模型调用打印：
+
+```text
+[huanyu-vision-fsdp] installed scope=frozen_visual entrypoints=module_call,direct_forward
+[huanyu-vision-fsdp] phase=enter rank=... call=1 units=28
+[huanyu-vision-fsdp] phase=gathered rank=... call=1 units=28
+[huanyu-vision-fsdp] phase=released rank=... call=1 units=28
+```
+
+`units` 以实际包装结果为准；`gathered` 表示 Python unshard 调用已返回，不保证全部异步设备
+工作已经完成。继续开启 `HUANYU_TRAIN_HANG_DIR`，并从各 rank 的阶段记录和超时栈核对进展。
+`released` 在异常清理成功时也会打印，不能单凭这一行判断训练成功。
+
+CPU 测试复现旧实现的一图/多图 gather 序列分歧，并验证修复后的无图、多图、图片加视频、
+连续调用、直接 forward、梯度、异常释放、缓存入口及探针兼容性；不模拟 HCCL/设备流。
+可运行新增回归和集成检查：
+
+```bash
+TORCH_COMPILE_DISABLE=1 TORCHINDUCTOR_DISABLE=1 python3 -m pytest -q \
+  "$PROJECT_ROOT/verl_omni_ext/models/qwen3_6_huanyu/tests"/test_{vision_fsdp,registration,train_hang_probe}_on_cpu.py
+```
+
+本次与媒体边界、processor、在线/缓存 forward、视频、音频、注册、位置及诊断的相关
+回归共 196 项通过，发布目录内也通过同组测试。额外运行 `test_precision_on_cpu.py`
+时有一条既有日志字符串断言失败：实际输出增加了 `npu_kernel=0` 字段，旧断言仍要求
+`already=1 native=1` 连在一起；在修改前提交 `8bb28f3` 上复现相同失败，未计入上述通过数。
+这些结果只代表 CPU 契约验证，尚无本次 16 卡 NPU 成功结果。
+
 ### Rollout 后处理中的图像 token 不匹配
 
 另一轮作业在 `_compute_score -> _compute_multi_modal_inputs` 报告

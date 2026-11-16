@@ -211,6 +211,10 @@ class Qwen36HuanyuThinkerAdapter(OmniModelBase):
             cache_args = dict(encode_audio=encode_trainable_huanyu_audio, require_audio_only=True)
         install_huanyu_actor_precision(module)
         install_huanyu_forward(module, **token_ids, **cache_args)
+        if not use_cache:
+            from .vision_fsdp import install_frozen_vision_fsdp
+
+            install_frozen_vision_fsdp(module)
         # old_log_prob may call the unchunked verl utility despite the engine
         # chunk flags. Install here, after Huanyu validation/loading succeeds.
         install_huanyu_entropy_chunking()
