@@ -217,6 +217,59 @@ bash "$AVQA/run.sh"
 
 如果图捕获 OOM 或不兼容，用 `AVQA_OPTIMIZED=0 HUANYU_GRAPH_MODE=0` 做一次明确标记的原算子/eager 对照；不要自动缩小正式 batch、LoRA 或长度预算后仍称作相同配置。图开关默认 1，正式参数也可以通过末尾 Hydra 参数覆盖，所有覆盖会写入运行记录。
 
+## 首次 old_log_prob 挂起的诊断
+
+2026-11-16 的失败作业在首次训练侧多模态 forward 后出现 HCCL watchdog。
+rank 4 / PID 432602 的 Ray 日志是 `12:37:34 ... killed because the job 04000000 finished`，
+属于作业退出清理；该记录不能作为“rank 4 提前被 OOM 杀死”的证据。
+16 个 Actor 都打印过 `visual unshard ... call=1 n=28/28 failed=(none)`，但这只说明主机侧
+unshard 调用走到日志位置，不能证明视觉 forward 或异步设备通信完成。
+现有日志没有显式图片解码异常或 NPU OOM；内核日志无权限，因此仍不能排除主机 OOM。
+没有时间戳的 `TBE ... main process disappeared` 和 `kernel_meta ... Directory not empty`
+也不足以证明最早故障来自编译目录。
+
+下一次复现保持原 batch、n、长度预算和优化开关，只增加诊断并限制为一个训练 step：
+
+```bash
+RUN_DIR="$PROJECT_ROOT/runs/avqa_hang_$(date +%Y%m%d_%H%M%S)"
+HANG_DIR="/tmp/$(basename "$RUN_DIR")"
+printf 'RUN_DIR=%s\nHANG_DIR=%s\n' "$RUN_DIR" "$HANG_DIR"
+
+RUN_DIR="$RUN_DIR" AVQA_OPTIMIZED=1 HUANYU_GRAPH_MODE=1 \
+AVQA_TRAIN_FILE=/opt/huawei/dataset/infra_data/data/avqa_r1_6k_2748_filtered/train.parquet \
+AVQA_VAL_FILE=/opt/huawei/dataset/infra_data/data/avqa_r1_6k_2748_filtered/validation.parquet \
+HUANYU_TRAIN_HANG_DIR="$HANG_DIR" \
+bash "$PROJECT_ROOT/verl_omni_ext/models/qwen3_6_huanyu/aqav/run.sh" \
+  data.filter_overlong_prompts=false \
+  trainer.total_training_steps=1 trainer.test_freq=-1 trainer.save_freq=-1
+```
+
+`/tmp` 仅用于逐进程诊断文件，避免共享目录写入干扰；没有修改训练工作目录，不能把它当作修复。
+脚本会将三个 `HUANYU_TRAIN_HANG_*` 变量显式传入 Ray worker。先确认 console 中每个 Actor
+都有 `[huanyu-train-hang] installed`。默认每进程只观测前两次模型调用，可用
+`HUANYU_TRAIN_HANG_CALLS` 调整；不是训练 step 数。每次调用超过 120 秒未退出，就重复保存
+Python 线程栈，不杀进程；阈值用 `HUANYU_TRAIN_HANG_SECONDS` 调整。计时从整个模型调用入口
+开始，长调用出现线程栈并不自动等于故障。
+
+出现停滞时即可在**同一容器**查看，不必等 HCCL 超时：
+
+```bash
+python3 "$PROJECT_ROOT/verl_omni_ext/models/qwen3_6_huanyu/train_hang_probe.py" "$HANG_DIR"
+# 从上面输出的 python_stacks 路径选择 rank 4 及一个其他 rank，查看完整线程栈。
+```
+
+每个 `*.jsonl` 记录视觉/音频/语言模型及视觉块、语言层的进入/返回、输入 shape、调用次数、
+主机 RSS 和 cgroup v2 指标，以及 NPU allocator 当前/峰值统计；每 15 秒的 heartbeat 只读主机指标。
+探针不复制张量、不读张量值、不增加设备 synchronize。NPU allocator 不代表整张卡的全部占用；
+峰值没有清零，包含之前的分配。对 `memory.events` 必须比较同一 cgroup 前后的增量，非零历史
+计数不能单独归因到本次任务，读取失败也不表示没有 OOM。
+
+`scope_return` 表示 Python 返回，不保证异步设备完成。安装在探针之后的 FSDP pre/post hook
+可能位于这些阶段之外，最终等待位置应以 `*.stacks.txt` 为准。Python 栈也不能代替 NPU 算子栈。
+探针使用进程级 `faulthandler.dump_traceback_later` 定时器，本次不要同时启用其他同类 watchdog。
+若异常可传播，会记录原 traceback 并重新抛出；若进程被 SIGKILL，无法保证保存最后一条记录。
+当前只有 CPU 契约/超时落盘验证，真实 NPU 卡点仍需这次复现结果确认。
+
 ## 判断是否学到了有效行为
 
 ```bash

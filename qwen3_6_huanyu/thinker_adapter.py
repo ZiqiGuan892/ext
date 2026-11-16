@@ -235,6 +235,10 @@ class Qwen36HuanyuThinkerAdapter(OmniModelBase):
         from .kernel_perf.finite_probe import install_finite_probe
 
         install_finite_probe(module)
+        # 独立于 rollout profiler：只记录训练侧阶段、内存和超时线程栈。
+        from .train_hang_probe import install_train_hang_probe
+
+        install_train_hang_probe(module)
         logger.info("Huanyu training adapter selected: alias=%s, HF architecture=%s, huanyu_freeze_audio=%s, "
                     "train_encoder=%s, train_projector=%s, cache=%s",
                     TRAINING_ARCHITECTURE, module.config.architectures, freeze_audio,
