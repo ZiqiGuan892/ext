@@ -270,6 +270,39 @@ python3 "$PROJECT_ROOT/verl_omni_ext/models/qwen3_6_huanyu/train_hang_probe.py" 
 若异常可传播，会记录原 traceback 并重新抛出；若进程被 SIGKILL，无法保证保存最后一条记录。
 当前只有 CPU 契约/超时落盘验证，真实 NPU 卡点仍需这次复现结果确认。
 
+### PEFT 直接调用 forward 时的探针覆盖
+
+2026-11-16 的 `avqa_2748_mediafix_step1_20261116_154718` 作业确认服务器 PEFT 0.20.0
+的 `BaseTuner.forward` 使用 `self.model.forward(*args, **kwargs)`。它绕过基础模型的
+根模块 pre/post hook，因此旧探针可能一直显示 `call=0 last_event=installed`，即使音频
+处理和视觉 unshard 已经执行；此时显示的主机内存只是安装快照，超时抓栈也没有启动。
+
+该作业在约 16:03:57 进入训练侧多模态路径，16:14:17–18 的 rank 0/1 报告
+`ALLGATHER seq_num 2904/2905 dispatch timeout`，当前算子为 `aclnnInplaceCopy`。
+这证明媒体 token 修复后仍存在训练侧等待问题，不能把 `call=0` 解释为仍在等待 rollout。
+上述设备日志尚不足以认定 OOM、图片损坏或具体卡死算子，也不能证明某次 all-gather
+已经完成；需要 Python 栈与各 rank 的阶段记录继续定位。
+
+同一作业随后通过 `py-spy dump --nonblocking --pid ...` 抓到存活 Actor 的栈：
+rank 0/1（PID 619545/619546）在 `compute_log_prob` 的语言模型路径，栈顶为
+`torch_chunk_gated_delta_rule_fast`（`gdn_kernels.py:154`）；rank 4（PID 619549）仍在
+`get_image_features` 的视觉前向（服务器 `modeling_qwen3_5_moe.py:1057`）。
+这缩小了排查范围，但不同 rank 的单次栈快照不等于通信顺序错误的证明，也不能据此
+判定 GDN 算子故障或所有图像均已成功处理。下一步核对服务器对应行、视觉塔的
+FSDP reshard 策略、各 rank 图像/视觉块调用次数和未完成 collective。
+
+探针现在保留根模块 hook，同时在直接 `forward()` 的包装入口补齐启动/结束逻辑，
+两条路径共用采集预算，正常调用不重复计数。直接调用抛错时也会保存原异常并结束计时。
+音频阶段覆盖实际的 `model.audio_encoder` / `model.audio_projection`。不修改 PEFT、
+模型数值运算、通信配置或训练配方，不增加设备同步。
+
+同步 `train_hang_probe.py` 后需要启动新作业，原来的单步启动命令和三项诊断变量不变。
+新版本安装日志应包含 `entrypoints=module_hook,direct_forward`，报告会打印本次实际入口
+`entrypoint: direct_forward` 或 `module_hook`。仅有 `installed` 不代表 forward 未执行。
+120 秒未返回时，从报告列出的 `*.stacks.txt` 读取完整线程栈，无需等到 HCCL 超时。
+本地 16 项 CPU 回归通过，含真实定时抓栈、两类入口计数、梯度和 OOM/视觉异常保留；
+发布目录内与媒体边界、forward、注册一起验证共 67 项通过。尚未验证本次 NPU 训练卡点已解决。
+
 ### Rollout 后处理中的图像 token 不匹配
 
 另一轮作业在 `_compute_score -> _compute_multi_modal_inputs` 报告

@@ -6,6 +6,8 @@ event means Python returned, not that asynchronous NPU work completed. FSDP
 hooks installed later may execute outside these module scopes; use the stack
 dump to identify the actual wait. This probe owns faulthandler's process-wide
 dump_traceback_later timer while a selected forward is active.
+Both module(...) and direct module.forward(...) calls are observed: PEFT can
+use the latter, bypassing the base model's root module hooks.
 """
 
 import atexit
@@ -60,7 +62,8 @@ def _metadata(value, depth=0):
 
 
 def _selected(name):
-    return (name in ("model.visual", "audio_encoder", "audio_projection", "model.language_model", "lm_head")
+    return (name in ("model.visual", "audio_encoder", "audio_projection", "model.audio_encoder",
+                     "model.audio_projection", "model.language_model", "lm_head")
             or re.fullmatch(r"model\.visual\.(patch_embed|merger|blocks\.\d+)", name) is not None
             or re.fullmatch(r"model\.language_model\.(embed_tokens|norm|layers\.\d+(\.(self_attn|linear_attn|mlp))?)",
                             name) is not None)
@@ -125,8 +128,8 @@ class TrainHangProbe:
                 # faulthandler timer still works if Python cannot obtain the GIL.
                 self.emit("heartbeat", last_phase=self.phase, memory=_host_memory())
 
-    def root_enter(self, module, args, kwargs):
-        if self.call >= self.limit:
+    def root_enter(self, module, args, kwargs, *, entrypoint="module_hook"):
+        if self.closed.is_set() or self.active or self.call >= self.limit:
             return
         self.call += 1
         self.active, self.returned, self.failed = True, False, False
@@ -138,7 +141,8 @@ class TrainHangProbe:
         self.stacks.write(f"\ncall={self.call} rank={self.rank} started={time.time()}\n")
         self.stacks.flush()
         faulthandler.dump_traceback_later(self.seconds, repeat=True, file=self.stacks, exit=False)
-        self.emit("forward_enter", inputs=_metadata({"args": args, **kwargs}), memory=self.memory())
+        self.emit("forward_enter", entrypoint=entrypoint,
+                  inputs=_metadata({"args": args, **kwargs}), memory=self.memory())
 
     def root_exit(self, module, args, kwargs, output):
         if not self.active:
@@ -190,8 +194,18 @@ def install_train_hang_probe(module):
 
     @wraps(original)
     def forward(self, *args, **kwargs):
+        # PEFT BaseTuner.forward may call self.model.forward directly. In that
+        # path neither root hook runs. Own the diagnostic lifetime here only
+        # when the module pre-hook has not already started it; ordinary calls
+        # retain coverage of the module's remaining pre/post hooks.
+        direct_call = not probe.active
+        if direct_call:
+            probe.root_enter(self, args, kwargs, entrypoint="direct_forward")
         try:
             output = original(*args, **kwargs)
+            if probe.active:
+                probe.returned = True
+            return output
         except BaseException as exc:
             if probe.active:
                 probe.failed = True
@@ -203,9 +217,9 @@ def install_train_hang_probe(module):
                     # preserve the original exception and its traceback.
                     pass
             raise
-        if probe.active:
-            probe.returned = True
-        return output
+        finally:
+            if direct_call:
+                probe.root_exit(self, args, kwargs, None)
 
     module.forward = MethodType(forward, module)
     probe.handles.append(module.register_forward_pre_hook(probe.root_enter, prepend=True, with_kwargs=True))
@@ -221,7 +235,8 @@ def install_train_hang_probe(module):
         probe.handles.append(child.register_forward_pre_hook(before, prepend=True, with_kwargs=True))
         probe.handles.append(child.register_forward_hook(after))
     module._huanyu_train_hang_probe = probe
-    print(f"[huanyu-train-hang] installed pid={probe.pid} files={probe.path}.* "
+    print(f"[huanyu-train-hang] installed entrypoints=module_hook,direct_forward "
+          f"pid={probe.pid} files={probe.path}.* "
           f"calls={calls} stack_after={seconds}s", flush=True)
     return probe
 
@@ -245,7 +260,12 @@ def report(directory):
         last = rows[-1]
         print(f"\nrank={last['rank']} pid={last['pid']} call={last['call']} "
               f"last_event={last['event']} incomplete={incomplete}\nfile={path}")
+        if last["call"] == 0:
+            print("No forward observed by this probe; this does not prove that the model has not run.")
         current = [r for r in rows if r["call"] == last["call"]]
+        entry = next((r for r in current if r["event"] == "forward_enter"), None)
+        if entry:
+            print("entrypoint:", entry.get("entrypoint", "legacy/unknown"))
         phases = [r for r in current if r["event"] in ("scope_enter", "scope_return", "forward_enter", "forward_exit")]
         for row in phases[-6:]:
             print(f"  {row['time']:.3f} {row['event']} {row.get('scope', '')} {row.get('occurrence', '')}")
