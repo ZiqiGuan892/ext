@@ -16,6 +16,7 @@ import numpy as np
 import torch
 
 from .audio_chunking import AUDIO_CHUNK_POLICY, prepare_audio_waveform
+from .media_boundary import media_text_token_id, prompt_only_ids, trajectory_prompt_view
 
 
 IMAGE_PATTERN = "(<image>./</image>)"
@@ -40,6 +41,61 @@ def _items(value):
     if value is None:
         return []
     return list(value) if isinstance(value, (tuple, list)) else [value]
+
+
+def _media_error_context(processor, output, input_ids):
+    """Summarize marker locations on an error without decoding text or media.
+
+    Never copy NPU tensors for diagnostics or infer where the response starts
+    from the number of image tokens. AgentLoop supplies the actual two lists.
+    """
+    def flat_ids(value):
+        if isinstance(value, torch.Tensor):
+            if value.device.type != "cpu":
+                return None
+            if value.ndim == 2 and value.shape[0] == 1:
+                value = value[0]
+            if value.ndim != 1:
+                return None
+            return value.tolist()
+        if isinstance(value, (list, tuple)) and all(isinstance(token, (int, np.integer)) for token in value):
+            return [int(token) for token in value]
+        return None
+
+    def runs(ids, marker):
+        if ids is None:
+            return {"available": False}
+        ranges, start, count = [], None, 0
+        for index, token in enumerate(ids):
+            if token == marker:
+                count += 1
+                if start is None:
+                    start = index
+            elif start is not None:
+                ranges.append([start, index - start])
+                start = None
+        if start is not None:
+            ranges.append([start, len(ids) - start])
+        return {"token_count": count, "run_count": len(ranges),
+                "runs_offset_length": ranges[:16], "runs_truncated": len(ranges) > 16}
+
+    sequences = {"prompt": flat_ids(_get(output, "prompt_ids")),
+                 "response": flat_ids(_get(output, "response_ids")),
+                 "input": flat_ids(input_ids)}
+    context = {"pid": os.getpid(),
+               "lengths": {key: len(ids) if ids is not None else None for key, ids in sequences.items()},
+               "input_equals_prompt_plus_response": None, "markers": {}}
+    if all(ids is not None for ids in sequences.values()):
+        context["input_equals_prompt_plus_response"] = sequences["input"] == sequences["prompt"] + sequences["response"]
+    for name in ("image_token_id", "video_token_id", "vision_start_token_id", "vision_end_token_id",
+                 "audio_start_token_id", "audio_end_token_id"):
+        marker = getattr(processor, name, None)
+        if marker is None:
+            marker = _get(processor.config, name)
+        if marker is not None:
+            context["markers"][name] = {"token_id": int(marker),
+                                        **{key: runs(ids, int(marker)) for key, ids in sequences.items()}}
+    return context
 
 
 class HuanyuProcessor:
@@ -317,12 +373,23 @@ class HuanyuProcessor:
             "image_bound": torch.tensor(image_bounds, dtype=torch.long).reshape(-1, 2),
         }
 
-    def build_multi_modal_inputs(self, input_ids, multi_modal_data, mm_processor_kwargs=None):
+    def build_multi_modal_inputs(self, input_ids, multi_modal_data, mm_processor_kwargs=None,
+                                 *, prompt_ids=None, response_ids=None):
+        prompt_lengths = None
+        if prompt_ids is not None or response_ids is not None:
+            if prompt_ids is None or response_ids is None:
+                raise ValueError("Huanyu media binding needs both prompt_ids and response_ids")
+            input_ids, prompt_lengths = trajectory_prompt_view(
+                input_ids, prompt_ids, response_ids, getattr(self.tokenizer, "pad_token_id", None),
+                text_token_id=media_text_token_id(self.config),
+            )
         data = multi_modal_data or {}
         kwargs = dict(mm_processor_kwargs or {})
         vision = {**self._vision(data.get("images")), **self._video(data.get("videos"))}
         features, lengths, groups = self._audio(data.get("audios"), kwargs.get("sampling_rate", self.sampling_rate))
         inputs = {**vision, **self._bound_inputs(input_ids, features, lengths, groups, vision)}
+        if prompt_lengths is not None:
+            inputs["huanyu_prompt_lengths"] = prompt_lengths
         self._use_embedding_cache(inputs, vision, features, lengths)
         return inputs
 
@@ -458,6 +525,19 @@ def install_agent_loop_bridge():
             candidates.append(modified)
     installed = 0
     for cls in dict.fromkeys(candidates):
+        position_method = getattr(cls, "_compute_position_ids", None)
+        if callable(position_method) and not getattr(position_method, "_huanyu_prompt_positions", False):
+            def positions(self, input_ids, attention_mask, multi_modal_inputs, *args,
+                          _original=position_method, **kwargs):
+                if isinstance(getattr(self, "processor", None), HuanyuProcessor):
+                    input_ids = prompt_only_ids(
+                        input_ids, (multi_modal_inputs or {}).get("huanyu_prompt_lengths"), attention_mask,
+                        text_token_id=media_text_token_id(self.processor.config),
+                    )
+                return _original(self, input_ids, attention_mask, multi_modal_inputs, *args, **kwargs)
+
+            positions._huanyu_prompt_positions = True
+            setattr(cls, "_compute_position_ids", positions)
         original = getattr(cls, "_compute_multi_modal_inputs", None)
         if original is None:
             continue
@@ -468,9 +548,25 @@ def install_agent_loop_bridge():
         def build(self, output, input_ids, _original=original):
             if not isinstance(getattr(self, "processor", None), HuanyuProcessor):
                 return _original(self, output, input_ids)
-            return self.processor.build_multi_modal_inputs(
-                input_ids, output.multi_modal_data, getattr(output, "mm_processor_kwargs", None)
-            )
+            try:
+                inputs = self.processor.build_multi_modal_inputs(
+                    input_ids, output.multi_modal_data, getattr(output, "mm_processor_kwargs", None),
+                    prompt_ids=getattr(output, "prompt_ids", None), response_ids=getattr(output, "response_ids", None),
+                )
+                if "huanyu_prompt_lengths" in inputs and not getattr(self, "_huanyu_media_boundary_reported", False):
+                    print("[huanyu-media-boundary] prompt_only=true response_embeddings=original", flush=True)
+                    self._huanyu_media_boundary_reported = True
+                return inputs
+            except Exception as exc:
+                try:
+                    context = _media_error_context(self.processor, output, input_ids)
+                    context.update(error_type=type(exc).__name__, error=str(exc))
+                    print("[huanyu-mm-input-error] " + json.dumps(context, ensure_ascii=True), flush=True)
+                except Exception:
+                    # Preserve the original media/OOM exception even if its
+                    # diagnostic allocation or output stream also fails.
+                    pass
+                raise
 
         build._huanyu_bridge = True
         setattr(cls, "_compute_multi_modal_inputs", build)

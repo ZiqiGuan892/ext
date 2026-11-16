@@ -1,6 +1,8 @@
 """CPU checks for the Huanyu multimodal data contract, without model weights."""
 
 import importlib.util
+from contextlib import redirect_stdout
+import io
 import json
 from pathlib import Path
 import re
@@ -323,6 +325,72 @@ class HuanyuProcessorTests(unittest.TestCase):
         self.assertEqual(worker._compute_multi_modal_inputs(output, torch.tensor([[1000]])), "original")
         worker.processor = processor()
         self.assertIn("huanyu_audio_features", worker._compute_multi_modal_inputs(output, torch.tensor([[1000]])))
+
+    def test_generated_image_markers_do_not_bind_media_or_mutate_trajectory(self):
+        class Worker:
+            def _compute_multi_modal_inputs(self, output, input_ids):
+                raise AssertionError("Huanyu must use its processor")
+
+        modules = {
+            "verl.experimental.agent_loop.agent_loop": SimpleNamespace(AgentLoopWorker=Worker),
+            "verl.trainer.ppo.v1.agent_loop_tq": SimpleNamespace(AgentLoopWorkerTQ=Worker),
+        }
+        with patch.object(processor_module.importlib, "import_module", side_effect=modules.__getitem__):
+            processor_module.install_agent_loop_bridge()
+        for expected, extra, grid in ((165, 1, [1, 22, 30]), (880, 2, [1, 40, 88])):
+            with self.subTest(expected=expected, extra=extra):
+                worker = Worker()
+                worker.processor = processor()
+                worker.processor.image_processor = lambda **kw: {
+                    "pixel_values": torch.zeros(expected * 4, 24), "image_grid_thw": torch.tensor([grid])}
+                prompt = [14] + [13] * expected + [15, 1000]
+                response = [1001] + [13] * extra + [1002]
+                output = SimpleNamespace(prompt_ids=prompt[:], response_ids=response[:],
+                                         multi_modal_data={"images": [object()]})
+                ids = torch.tensor(prompt + response)
+                original_ids = ids.clone()
+                stdout = io.StringIO()
+                with redirect_stdout(stdout):
+                    rebuilt = worker._compute_multi_modal_inputs(output, ids)
+                self.assertEqual(rebuilt["image_bound"].tolist(), [[1, 1 + expected]])
+                self.assertEqual(rebuilt["huanyu_prompt_lengths"].tolist(), [len(prompt)])
+                context = processor_module._media_error_context(worker.processor, output, ids)
+                self.assertTrue(context["input_equals_prompt_plus_response"])
+                self.assertEqual(context["markers"]["image_token_id"]["prompt"]["token_count"], expected)
+                self.assertEqual(context["markers"]["image_token_id"]["response"]["runs_offset_length"], [[1, extra]])
+                self.assertNotIn("[huanyu-mm-input-error]", stdout.getvalue())
+                self.assertEqual(output.prompt_ids, prompt)
+                self.assertEqual(output.response_ids, response)
+                torch.testing.assert_close(ids, original_ids)
+        original_error = ValueError("original alignment error")
+        with patch.object(worker.processor, "build_multi_modal_inputs", side_effect=original_error), \
+                patch.object(processor_module, "_media_error_context", side_effect=MemoryError("diagnostic OOM")):
+            with self.assertRaises(ValueError) as caught:
+                worker._compute_multi_modal_inputs(output, ids)
+        self.assertIs(caught.exception, original_error)
+
+    def test_alignment_context_does_not_misattribute_bad_prompt_to_response(self):
+        proc = processor()
+        output = SimpleNamespace(prompt_ids=[14, 13, 15, 1000, 13], response_ids=[1001, 1002])
+        context = processor_module._media_error_context(proc, output, torch.tensor(output.prompt_ids + output.response_ids))
+        self.assertEqual(context["markers"]["image_token_id"]["prompt"]["runs_offset_length"], [[1, 1], [4, 1]])
+        self.assertEqual(context["markers"]["image_token_id"]["response"]["token_count"], 0)
+        # Incomplete or padded inputs are explicitly reported, never guessed.
+        context = processor_module._media_error_context(proc, output, torch.tensor([0] + output.prompt_ids + output.response_ids))
+        self.assertFalse(context["input_equals_prompt_plus_response"])
+        context = processor_module._media_error_context(proc, SimpleNamespace(), torch.tensor([13]))
+        self.assertIsNone(context["input_equals_prompt_plus_response"])
+        self.assertFalse(context["markers"]["image_token_id"]["response"]["available"])
+
+    def test_alignment_context_caps_runs_and_does_not_copy_device_tensors(self):
+        context = processor_module._media_error_context(
+            processor(), SimpleNamespace(prompt_ids=[1000], response_ids=[13, 1000] * 20),
+            torch.empty(2, device="meta", dtype=torch.long))
+        marker = context["markers"]["image_token_id"]
+        self.assertFalse(marker["input"]["available"])
+        self.assertEqual(marker["response"]["token_count"], 20)
+        self.assertEqual(len(marker["response"]["runs_offset_length"]), 16)
+        self.assertTrue(marker["response"]["runs_truncated"])
 
 
 class HuanyuProcessorCheckpointTests(unittest.TestCase):

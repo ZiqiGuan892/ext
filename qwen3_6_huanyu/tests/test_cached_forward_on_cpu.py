@@ -122,6 +122,24 @@ class CachedForwardTests(unittest.TestCase):
         )
         return model
 
+    def test_generated_media_tokens_keep_gradients_through_decoder_recomputation(self):
+        model = self.make_model(recompute=True)
+        ids, kwargs = mixed_inputs()
+        kwargs["huanyu_prompt_lengths"] = kwargs["attention_mask"].sum(-1)
+        ids = torch.cat([ids, torch.tensor([[6, 8, 2, 3]]).expand(len(ids), -1)], dim=-1)
+        kwargs["attention_mask"] = torch.cat([kwargs["attention_mask"], torch.ones(len(ids), 4)], dim=-1)
+        kwargs["position_ids"] = torch.arange(ids.numel() * 3).reshape(3, len(ids), -1)
+        recompute_guard = getattr(checkpoint_module, "_run_fn_with_dynamo_disabled", None)
+        guard_context = (patch.object(checkpoint_module, "_run_fn_with_dynamo_disabled", inspect.unwrap(recompute_guard))
+                         if recompute_guard is not None else nullcontext())
+        with guard_context:
+            model(ids, **kwargs).square().sum().backward()
+        self.assertGreaterEqual(model.decoder_calls, 2)
+        self.assertEqual(model.embedding_calls, 1)
+        for marker in (6, 8, 2, 3):
+            self.assertTrue(torch.isfinite(model.embedding.weight.grad[marker]).all())
+            self.assertGreater(float(model.embedding.weight.grad[marker].abs().sum()), 0)
+
     def test_video_temporal_spans_preserve_timestamps_and_mixed_media(self):
         model = self.make_model()
         ids, kwargs = video_inputs()

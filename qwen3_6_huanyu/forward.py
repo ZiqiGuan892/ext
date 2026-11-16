@@ -2,8 +2,9 @@
 
 The initial integration uses padded [B,S] inputs. Audio is encoded by the
 installed vLLM-Omni implementation, then replaces only verified audio slots in
-the token-embedding result. Keeping input_ids in the original HF forward also
-keeps its image/video masks and mRoPE construction intact.
+the token-embedding result. With AgentLoop prompt-length metadata, HF receives
+a structural ID view for media masks/RoPE while the embedding prehook restores
+the original IDs. Generated media markers remain ordinary trainable text.
 """
 
 from contextvars import ContextVar
@@ -17,9 +18,11 @@ from torch.nn import functional as F
 
 from .audio_alignment import find_audio_bounds, insert_audio_embeddings
 from .aqa_position_ids import restore_huanyu_aqa_positions
+from .media_boundary import media_text_token_id, prompt_only_ids
 
 
 _ACTIVE_AUDIO = ContextVar("huanyu_training_audio", default=None)
+_ACTIVE_MEDIA_IDS = ContextVar("huanyu_training_media_ids", default=None)
 _FLAG = "_verl_huanyu_forward_installed"
 
 
@@ -211,6 +214,23 @@ def install_huanyu_forward(module, *, start_token_id, end_token_id, placeholder_
     if use_precompute and require_audio_only:
         raise ValueError("Trainable Huanyu audio requires online encoding, not cached embeddings")
     reported_audio_modes = set()
+    text_token_id = media_text_token_id(
+        getattr(module, "config", {}),
+        (start_token_id, end_token_id, placeholder_token_id, image_token_id, video_token_id),
+    )
+
+    def restore_embedding_ids(embedding_module, args):
+        active = _ACTIVE_MEDIA_IDS.get()
+        if active is None or active["owner"] is not module:
+            return None
+        if not args or args[0] is not active["binding_ids"]:
+            raise RuntimeError("Huanyu media binding encountered an unexpected embedding lookup")
+        active["calls"] += 1
+        # Run the real embedding module, including PEFT/FSDP hooks and autograd,
+        # on the unchanged trajectory IDs. Only masks/RoPE see the binding view.
+        return (active["input_ids"], *args[1:])
+
+    embedding.register_forward_pre_hook(restore_embedding_ids)
 
     def report_audio(chunks, mode):
         # Report only after HF consumed the injected embeddings successfully.
@@ -263,6 +283,7 @@ def install_huanyu_forward(module, *, start_token_id, end_token_id, placeholder_
 
     @wraps(getattr(original_forward, "__func__", original_forward))
     def forward(self, *args, **kwargs):
+        prompt_lengths = kwargs.pop("huanyu_prompt_lengths", None)
         cache_enabled = kwargs.pop("huanyu_cache_enabled", None)
         cached_audio = kwargs.pop("huanyu_cached_audio_embeds", None)
         cached_vision = kwargs.pop("huanyu_cached_vision_embeds", None)
@@ -295,6 +316,29 @@ def install_huanyu_forward(module, *, start_token_id, end_token_id, placeholder_
             kwargs["position_ids"] = restore_huanyu_aqa_positions(kwargs["position_ids"], ids)
         if kwargs.get("inputs_embeds") is not None:
             raise ValueError("Huanyu forward builds audio embeddings from input_ids; inputs_embeds is unsupported")
+        binding_ids = prompt_only_ids(
+            ids, _lengths(prompt_lengths) if prompt_lengths is not None else None,
+            kwargs.get("attention_mask"), text_token_id=text_token_id,
+        )
+
+        def native_forward():
+            if binding_ids is ids:
+                return original_forward(*args, **kwargs)
+            active_ids = {"owner": self, "input_ids": ids, "binding_ids": binding_ids, "calls": 0}
+            token = _ACTIVE_MEDIA_IDS.set(active_ids)
+            native_args, native_kwargs = args, dict(kwargs)
+            if args:
+                native_args = (binding_ids, *args[1:])
+            else:
+                native_kwargs["input_ids"] = binding_ids
+            try:
+                output = original_forward(*native_args, **native_kwargs)
+                if active_ids["calls"] != 1:
+                    raise RuntimeError("HF forward did not consume Huanyu original token embeddings exactly once")
+                return output
+            finally:
+                _ACTIVE_MEDIA_IDS.reset(token)
+
         if use_precompute:
             if _lengths(cache_enabled) != [1] * ids.shape[0]:
                 raise ValueError("Huanyu strict cache mode requires cached inputs for every sample; no online fallback")
@@ -304,7 +348,7 @@ def install_huanyu_forward(module, *, start_token_id, end_token_id, placeholder_
                     and kwargs.get("position_ids") is None):
                 raise ValueError("Huanyu cached images/videos require processor-generated multimodal position_ids")
             samples = _cached_samples(
-                ids, _feature_chunks(cached_audio), _feature_chunks(cached_vision),
+                binding_ids, _feature_chunks(cached_audio), _feature_chunks(cached_vision),
                 _lengths(lengths), _lengths(chunk_counts), _lengths(image_counts),
                 kwargs.get("image_grid_thw"), marker_ids, image_token_id, spatial_merge_size,
                 embedding.weight.shape[-1],
@@ -315,7 +359,7 @@ def install_huanyu_forward(module, *, start_token_id, end_token_id, placeholder_
             active = {"owner": self, "ids": ids, "samples": samples, "calls": 0}
             token = _ACTIVE_AUDIO.set(active)
             try:
-                output = original_forward(*args, **kwargs)
+                output = native_forward()
                 if active["calls"] != 1:
                     raise RuntimeError("HF forward did not consume Huanyu cached embeddings")
                 report_audio(_feature_chunks(cached_audio), "cached_frozen")
@@ -326,7 +370,7 @@ def install_huanyu_forward(module, *, start_token_id, end_token_id, placeholder_
                                                cached_video, video_counts)):
             raise ValueError("Huanyu cached inputs require HUANYU_USE_PRECOMPUTE=1 on training workers")
         batch, lens = _prepare_features(features, lengths)
-        actual_counts = (ids == start_token_id).sum(dim=1).tolist()
+        actual_counts = (binding_ids == start_token_id).sum(dim=1).tolist()
         if require_audio_only:
             if batch is None or any(count == 0 for count in actual_counts):
                 raise ValueError("Huanyu audio training requires audio in every AQA sample on every rank")
@@ -341,11 +385,11 @@ def install_huanyu_forward(module, *, start_token_id, end_token_id, placeholder_
                 raise ValueError("Huanyu per-sample audio counts do not match feature chunks")
         elif batch is not None and ids.shape[0] != 1:
             raise ValueError("Mixed-batch Huanyu audio requires per-sample huanyu_audio_chunk_counts")
-        has_audio_markers = bool(((ids == start_token_id) | (ids == end_token_id)).any())
+        has_audio_markers = bool(((binding_ids == start_token_id) | (binding_ids == end_token_id)).any())
         if batch is None:
             if has_audio_markers:
                 raise ValueError("Audio tokens are present but Huanyu audio features are missing")
-            return audit_mixed_precision(original_forward(*args, **kwargs))
+            return audit_mixed_precision(native_forward())
         if not has_audio_markers:
             raise ValueError("Huanyu audio features are present but audio tokens are missing")
 
@@ -353,7 +397,7 @@ def install_huanyu_forward(module, *, start_token_id, end_token_id, placeholder_
         if len(chunks) != len(lens):
             raise ValueError("Huanyu encoder returned a different number of audio chunks")
         samples, cursor = [], 0
-        for row in ids:
+        for row in binding_ids:
             count = int((row == start_token_id).sum())
             sample_chunks = chunks[cursor:cursor + count]
             bounds = find_audio_bounds(row, [chunk.shape[0] for chunk in sample_chunks], **marker_ids)
@@ -364,7 +408,7 @@ def install_huanyu_forward(module, *, start_token_id, end_token_id, placeholder_
         active = {"owner": self, "ids": ids, "samples": samples, "calls": 0}
         token = _ACTIVE_AUDIO.set(active)
         try:
-            output = original_forward(*args, **kwargs)
+            output = native_forward()
             if active["calls"] != 1:
                 raise RuntimeError("HF forward did not consume Huanyu audio through the input embedding module")
             report_audio(chunks, "online_trainable" if require_audio_only else "online_frozen")

@@ -270,6 +270,70 @@ python3 "$PROJECT_ROOT/verl_omni_ext/models/qwen3_6_huanyu/train_hang_probe.py" 
 若异常可传播，会记录原 traceback 并重新抛出；若进程被 SIGKILL，无法保证保存最后一条记录。
 当前只有 CPU 契约/超时落盘验证，真实 NPU 卡点仍需这次复现结果确认。
 
+### Rollout 后处理中的图像 token 不匹配
+
+另一轮作业在 `_compute_score -> _compute_multi_modal_inputs` 报告
+`image token lengths [165, 1] != image grid lengths [165]`，以及 `[880, 2] != [880]`。
+这是奖励准备阶段的媒体对齐错误，不能当作训练 Actor forward 的 HCCL 卡点。
+完整输入扫描多出一段图像 token，可能来自模型 response；历史日志没有 token 位置，
+不能仅据此认定图片损坏或 OOM。
+
+当前修复对 Huanyu 单轮 AR 训练使用显式 prompt 边界：
+
+1. AgentLoop 提供原始 `prompt_ids` 和 `response_ids`，先校验实际输入与二者拼接一致，
+   仅允许额外的外侧 padding，再用 prompt 校验图片 grid、视频时序组和音频块。
+2. `huanyu_prompt_lengths` 随每条样本的多模态输入传输；RoPE 和训练 forward 根据
+   attention mask 中的有效 token 计数恢复边界，支持重新 padding 和微批次重排。
+3. HF 的媒体 mask/位置编码使用结构视图，把 response 和 padding 当成普通文本；
+   embedding pre-hook 把实际查表参数恢复为原始 token IDs，因此回答中的 `<|image_pad|>`
+   等标记仍保留自己的 token embedding 和梯度，不再消耗输入图片的 features。
+
+不删除/替换保存的轨迹，不改变 response mask、log-prob、奖励或采样参数；不把真实 prompt
+中的不匹配静默截断。没有显式边界的旧调用继续执行全序列严格校验。此契约用于单轮文本输出，
+不支持在 response 中追加需要编码的新媒体（例如多轮工具返回图片）。
+
+须同时同步 `media_boundary.py`、`processor.py` 和 `forward.py`，由新作业的 AgentLoop/Actor
+加载；无需新增启动参数。首次成功构造输入会打印：
+
+```text
+[huanyu-media-boundary] prompt_only=true response_embeddings=original
+```
+
+CPU 回归覆盖 `[165,1]` / `[880,2]`、完整生成媒体标记、左右 padding、混合批次、在线/缓存
+媒体注入、原始 token 的 embedding 梯度及真实 prompt 错误。该修复不等于已解决另一轮的
+`old_log_prob` HCCL 卡死，仍需在 16 卡 NPU 上验证训练能否继续。
+
+本次本地相关回归共 156 项通过，包含 decoder checkpoint 重算。服务器可执行同一组 CPU 测试：
+
+```bash
+TORCH_COMPILE_DISABLE=1 TORCHINDUCTOR_DISABLE=1 python3 -m pytest -q \
+  "$PROJECT_ROOT/verl_omni_ext/models/qwen3_6_huanyu/tests"/test_{media_boundary,processor_bridge,cached_processor,forward,cached_forward,video_pipeline,audio_training,registration,aqa_position_ids}_on_cpu.py
+```
+
+Huanyu AgentLoop 桥接器现在在输入构建异常时输出一行 `[huanyu-mm-input-error]` JSON，包含：
+
+- `lengths`：prompt、response 和实际 input 的长度。
+- `input_equals_prompt_plus_response`：实际输入是否恰好是两者拼接；缺少边界信息时为 null。
+- `markers.image_token_id.prompt/response/input`：分别记录图像 token 总数、连续段数和
+  `runs_offset_length`（零起始位置、长度；每段位置相对于自己的序列）。最多列出 16 段，
+  超出时 `runs_truncated=true`，但总数仍完整。
+- 其他视频、视觉边界和音频边界 token 的同类统计，以及原异常类型和消息。
+
+诊断只在异常时运行，不复制设备张量，不打印文本或媒体内容，仍重新抛出原异常。
+磁盘文件更新不会自动替换已运行进程中的代码。
+在新作业日志中提取：
+
+```bash
+grep -aF '[huanyu-mm-input-error]' "$LOG"
+```
+
+修复后若仍有错误，依据统计区分 prompt 本身不匹配与输入拼接/元数据错误；不要删除回答
+token 或截断 `image_bound` 来绕过校验。
+
+服务器给出的 `_run_prompt` 实现会先等待同组全部 session 结束，再打印异常并写入 `failure`。
+进度行是队列状态快照，不是累计异常数；当前 `failure=0` 不能证明没有轨迹失败，也不能在
+未核对服务器 ReplayBuffer 的消费/补采逻辑前断定失败组已重试或被标为成功。
+
 ## 判断是否学到了有效行为
 
 ```bash
