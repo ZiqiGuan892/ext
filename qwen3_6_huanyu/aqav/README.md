@@ -2,6 +2,10 @@
 
 核对日期：2026-11-12。目标是保留官方公开的 **GPU LoRA 训练配方**，将初始模型替换为 2748、资源替换为单节点 16 张 Ascend NPU。不是仓库另一份 NPU 全参数 AVQA 配方，也不是 Huanyu AQA/GenRM 配方。
 
+发布布局：GitHub `new` 分支中的位置为 `qwen3_6_huanyu/aqav/`；`aqav` 专用分支根目录
+只包含本目录文件。服务器使用时均放回 `$PROJECT_ROOT/verl_omni_ext/models/qwen3_6_huanyu/aqav/`。
+专用分支不是独立训练环境，仍需最新 Huanyu 实现及 `verl_omni_ext/probes/hccl_policy.py`。
+
 ## 已核对的来源与尚未验证的内容
 
 - [官方实验说明](https://github.com/verl-project/verl-omni/tree/main/examples/gspo_trainer) 将曲线标为 `release/v0.2.0`、Qwen3-Omni-30B-A3B-Instruct、4×H800、LoRA r=32；报告训练 reward 约从 0.73 到 0.94，验证 reward mean@1 达到 0.877、348 step。
@@ -13,6 +17,59 @@
 尚未直接取得 [W&B run](https://wandb.ai/verl-omni/gspo_demo/runs/kzzrq9pr) 的完整 config/history；访问该页面的浏览器流程被自动审批拦截，原因是涉及未授权的 `forge.coreweave.com` 域名，已停止访问。以上曲线数值来自官方 README，不能称作已独立复核的 run 数据。
 
 本地测试只验证命令构造、数据标签、媒体路径和奖励契约。尚未在服务器加载 2748、验证 LoRA 梯度/权重同步或获得 reward 曲线。
+
+### 2026-11-16：在同步后的最新代码上重测
+
+本次沿用上述 LoRA 配方，保持 BS128、n16、LoRA32、TP2、16 NPU 和 choice reward，
+通过 `AVQA_OPTIMIZED=1` 开启融合 GDN、RMSNorm、MoE 和 rollout 图模式。
+此模式使用 `kernel_graph` 精度档案，同时关闭与融合 GDN 冲突的 FP32 参考实现。
+不设置该变量时默认 `AVQA_OPTIMIZED=0`，保留原配方的算子路径，作为对照。
+
+**此次暂不启用 route replay**：两种模式均显式设置 `HUANYU_EXPERT_REPLAY=0`、
+`enable_rollout_routing_replay=false`、`enable_return_routed_experts=false`。
+这不表示 LoRA 与 replay 原理上不兼容；当前回放钩子对 PEFT 包装的识别和完整训练链路尚待验证。
+此入口不要求安装 replay 插件，不继承旧终端的 replay、权重同步优化或逐层调试开关。
+融合 MoE 本身可以独立运行，关闭 replay 时使用当前模型正常计算的路由。
+
+rollout 图模式未设置时默认开启；`AVQA_OPTIMIZED=1` 要求 `HUANYU_GRAPH_MODE=1`，
+显式设置为 0 会提前报错。训练侧 `torch.compile` 仍关闭。
+HCCL 明确使用 `aiv / AIV`，调用新探针检查环境一致性；该检查不代表设备通信算法实测。
+
+先同步最新 Huanyu 代码、本次修改的 `run.sh` 和 `verl_omni_ext/probes/hccl_policy.py` 到服务器。
+已有原始 parquet 无需重新下载或转换。已离线过滤的数据只有在 tokenizer、模板、
+媒体预处理和长度上限一致时才继续复用；未确认一致时保留默认长度过滤。
+
+环境和 Ray 已准备好时，可以先用完整 BS/N 跑 10 step，并对比训练前和第 10 步的验证：
+
+```bash
+AVQA="$PROJECT_ROOT/verl_omni_ext/models/qwen3_6_huanyu/aqav"
+export RUN_DIR="$PROJECT_ROOT/runs/avqa_2748_kernel_graph_moe_replay0_step10_$(date +%Y%m%d_%H%M%S)"
+AVQA_OPTIMIZED=1 HUANYU_GRAPH_MODE=1 \
+bash "$AVQA/run.sh" \
+  trainer.total_training_steps=10 \
+  trainer.val_before_train=true \
+  trainer.test_freq=10 \
+  trainer.save_freq=-1 \
+  'trainer.logger=[console]'
+```
+
+这个重测窗口在上述算子/图优化之外，只改变总步数、首次验证和保存频率；每个训练 batch 仍有
+128×16=2048 条轨迹，并非此前 BS16/n8 的 AQA 测试。10 step 无法保证 reward 上涨。
+要继续完整 10 epoch 实验，从原始模型重新执行
+`AVQA_OPTIMIZED=1 HUANYU_GRAPH_MODE=1 bash "$AVQA/run.sh"`，不复用重测目录。
+验证集、奖励和采样参数保持一致，才能解释 reward 的前后变化。
+
+运行后检查 `console.log` 中的 `[avqa] optimized=1 ... replay=0`，以及：
+
+```bash
+grep -aE '\[avqa\]|\[huanyu-kernel\]|trainable params|step:|Initial validation metrics|val-core/avqa_r1_6k/' "$RUN_DIR/console.log"
+```
+
+应有 `actor GDN fused kernel installed`、`actor npu_rms_norm installed`、
+`actor fused MoE installed ... replay=off` 和 `graph mode requested; resolved cudagraph_mode=`。
+这些日志用于确认安装和配置；图实际回放、LoRA 梯度、数值精度及吞吐仍需服务器运行验证。
+本地 CPU 测试验证原配方参数、优化环境与实际 worker 精度策略一致、replay 三处关闭、
+奖励及数据转换/过滤契约，不代表已在 NPU 上完成训练。
 
 ## 参数和适配差异
 
@@ -158,7 +215,7 @@ bash "$AVQA/run.sh"
 
 运行目录保存 `command.sh`、`resolved-config.txt`、`console.log`、checkpoint 和逐样本生成结果。W&B 默认离线，只记录本地文件；如已有账号且希望在线上传，可显式设置 `WANDB_MODE=online`。
 
-如果图捕获 OOM 或不兼容，用 `HUANYU_GRAPH_MODE=0` 做一次明确标记的 eager 排障；不要自动缩小正式 batch、LoRA 或长度预算后仍称作相同配置。该开关默认 1，正式参数也可以通过末尾 Hydra 参数覆盖，所有覆盖会写入运行记录。
+如果图捕获 OOM 或不兼容，用 `AVQA_OPTIMIZED=0 HUANYU_GRAPH_MODE=0` 做一次明确标记的原算子/eager 对照；不要自动缩小正式 batch、LoRA 或长度预算后仍称作相同配置。图开关默认 1，正式参数也可以通过末尾 Hydra 参数覆盖，所有覆盖会写入运行记录。
 
 ## 判断是否学到了有效行为
 

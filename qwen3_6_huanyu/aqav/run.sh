@@ -14,6 +14,18 @@ MODEL_PATH="${AVQA_MODEL_PATH:-/opt/huawei/dataset/model_gy/downloaded_models/27
 Q36_CKPT_DIR="${Q36_CKPT_DIR:-/opt/huawei/dataset/downloaded_models/Qwen3.6-35B-A3B-whisper-0814-rl}"
 RUN_DIR="${RUN_DIR:-$PROJECT_ROOT/runs/avqa_2748_$(date +%Y%m%d_%H%M%S)_$$}"
 REWARD_FILE="$HERE/choice_reward.py"
+AVQA_OPTIMIZED="${AVQA_OPTIMIZED:-0}" # 1：融合 GDN/RMS/MoE + 图模式，保持 LoRA 配方；暂不启用 route replay。
+case "$AVQA_OPTIMIZED" in
+    0) precision=custom; gdn_fp32=1 ;;
+    1)
+        precision=kernel_graph; gdn_fp32=0
+        [[ "${HUANYU_GRAPH_MODE:-1}" == 1 ]] || {
+            echo 'AVQA_OPTIMIZED=1 要求 HUANYU_GRAPH_MODE=1；原配方 eager 对照请用 AVQA_OPTIMIZED=0' >&2
+            exit 2
+        }
+        ;;
+    *) echo 'AVQA_OPTIMIZED 必须为 0 或 1' >&2; exit 2 ;;
+esac
 
 # 原实验显式配置。保持 BS、N、优化器和 LoRA 范围；卡数从 4 改为 16。
 ARGS=(
@@ -114,6 +126,8 @@ ARGS+=(
     "++actor_rollout_ref.model.override_config.huanyu_train_audio_projector=false"
     'actor_rollout_ref.model.exclude_modules=".*talker.*|.*code2wav.*|.*code_predictor.*|.*visual.*|.*audio_tower.*|.*audio_encoder.*|.*audio_projection.*"'
     "actor_rollout_ref.rollout.name=vllm_omni"
+    "actor_rollout_ref.rollout.enable_rollout_routing_replay=false" # 此次 LoRA 重测暂不使用路由回放。
+    "++actor_rollout_ref.rollout.engine_kwargs.vllm_omni.enable_return_routed_experts=false" # 同时关闭引擎路由采集。
     "++actor_rollout_ref.rollout.engine_kwargs.vllm_omni.worker_extension_cls=verl_omni_ext.models.qwen3_6_huanyu.worker_extension.HuanyuColocateWorkerExtension"
     "++actor_rollout_ref.rollout.engine_kwargs.vllm_omni.additional_config.weight_nz_mode=0"
     "reward.reward_model.enable=false"
@@ -123,6 +137,12 @@ ARGS+=(
     "trainer.rollout_data_dir=\"$RUN_DIR/rollout_dump\""
     "trainer.validation_data_dir=\"$RUN_DIR/validation_dump\""
 )
+if [[ "$AVQA_OPTIMIZED" == 1 ]]; then
+    ARGS+=(
+        "++actor_rollout_ref.rollout.engine_kwargs.vllm_omni.mamba_ssm_cache_dtype=bfloat16" # 原生 GDN kernel 使用的状态精度。
+        "++actor_rollout_ref.rollout.engine_kwargs.vllm_omni.additional_config.rl_config.enabled=true" # 引擎 RL 兼容配置。
+    )
+fi
 
 # 清除旧任务的缓存/诊断/精度实验影响，同时显式传给 Ray worker。
 RUNTIME_ENV=(
@@ -145,8 +165,16 @@ RUNTIME_ENV=(
     "MINICPMO_TUNE_AUDIO=0" "MINICPMO_TUNE_VISION=0"
     "MINICPMO_USE_CUSTOM_DATASET=1" "MINICPMO_ENABLE_MM_FORWARD=1"
     "MINICPMO_ALLOW_PACKED_MM_FORWARD=1" "MINICPMO_DISABLE_MM_DEDUP=1"
-    "HUANYU_PRECISION_PROFILE=custom" # 不继承 full 参考模式的强制 eager。
-    "MINICPMO_HUANYU_GDN_FP32_TRAINING=1" # 保留 HF GDN fallback 的 FP32 状态更新保护。
+    "HUANYU_PRECISION_PROFILE=$precision" # 不继承 full 参考模式的强制 eager。
+    # 显式指定整组开关，避免继承此前 AQA 对照实验的零散配置。
+    "MINICPMO_GDN_NPU_KERNEL=$AVQA_OPTIMIZED" "MINICPMO_NPU_RMS_NORM=$AVQA_OPTIMIZED" "MINICPMO_MOE_NPU_KERNEL=$AVQA_OPTIMIZED"
+    "HUANYU_EXPERT_REPLAY=0" "HUANYU_KERNEL_BISECT=none" "HUANYU_REPLAY_DEBUG=0"
+    "HUANYU_MOE_FINITE_DEBUG=0" "HUANYU_FINITE_PROBE=0"
+    "HUANYU_WSYNC_PROFILE=off" "HUANYU_WSYNC_TRACE=off" "HUANYU_WSYNC_VERIFY=0"
+    "HUANYU_WSYNC_LAYOUT=passthrough" "Q36_BACKWARD_PREFETCH=off"
+    "HUANYU_HCCL_PROFILE=aiv" "HCCL_OP_EXPANSION_MODE=AIV" # 新版公共通信策略；同时传给 driver/worker。
+    "MINICPMO_HUANYU_GDN_FP32_TRAINING=$gdn_fp32" # 融合 GDN 与 FP32 参考实现互斥。
+    "MINICPMO_HYBRID_BLOCK_ZERO_REFERENCE=$AVQA_OPTIMIZED" # kernel_graph 档案要求的 hybrid 状态初始化。
     "MINICPMO_ISOLATE_MEDIA_ENCODERS=1" "MINICPMO_HUANYU_LAYERWISE_RELOAD=1"
     "MINICPMO_FSDP2_PIN_MEMORY=0"
     "VLLM_ASCEND_ENABLE_NZ=0" "VLLM_ASCEND_WEIGHT_NZ_MODE=0" "ASCEND_WEIGHT_NZ_MODE=0"
@@ -154,7 +182,7 @@ RUNTIME_ENV=(
     "HUANYU_FULL_WEIGHT_AUDIT_DIR=" "HUANYU_WEIGHT_SYNC_AUDIT_DIR=" "HUANYU_EMBEDDING_AB_DIR="
     "HUANYU_JOB_DETERMINISM=0" "MINICPMO_HANG_PROBE=0"
 )
-for key in MINICPMO_GDN_FP32_REFERENCE MINICPMO_HYBRID_BLOCK_ZERO_REFERENCE \
+for key in MINICPMO_GDN_FP32_REFERENCE \
     MINICPMO_GDN_CACHE_BARRIER MINICPMO_GDN_PREFILL_REFERENCE MINICPMO_GDN_L2NORM_REFERENCE \
     MINICPMO_GDN_CONV_REFERENCE MINICPMO_GDN_GATING_REFERENCE MINICPMO_PRIVATE_HYBRID_CACHE \
     MINICPMO_STABLE_LINEAR MINICPMO_HF_NORM_REFERENCE MINICPMO_HF_ROUTER_REFERENCE \
@@ -163,6 +191,10 @@ for key in MINICPMO_GDN_FP32_REFERENCE MINICPMO_HYBRID_BLOCK_ZERO_REFERENCE \
     MINICPMO_MOE_TP_REFERENCE MINICPMO_ROW_TP_REFERENCE; do
     RUNTIME_ENV+=("$key=0")
 done
+# 若用户设了插件白名单，driver 和 Ray worker 必须一致；不覆盖已有 Ascend 插件。
+if [[ -v VLLM_PLUGINS ]]; then
+    RUNTIME_ENV+=("VLLM_PLUGINS=$VLLM_PLUGINS")
+fi
 case "${HUANYU_GRAPH_MODE:-1}" in
     1) eager=false; compile=1; disable=0 ;;
     0) eager=true; compile=0; disable=1 ;;
@@ -215,6 +247,11 @@ fi
 mkdir -p -- "$RUN_DIR"
 exec > >(tee -a "$RUN_DIR/console.log") 2>&1
 printf '[avqa] recipe=published-main model=%s actor=16 TP=2 LoRA=32 reward=choice run=%s\n' "$MODEL_PATH" "$RUN_DIR"
+printf '[avqa] optimized=%s graph=%s fused_gdn=%s fused_rms=%s fused_moe=%s replay=%s wsync=off hccl=aiv\n' \
+    "$AVQA_OPTIMIZED" "$HUANYU_GRAPH_MODE" "$MINICPMO_GDN_NPU_KERNEL" "$MINICPMO_NPU_RMS_NORM" "$MINICPMO_MOE_NPU_KERNEL" "$HUANYU_EXPERT_REPLAY"
+_hccl_probe="$PROJECT_ROOT/verl_omni_ext/probes/hccl_policy.py"
+[[ -f "$_hccl_probe" ]] || { echo "缺少通信策略探针：$_hccl_probe" >&2; exit 2; }
+"$PYTHON_BIN" "$_hccl_probe" --strict || exit $?
 printf '%q ' "$PYTHON_BIN" -m verl_omni.trainer.main_omni "${ARGS[@]}" "$@" > "$RUN_DIR/command.sh"
 printf '\n' >> "$RUN_DIR/command.sh"
 # 在加载权重前记录框架默认值；未知字段导致失败时，不继续浪费 NPU 启动时间。
