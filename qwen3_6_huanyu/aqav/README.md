@@ -403,6 +403,52 @@ TORCH_COMPILE_DISABLE=1 TORCHINDUCTOR_DISABLE=1 python3 -m pytest -q \
   "$PROJECT_ROOT/verl_omni_ext/models/qwen3_6_huanyu/tests"/test_{log_probs,entropy,vision_fsdp,media_boundary,processor_bridge,cached_processor,forward,cached_forward,video_pipeline,audio_training,registration,aqa_position_ids,train_hang_probe}_on_cpu.py
 ```
 
+### 分块已生效但仍 OOM：移除 logits 打包副本
+
+`avqa_2748_full_20261116_173338_612632` 在 `old_log_prob` 再次失败。调用栈已经经过
+`log_probs.py -> _ChunkedLogProbs.forward -> backend`，说明 512-token 分块已生效。
+这次 NPU 5 申请 244 MiB，而只剩 48.46 MiB；allocated 52.68 GiB、reserved
+52.71 GiB。进度为 `0/350`，尚未完成第一个训练 step。
+
+此前修复只限制交叉熵中间量。引擎进入 helper 前仍执行
+`torch.cat([t for t in logits.unbind()])`，把有效 logits 从原始 `[B,S,V]` 复制成
+完整 `[T,V]`，而 `raw_output` 仍持有原始 logits。这里 T 为有效 token 总数。
+这一份副本需要 `T × V × dtype字节数`，与每块 512 token 的交叉熵工作区无关。
+
+新增 `model_outputs.py`，在标记为 Huanyu 的模型上包装
+`FSDPEngineWithLMHead.prepare_model_outputs`。直接逐样本、逐 token 块读取原始
+logits 的视图，使用引擎原有的 packed/rolled labels，仅拼接 `[T]` 的 log-prob
+与 entropy 标量结果；不在样本边界重新 shift labels。反向逐块重算交叉熵，补齐
+位置的梯度为零。已分块的原生 helper 直接处理不超过 512 token 的块，避免嵌套重算。
+
+熵计算、温度处理、原生 NPU 后端和输出的 nested offsets 保持原来的语义。
+模型前向仍使用 padded 输入。fused-output、remove-padding、蒸馏及 sum-pi-squared
+分支调用原始引擎方法。其他模型不启用此 hook；未知引擎接口明确报错。
+完整模型 logits 及其梯度仍会分配，非单位温度时原引擎的缩放副本也仍存在；本修复
+移除的是有效 logits 的打包副本，不能保证所有后续训练阶段都不再 OOM。
+
+更新后保留完整训练命令与关闭 probe 的设置，无需修改 BS128、n16、LoRA32、TP2、
+长度上限或 token 预算。确认出现：
+
+```text
+[huanyu-output] installed ... scope=huanyu packing=scalar_only
+[huanyu-output] active ... shape=(B,S,V) valid_tokens=T chunk_size=512 mode=no_grad packing=scalar_only
+```
+
+`[huanyu-output] ... mode=grad` 表示进入需要梯度的输出处理；仍以真实训练 step
+完成和正常退出判断训练是否成功。上述日志为一次性路径说明，不是卡死 probe。
+
+286 项相关 CPU 回归通过，覆盖变长样本、padding 梯度、非连续输入、温度、熵与
+log-prob 联合梯度、checkpoint、PEFT 包装、原生 helper 分块及原有多模态适配。
+另提取本地真实 verl 的 dispatcher、NPU helper、`FSDPEngineWithLMHead` 输出处理
+源码，替换设备算子为 CPU 实现，6 组 dtype/temperature 的数值、梯度及不生成
+词表打包副本的检查通过；这不等同于真实 NPU 数值和峰值显存验证。
+
+```bash
+TORCH_COMPILE_DISABLE=1 TORCHINDUCTOR_DISABLE=1 python3 -m pytest -q \
+  "$PROJECT_ROOT/verl_omni_ext/models/qwen3_6_huanyu/tests"/test_{model_outputs,log_probs,entropy,vision_fsdp,media_boundary,processor_bridge,cached_processor,forward,cached_forward,video_pipeline,audio_training,registration,aqa_position_ids,train_hang_probe}_on_cpu.py
+```
+
 ### Rollout 后处理中的图像 token 不匹配
 
 另一轮作业在 `_compute_score -> _compute_multi_modal_inputs` 报告

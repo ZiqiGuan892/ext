@@ -24,31 +24,41 @@ def _validate_chunk_size(chunk_size):
         raise ValueError("Huanyu log-prob chunk_size must be a positive integer")
 
 
-def _blocks(logits, chunk_size):
+def _blocks(logits, chunk_size, lengths=None):
+    if lengths is not None:
+        offset = 0
+        for batch, length in enumerate(lengths):
+            for start in range(0, length, chunk_size):
+                end = min(start + chunk_size, length)
+                index = (batch, slice(start, end))
+                yield index, slice(offset + start, offset + end), logits[index]
+            offset += length
+        return
     # Do not flatten a noncontiguous [B,S,V] tensor into a full vocabulary copy.
     for prefix in product(*(range(size) for size in logits.shape[:-2])):
         for start in range(0, logits.shape[-2], chunk_size):
             index = prefix + (slice(start, start + chunk_size),)
-            yield index, logits[index]
+            yield index, index, logits[index]
 
 
 class _ChunkedLogProbs(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, logits, labels, backend, chunk_size):
+    def forward(ctx, logits, labels, backend, chunk_size, lengths):
         ctx.backend = backend
         ctx.chunk_size = chunk_size
+        ctx.lengths = lengths
         ctx.device_type = logits.device.type
         ctx.autocast_enabled = torch.is_autocast_enabled(ctx.device_type)
         ctx.autocast_dtype = torch.get_autocast_dtype(ctx.device_type)
         ctx.save_for_backward(logits, labels)
         output = None
-        for index, block in _blocks(logits, chunk_size):
-            values = backend(block, labels[index])
+        for _, output_index, block in _blocks(logits, chunk_size, lengths):
+            values = backend(block, labels[output_index])
             if output is None:
                 # Native torch_npu determines the result dtype; do not force it
                 # to either FP32 or the logits dtype.
-                output = values.new_empty(logits.shape[:-1])
-            output[index] = values
+                output = values.new_empty(labels.shape)
+            output[output_index] = values
             del values
         return output
 
@@ -59,17 +69,18 @@ class _ChunkedLogProbs(torch.autograd.Function):
         # The logits gradient is necessarily full sized. Only CE intermediates
         # and its recomputation graph are bounded; model logits are unchanged.
         # This supplies first-order RL gradients, not higher-order derivatives.
-        grad_logits = torch.empty_like(logits, memory_format=torch.contiguous_format)
+        allocate = torch.zeros_like if ctx.lengths is not None else torch.empty_like
+        grad_logits = allocate(logits, memory_format=torch.contiguous_format)
         with torch.enable_grad(), torch.autocast(
             device_type=ctx.device_type, dtype=ctx.autocast_dtype, enabled=ctx.autocast_enabled
         ):
-            for index, block in _blocks(logits, ctx.chunk_size):
+            for index, output_index, block in _blocks(logits, ctx.chunk_size, ctx.lengths):
                 local_logits = block.detach().requires_grad_(True)
-                values = ctx.backend(local_logits, labels[index])
-                (gradient,) = torch.autograd.grad(values, local_logits, grad_outputs=grad_output[index])
+                values = ctx.backend(local_logits, labels[output_index])
+                (gradient,) = torch.autograd.grad(values, local_logits, grad_outputs=grad_output[output_index])
                 grad_logits[index].copy_(gradient)
                 del values, gradient, local_logits
-        return grad_logits, None, None, None
+        return grad_logits, None, None, None, None
 
 
 def chunked_logprobs_from_logits(logits, labels, backend, chunk_size=DEFAULT_CHUNK_SIZE):
@@ -84,7 +95,29 @@ def chunked_logprobs_from_logits(logits, labels, backend, chunk_size=DEFAULT_CHU
     labels = labels.reshape(logits.shape[:-1])
     if not labels.numel():
         return backend(logits, labels)
-    return _ChunkedLogProbs.apply(logits, labels, backend, chunk_size)
+    return _ChunkedLogProbs.apply(logits, labels, backend, chunk_size, None)
+
+
+def chunked_ragged_logprobs_from_logits(logits, labels, lengths, backend, chunk_size=DEFAULT_CHUNK_SIZE):
+    """Select valid rows from dense logits without making a packed [T,V] copy.
+
+    Labels are the engine's already-rolled, packed labels; do not shift again
+    at sample boundaries. Only the scalar output is packed. Backward writes
+    zero gradients to padding and never assembles a packed vocabulary tensor.
+    """
+    _validate_chunk_size(chunk_size)
+    if not isinstance(logits, torch.Tensor) or not logits.is_floating_point() or logits.ndim != 3:
+        raise ValueError("Huanyu ragged log-probs require floating-point [batch,seq,vocab] logits")
+    lengths = tuple(lengths)
+    if (not logits.shape[-1] or len(lengths) != logits.shape[0]
+            or any(type(length) is not int or not 0 <= length <= logits.shape[1] for length in lengths)):
+        raise ValueError("Huanyu ragged log-prob lengths must match the dense batch and sequence bounds")
+    if not isinstance(labels, torch.Tensor) or labels.ndim != 1 or labels.numel() != sum(lengths):
+        raise ValueError("Huanyu ragged log-probs require one packed label per valid token")
+    if not labels.numel():
+        # A view with no elements preserves native empty-output dtype/autograd.
+        return backend(logits[:, :0, :].reshape(0, logits.shape[-1]), labels)
+    return _ChunkedLogProbs.apply(logits, labels, backend, chunk_size, lengths)
 
 
 def install_huanyu_logprob_chunking(chunk_size=DEFAULT_CHUNK_SIZE):
@@ -120,6 +153,10 @@ the installed verl or torch_npu sources and does not change model precision.
                   f"dtype={logits.dtype} device={logits.device} chunk_size={chunk_size} "
                   f"mode={mode} backend=native_npu", flush=True)
             reported.add(mode)
+        if logits.ndim == 2 and logits.shape[0] <= chunk_size:
+            # The padded-output hook already bounds this call. Native autograd
+            # inside its block recomputation avoids nesting two recomputations.
+            return original(logits, labels)
         return chunked_logprobs_from_logits(logits, labels, original, chunk_size)
 
     huanyu_logprobs_from_logits._huanyu_logprobs_chunked = True
