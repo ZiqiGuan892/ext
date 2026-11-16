@@ -73,6 +73,9 @@ class RegistrationTests(unittest.TestCase):
         entropy = ModuleType(f"{PACKAGE}.entropy")
         self.install_entropy = Mock()
         entropy.install_huanyu_entropy_chunking = self.install_entropy
+        log_probs = ModuleType(f"{PACKAGE}.log_probs")
+        self.install_log_probs = Mock()
+        log_probs.install_huanyu_logprob_chunking = self.install_log_probs
         sync_policy = ModuleType(f"{PACKAGE}.microbatch_sync")
         self.install_sync = Mock()
         sync_policy.install_huanyu_microbatch_sync = self.install_sync
@@ -91,6 +94,7 @@ class RegistrationTests(unittest.TestCase):
             offload.__name__: offload,
             precision.__name__: precision,
             entropy.__name__: entropy,
+            log_probs.__name__: log_probs,
             sync_policy.__name__: sync_policy,
             visual.__name__: visual,
             positions.__name__: positions,
@@ -167,6 +171,7 @@ class RegistrationTests(unittest.TestCase):
         result = self.adapter.configure_model(self.model, self.config)
         self.install_tq_positions.assert_called_once_with()
         self.install_entropy.assert_called_once_with()
+        self.install_log_probs.assert_called_once_with()
         self.install_precision.assert_called_once_with(self.model)
         self.install_sync.assert_not_called()
         self.assertIs(result, self.model)

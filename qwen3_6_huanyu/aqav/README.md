@@ -356,6 +356,53 @@ TORCH_COMPILE_DISABLE=1 TORCHINDUCTOR_DISABLE=1 python3 -m pytest -q \
 `already=1 native=1` 连在一起；在修改前提交 `8bb28f3` 上复现相同失败，未计入上述通过数。
 这些结果只代表 CPU 契约验证，尚无本次 16 卡 NPU 成功结果。
 
+### 前向返回后的 NPU log-prob 交叉熵 OOM
+
+`avqa_2748_mediafix_step1_20261116_164155` 的新日志显示第二次模型调用的 16 个 rank
+均进入并完成 Python unshard 调用，片段中有 15 个 rank 的 `released`；不能据此认定
+所有 rank 都已完成。本次报错的 rank 6 已从模型前向返回，17:04:11 在
+`_compute_old_log_prob -> prepare_model_outputs -> logprobs_from_logits_torch_npu ->
+npu_cross_entropy_loss` 申请 8.10 GiB 失败。当时设备总量 61.27 GiB，allocated
+48.43 GiB、reserved 48.47 GiB、free 6.38 GiB。两项 allocator 数值接近，不支持将
+这次失败主要归因于缓存碎片；直接失败是 NPU 分配不足，训练仍为 `0/1` step。
+
+这是一次明确发生在模型输出后处理中的 OOM。它说明程序越过此前观察到的视觉/语言
+前向等待位置，但不能反推此前历史超时全部由 OOM 引起，也不能将 `call=2` 当成完成两步训练。
+当前阶段尚未执行 actor 的训练反向或梯度归约，因此不能用 BF16 reduce 的开关解释此错误。
+
+原有 entropy 已按 token 分块，但 NPU log-prob helper 会把全部有效 logits 一次提交
+原生交叉熵。新增 `log_probs.py` 在 Huanyu 模型配置时包装这个 helper，每块最多 512
+个 token，仍使用原来的 `torch_npu.npu_cross_entropy_loss`，保留全部词表、labels、
+原生输出 dtype 和 autocast 上下文。dispatcher 的全局 helper 引用被更新，因此引擎
+提前 `from ... import logprobs_from_logits` 的别名也能命中；未知接口会明确报错。
+
+训练反向逐块重算原生交叉熵，再调用其原生 autograd，避免保存所有块的中间结果。
+仅支持通常 RL 更新所需的一阶梯度。完整 logits、其完整梯度和引擎在调用前打包 logits
+的内存仍存在。示例 rank 12 的 BF16 `[13,4922,248320]` logits 本身约 29.6 GiB；
+分块处理只限制交叉熵临时内存，不能保证整个训练过程绝无 OOM。
+
+更新 `log_probs.py` 和 `thinker_adapter.py` 后启动新作业，保持原来的单步命令、原配方、
+过滤后 parquet、`data.filter_overlong_prompts=false` 和卡死诊断参数。无需新增精度设置。
+检查安装日志与首次执行日志：
+
+```text
+[huanyu-logprobs] installed ... chunk_size=512 target=verl.utils.torch_functional.logprobs_from_logits_torch_npu
+[huanyu-logprobs] active ... chunk_size=512 mode=no_grad backend=native_npu
+```
+
+进入策略更新时还应看到 `mode=grad`。这些行表示执行路径，最终仍以训练 `step:1` 和
+正常退出判断单步完成。若再次 OOM，检查新的调用栈，不能沿用本次交叉熵定位结论。
+
+本次 246 项 CPU 回归通过，覆盖 log-prob 值/加权梯度、FP16/BF16/FP32/FP64、autocast
+重算、非连续 logits、512-token 上限、保存的张量、提前导入的别名、媒体/FSDP/诊断集成。
+另用本地 `verl` 的真实 dispatcher/helper AST 及 CPU 算子替身验证了引用和梯度。
+尚未在真实 NPU 上验证该分块交叉熵的数值、峰值显存和整步运行结果。
+
+```bash
+TORCH_COMPILE_DISABLE=1 TORCHINDUCTOR_DISABLE=1 python3 -m pytest -q \
+  "$PROJECT_ROOT/verl_omni_ext/models/qwen3_6_huanyu/tests"/test_{log_probs,entropy,vision_fsdp,media_boundary,processor_bridge,cached_processor,forward,cached_forward,video_pipeline,audio_training,registration,aqa_position_ids,train_hang_probe}_on_cpu.py
+```
+
 ### Rollout 后处理中的图像 token 不匹配
 
 另一轮作业在 `_compute_score -> _compute_multi_modal_inputs` 报告
