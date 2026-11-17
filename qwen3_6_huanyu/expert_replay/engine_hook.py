@@ -32,12 +32,22 @@ _FINGERPRINT = "verl==0.10.0.dev0"
 
 
 def _model_chain(module):
-    seen = set()
-    while module is not None and id(module) not in seen:
-        seen.add(id(module))
-        yield module
-        wrapped = getattr(module, "_fsdp_wrapped_module", None)
-        module = wrapped if wrapped is not None else getattr(module, "_orig_mod", None)
+    """Resolve model wrappers without mistaking PEFT's .model for the decoder."""
+    pending, seen = [module], set()
+    while pending:
+        candidate = pending.pop()
+        if candidate is None or id(candidate) in seen:
+            continue
+        seen.add(id(candidate))
+        yield candidate
+        for attr in ("_fsdp_wrapped_module", "_orig_mod"):
+            pending.append(getattr(candidate, attr, None))
+        # configure_model installs the fused blocks before verl applies LoRA.
+        # PEFT forwards .model to the causal LM, adding a level relative to the
+        # bare LM's .model.language_model.layers used by _language_layers.
+        get_base_model = getattr(candidate, "get_base_model", None)
+        if callable(get_base_model):
+            pending.append(get_base_model())
 
 
 def _replay_engine(engine) -> bool:

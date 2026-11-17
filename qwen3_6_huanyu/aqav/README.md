@@ -610,3 +610,170 @@ grep -aE 'step:|Initial validation metrics|val-core/avqa_r1_6k/' "$LOG" | tail -
 若 reward 不涨，先查输出是否有合法 answer 标签、`response_length/clip_ratio` 是否很高、组内奖励是否全同、LoRA 梯度是否非零、更新后的 rollout 权重是否同步，再查 actor/rollout 概率偏差和 KL。`actor/loss` 接近零本身不能证明未学习。不要为制造上升曲线改变答案标签、奖励权重或验证集。
 
 先验证以上链路，再决定是否需要针对 2748 调参；一旦调整学习率、LoRA 范围或采样温度，应记录为后续实验，而不是官方参数复现。
+
+## AQAV 训练故障复盘汇总（截至 2026-11-17）
+
+本节汇总本次 AQAV（数据集名 AVQA-R1-6K）迁移与重测中的实际故障，方便按报错快速定位。
+证据来自服务器返回的日志、现场读取的源码和本地 CPU 回归；上文各阶段的“尚未验证”描述
+保留为当时记录，当前进展以本节末尾为准。基线为 2748、16 NPU、BS128、n16、TP2、
+LoRA32、GSPO/GRPO、choice reward，保留原长度上限与优化配置。
+
+### 故障与处理索引
+
+| 阶段 / 报错 | 定位结论 | 处理及对应代码 | 验证边界 |
+| --- | --- | --- | --- |
+| 数据准备：`Official converter missing: .../examples/gspo_trainer/data_process/avqa.py` | 入口依赖另一份源码树中的转换脚本，当前环境没有该路径 | 将转换器放入本目录 [avqa.py](avqa.py)，[prepare.py](prepare.py) 从同目录加载 | 消除跨仓库路径依赖；仍需校验原始归档、媒体路径及转换后的 parquet |
+| 启动：`缺少官方奖励实现 .../verl_omni/utils/reward_score/choice_reward.py` | 当前基础包未包含入口指定的奖励文件 | 同目录保存 [choice_reward.py](choice_reward.py)，[run.sh](run.sh) 使用该绝对路径 | 保持官方 choice reward，不改成 GenRM 或另写奖励公式 |
+| 首次 `old_log_prob`：`ProcessGroupHCCL::Watchdog::run`、`Fatal Python error: Aborted`，随后 Ray `keepalive watchdog timeout` | 已确认 Actor 在训练侧等待并被 watchdog 终止；Ray RPC 错误是后续表现。首轮日志不足以确定唯一底层原因 | 逐 rank 收集阶段、内存和线程栈；随后修复冻结视觉参数的 FSDP 生命周期，见下节 | 不能据此认定网卡故障、图片损坏、OOM 或运行目录有问题 |
+| 探针一直 `call=0 last_event=installed`，但 Actor 已在 forward | PEFT 直接调用基础模型 `.forward()`，绕过根模块 pre/post hook | [train_hang_probe.py](../train_hang_probe.py) 同时覆盖模块 hook 和直接 forward，统一计数与异常记录 | `call` 是模型调用次数，不是训练 step；旧 `call=0` 不能证明仍在等 rollout |
+| 不同 rank 分别停在 GDN 与视觉前向；`ALLGATHER ... dispatch timeout` | 逐图编码与 `reshard_after_forward=True` 组合，使不同图片数的 rank 存在集合通信调用顺序分歧风险 | [vision_fsdp.py](../vision_fsdp.py)：统一聚合冻结视觉单元，同一次基础模型 forward 内保留完整参数，结束或异常时释放 | 修复有源码和 CPU 序列验证；不能把所有历史超时都归因于此。代价是视觉参数驻留时间延长 |
+| `old_log_prob` 原生交叉熵申请 **8.10 GiB** 失败，free **6.38 GiB** | 模型前向已返回，OOM 在输出概率计算；一次处理全部 logits 的交叉熵工作区过大 | [log_probs.py](../log_probs.py)：按 token 分块调用原生 NPU 交叉熵，反向按块重算 | 分块不消除原始 logits、打包副本或完整梯度，不能单独保证整步不 OOM |
+| 分块已执行，仍申请 **244 MiB** 失败，free **48.46 MiB** | 分块前已把原始 `[B,S,V]` logits 另行拼成 `[T,V]`，两份大张量同时存在 | [model_outputs.py](../model_outputs.py)：直接读取原始 logits 视图，只打包 log-prob / entropy 标量结果 | 去掉的是词表维打包副本；原始 logits 和完整梯度仍存在 |
+| 已完成第一个 step，第二步 `loss.backward -> grad_logits` 申请 **19.92 GiB** 失败，free **19.88 GiB** | 反向需要完整词表梯度；只限制有效 token 总数无法限制长短混合微批次的 padding 内存 | [padded_batching.py](../padded_batching.py)：额外限制 `B * S_max`，各 DP rank 协商一致的微批次数并保留样本/索引 | 单凭第二步 OOM 不能判断内存泄漏；微批次划分会影响吞吐和浮点累计顺序 |
+| Rollout 后处理：`image token lengths [165, 1] != image grid lengths [165]`，或 `[880, 2] != [880]` | 构造训练多模态输入时，原逻辑把 response 中的图像标记也当作输入图像占位符 | [media_boundary.py](../media_boundary.py)、[processor.py](../processor.py)、[forward.py](../forward.py)：用真实 prompt 边界限定媒体扫描与 RoPE，保留 response 原始 embedding | 不删除回答 token，不截断真实 prompt 的图片占位符；该错误与训练 forward 的 HCCL 等待不是同一阶段 |
+| 开启 replay：`vLLM prompt has 394 tokens but ... training prompt has 396` | 服务器原生更新器将完整图像占位符替换成纯 image pads，每张图丢掉两个视觉边界 token | [video_rollout.py](../video_rollout.py)、[rollout_inputs.py](../rollout_inputs.py)：保留完整视觉边界，仅在 image pad 位置注入 embedding，并在图像请求 dispatch 前安装补丁 | 严格 replay 校验保留；不能补零、随意切片路由行或用 debug 绕过。最新修复尚待完整 NPU 训练验证 |
+| 开启 replay 后进入 `old_log_prob`：`expert_replay: actor module has no fused MoE blocks installed` | replay 在 LoRA 包装后的模型上查找 decoder 层，漏解 PEFT 包装，可能将已安装的融合 MoE 误判为不存在 | [engine_hook.py](../expert_replay/engine_hook.py)：通过 `get_base_model()` 与 FSDP/compile 包装链查找真实模型，保留循环保护和原有路由校验 | CPU 已复现“安装成功但查找为空”并修复；此错误不能单独推出 LoRA/replay 不兼容，NPU 完整训练仍待验证 |
+
+### 三次 OOM 为什么需要三层修复
+
+三次失败的分配对象不同，后一次仍 OOM 不等于前一次修复没有执行：
+
+1. **交叉熵中间量**：512-token 分块限制每次原生 NPU CE 的输入和临时空间。
+2. **重复的词表张量**：避免在 `[B,S,V]` 原始 logits 仍存活时，再复制完整 `[T,V]`。
+3. **原始 logits 及其完整梯度**：用 padding 后的 `B * S_max` 控制微批次规模。
+
+这里 `B` 是当前设备上的微批次序列数，`S_max` 是该微批次补齐后的最大序列长度，
+不是全局 `train_batch_size=128`。`V` 是词表大小，`T` 是有效 token 总数。
+原始 **logits** 才带有 `[B,S,V]` 词表轴；选定标签的 **log_probs** 和 **entropy**
+是每 token 一个标量，通常为 `[B,S]`，去除 padding 后的 values 为 `[T]`。
+不能把三者都当作 `[B,S,V]`，也不能认为分块概率计算已经移除了完整 logits 梯度。
+
+示例：BF16、`V=248320` 时，`20480 * V * 2` 字节约为 **9.47 GiB**，只是一份
+词表张量的大小；激活、参数、其他梯度、温度缩放及算子 workspace 还要额外显存。
+因此微批次预算是分配规模约束，不是整卡峰值显存保证。
+
+上述修复没有把全局 BS128、n16、LoRA32、TP2、mini-batch16 或 4096/12288 长度上限
+缩小，也没有改奖励。三次失败的 allocated 与 reserved 数值接近，现有证据不支持
+直接把主因归结为 PyTorch 缓存碎片；应先核对失败分配及同时存活的大张量。
+
+### 通信超时与卡死的证据链
+
+首轮作业 `avqa_2748_20261116_115509_430028` 在约 12:34 出现 HCCL watchdog / abort，
+约 12:37 主进程才报告 `ActorUnavailableError`。因此应向前找首个 Actor/设备错误，
+而不是只看最后一段 Ray traceback。`killed because the job ... finished` 是退出清理，
+不能当作此前遭 OOM killer 杀死的证据。
+
+后续非阻塞抓栈确认：rank 0/1 已进入 GDN 语言路径，rank 4 在视觉 attention 的
+`lengths.tolist()`。后者读取设备 tensor 时可能等待设备工作；某个 Python 栈顶
+既不能证明对应算子就是根因，也不能证明该 rank 正在有效计算。结合实际配置中的
+`reshard_after_forward=True` 和逐图调用，才定位到冻结视觉块可能重复 all-gather 的风险。
+
+修复按相同顺序管理所有 rank 的冻结视觉 FSDP 单元，包括没有图片的 rank；仅这些单元
+在一次基础模型 forward 中不逐图 reshard，最后显式释放。不是全模型关闭 reshard，
+也不是盲目关闭 GDN 或增加通信超时时间。后续作业越过了原等待位置并暴露出明确的
+log-prob OOM，之后又有完整第一步成功的日志；这些是进展证据，不是对历史根因的完整证明。
+
+现场只读抓栈使用 `py-spy dump --nonblocking --pid <当前Actor PID>`；PID 必须取自
+当前作业，不能复用本文历史 PID。`--nonblocking` 避免暂停进程，但不保证绕过所有权限限制。
+只有安装日志而没有阶段记录时，应先确认探针是否覆盖 PEFT 直接 forward。
+
+以下推断在本次排查中没有证据支持，不能作为“已解决方案”写入运行结论：
+
+- 把项目搬到 `/tmp` 就能解决通信超时。`/tmp` 在本次只用来放诊断文件。
+- 图片处理失败或主机 OOM 已被彻底排除。原作业 `journalctl` 不存在、`dmesg` 无权限，
+  只能记录“缺少内核证据”；`memory.events` 也需比较同一 cgroup 的前后增量。
+- 模型输出 helper 的 OOM 是梯度归约精度导致。首次 `old_log_prob` 尚未进入 Actor 更新反向。
+- 只要 `failure=0` 就没有轨迹错误。它是队列状态快照；实际 `_run_prompt` 等同组 session
+  都结束后才写终态，随后还可能被队列消费，必须同时核对 traceback 和终态处理。
+
+### 启动准备和环境中的相关问题
+
+长度过滤最初只有约 2 条/秒，每次重启重复扫描 4491 条样本会明显延长准备时间。
+这属于重复预处理开销；使用 [filter_data.py](filter_data.py) 按同一模型、processor、
+模板和长度配置离线过滤，再显式指定过滤后的 train/validation parquet，并设置
+`data.filter_overlong_prompts=false`。模型、模板、媒体处理或长度规则改变后需重新验证
+过滤结果，不能仅凭文件名含 `filtered` 就跳过过滤。
+
+此前共用 Huanyu 环境还出现过“完成请求缺少 `routed_experts`”的问题。它与本次已拿到
+路由记录后发现 `394/396` 的错误不同：前者先查 `vllm.general_plugins` 安装元数据、
+`huanyu_r3` 是否在 EngineCore / worker 应用及 `enable_return_routed_experts` 传递。
+仅修改 `pyproject.toml` 或设置 `PYTHONPATH` 不代表 entry point 已安装到训练使用的 Python。
+需要使用同一解释器重新安装本地扩展，并启动加载新代码的新作业；已有插件白名单要保留
+`huanyu_r3` 和原有插件。AQAV 当前显式使用 `AVQA_REPLAY=1` 开启 replay，要求
+`AVQA_OPTIMIZED=1`。这类环境问题及 prompt 对齐失败都不能单独推出 LoRA 不兼容。
+
+### LoRA 包装导致 replay 找不到融合 MoE
+
+2026-11-16 23:42 的作业在 `actor_rollout_compute_log_prob` 中报错，调用链为
+`prepare_model_inputs -> _arm_micro_batch -> _geometry`。此时是在准备训练输入，
+还没有进入该微批次的模型 forward；本段异常没有显示 OOM 或通信超时。
+
+安装与查找发生在不同阶段：`configure_model` 先在裸模型上安装融合 MoE，verl 随后
+添加 PEFT/LoRA 包装。裸模型的层路径是 `model.language_model.layers`，但 PEFT 的
+`.model` 属性会指向整个基础 causal LM；旧查找只处理 `_fsdp_wrapped_module` 和
+`_orig_mod`，少解了一层，返回零个融合块。安装日志即使显示 `total=40 replay=on`，
+仍可能触发这个误报。
+
+修复让 replay 的模型标记检测和层数/专家数发现共用支持 `get_base_model()` 的遍历。
+仅解析包装，实际前向继续使用原 PEFT 模型，LoRA 参数和融合 MoE forward 都保留。
+没有通过硬编码 40 层、跳过路由校验、重新安装算子或关闭 replay 来绕过错误。
+如果解包后确实没有融合块，仍然报错；还应检查同一作业启动时的安装日志：
+
+```bash
+grep -anE '\[huanyu-kernel\].*fused MoE|\[huanyu-replay\].*engine hook|no fused MoE blocks' "$LOG"
+```
+
+本地新增 18 项 CPU 回归覆盖裸模型、LoRA、FSDP/compile 组合、循环引用、ref 门控、
+未安装 kernel、路由层数/专家号错误，以及真实 target 布局转换、回放索引、router 梯度
+和重复取用 checkpoint targets。连同 AQAV replay 入口和图像展开契约共 **43 项通过**：
+
+```bash
+python -m pytest -q \
+  verl_omni_ext/models/qwen3_6_huanyu/tests/test_replay_engine_wrappers_on_cpu.py \
+  verl_omni_ext/models/qwen3_6_huanyu/tests/test_aqav_replay_launcher_on_cpu.py \
+  verl_omni_ext/models/qwen3_6_huanyu/tests/test_image_rollout_on_cpu.py
+```
+
+测试使用小型 CPU 模型模拟 PEFT 的公开包装契约，不启动真实 NPU/FSDP 通信。
+更新后需启动新作业加载代码；保持原 LoRA、算子、图模式和 `AVQA_REPLAY=1` 配置，
+正式训练仍使用过滤后的 parquet、`data.filter_overlong_prompts=false` 和关闭 probe 的入口。
+
+### 最小诊断记录与验收
+
+每次失败保留该次运行的 `console.log`、`command.sh`、`resolved-config.txt`、准确代码
+版本、报错时间及 rank/PID；需要时再补同一 Ray session 的 worker 日志、探针文件和设备日志。
+先按调用链归类为 rollout、媒体后处理、old_log_prob、Actor backward 或验证阶段，再判断根因。
+
+```bash
+# 已设置当前作业的 LOG；先看首批明确错误，再看最新进度。
+grep -anEm 8 -B3 -A12 \
+  'OutOfMemoryError|NPU out of memory|ValueError: Huanyu|RuntimeError: (R3|expert_replay)|dispatch timeout|Fatal Python error' "$LOG"
+grep -anE 'pending:|Error in _run_prompt|step:|Training Progress:' "$LOG" | tail -n 30
+
+# 确认修复路径被安装/执行；这些标记本身不等于训练成功。
+grep -anE '\[huanyu-(vision-fsdp|logprobs|output|padded-batch)\]|image_spans=full_boundaries_v1' "$LOG"
+```
+
+搜索 OOM 时不要使用不带边界且忽略大小写的裸 `OOM`：它会误匹配 `MiniCPMOOmni`
+等类名，使真实错误被大量启动日志淹没。优先使用上面的完整异常名称。
+
+截至本节记录时，服务器已有 **一个完整训练 step 成功**的证据，随后第二步在 Actor
+反向 OOM。限制 padded 微批次之后的一轮开启 replay 的作业，又在 rollout 暴露了图像
+边界丢失；图像修复之后的新日志已进入训练侧 replay 输入准备，又暴露出上述 LoRA 包装
+查找错误。修复后尚无服务器完整训练成功结果。因此，不能写成“所有 step 已跑通”
+或“通信/OOM 已全部解决”。正式全量训练按用户选择关闭 probe；专门复现卡死时才启用
+诊断并限制训练步数。没有诊断文件不代表没有执行模型前向。
+
+| 修复里程碑 | `new` 分支提交 | 已有验证 |
+| --- | --- | --- |
+| 区分 prompt 与 response 媒体标记 | `51ef258` | 媒体边界、梯度和多模态 CPU 回归；后续 NPU 作业进入训练侧 |
+| 覆盖 PEFT 直接 forward 的探针 | `8bb28f3` | CPU 入口、计数、异常及定时抓栈验证 |
+| 冻结视觉 FSDP 生命周期 | `3333bc0` | 196 项相关 CPU 回归；后续 NPU 日志越过原观察位置 |
+| 原生 log-prob 分块 | `521278f` | 246 项相关 CPU 回归；后续 NPU traceback 确认 helper 已执行 |
+| 仅打包标量输出 | `9434afa` | 286 项相关 CPU 回归；后续服务器完成一个训练 step |
+| padded 微批次预算 | `0a60598` | 325 项相关 CPU 回归及真实 verl 分批源码检查；后续训练闭环待验证 |
+| 图像完整边界用于 replay | `fb735df` | 125 项相关 CPU 回归；提供 `check_image_contract.py` 供服务器验证，完整 NPU 训练待验证 |
+
+各测试数来自对应提交时的不同回归集合，不能相加作为独立测试总数。CPU 模拟不覆盖实际
+NPU 数值、设备流或 HCCL；最终验收需包含连续多个训练 step、验证/保存阶段及正常结束，
+并检查是否还出现失败轨迹、OOM 或未完成 collective。
