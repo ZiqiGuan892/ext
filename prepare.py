@@ -21,7 +21,7 @@ REPO = "harryhsing/AVQA-R1-6K"
 REVISION = "1c380427f66407f9f4ece354d84f804e4a16e522"
 ARCHIVE_SHA256 = "6ad5d4bc00a3367aa36d2b0ed062a0a53c8d701242110c43826541138522f388"
 DATA_DEFAULT = "/opt/huawei/dataset/infra_data/data/avqa_r1_6k"
-MODEL_DEFAULT = "/opt/huawei/dataset/model_gy/downloaded_models/2748"
+MODEL_DEFAULT = "/opt/huawei/dataset/model_gy/downloaded_models/Qwen3-Omni-30B-A3B-Instruct"
 TARGETS = ("q_proj", "k_proj", "v_proj", "o_proj")
 EXCLUDE = re.compile(r".*(?:talker|code2wav|code_predictor|visual|audio_tower|audio_encoder|audio_projection).*")
 
@@ -131,9 +131,10 @@ def check_data(path):
 
 def check_model(model):
     config = json.loads((model / "config.json").read_text(encoding="utf-8"))
-    if (config.get("model_type") != "qwen3_5_moe"
-            or config.get("audio_config", {}).get("model_type") != "huanyu_conformer_0_6b"):
-        raise ValueError("Expected Huanyu 2748 config; do not select the Whisper adapter")
+    is_huanyu = (config.get("model_type") == "qwen3_5_moe"
+                 and config.get("audio_config", {}).get("model_type") == "huanyu_conformer_0_6b")
+    if config.get("model_type") != "qwen3_omni_moe" and not is_huanyu:
+        raise ValueError("Expected a Qwen3-Omni or Huanyu 2748 checkpoint")
     index = model / "model.safetensors.index.json"
     if index.is_file():
         keys = list(json.loads(index.read_text(encoding="utf-8"))["weight_map"])

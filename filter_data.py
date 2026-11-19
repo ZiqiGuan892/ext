@@ -1,4 +1,4 @@
-"""Persist the installed Huanyu/verl dataset's length-filter result.
+"""Persist the selected AVQA training dataset's length-filter result.
 
 Use ``bash run.sh --filter`` so model, chat template, and data settings are
 composed from the same recipe as training. No Ray cluster or model weights are
@@ -109,12 +109,13 @@ def run_filter(config):
     for field in ("train_max_samples", "val_max_samples"):
         if int(config.data.get(field) or -1) > 0:
             raise ValueError(f"Do not set data.{field}: offline filtering must retain the full original split")
-    if config.actor_rollout_ref.model.architecture != "Qwen36HuanyuForTraining":
-        raise ValueError("This filter entrypoint expects the Huanyu training adapter")
-    expected_class = "pkg://verl_omni_ext.models.qwen3_6_huanyu.dataset"
-    if (config.data.custom_cls.path != expected_class
-            or config.data.custom_cls.name != "Qwen36HuanyuOmniRLHFDataset"):
-        raise ValueError("Use the same Qwen36HuanyuOmniRLHFDataset as the AVQA training recipe")
+    architecture = config.actor_rollout_ref.model.architecture
+    datasets = {
+        "Qwen3OmniMoeForConditionalGeneration": ("pkg://verl_omni.utils.dataset.omni_rl_datasets", "QwenOmniRLHFDataset"),
+        "Qwen36HuanyuForTraining": ("pkg://verl_omni_ext.models.qwen3_6_huanyu.dataset", "Qwen36HuanyuOmniRLHFDataset"),
+    }
+    if (config.data.custom_cls.path, config.data.custom_cls.name) != datasets.get(architecture):
+        raise ValueError(f"Use the AVQA training dataset registered for {architecture}")
     workers = int(config.data.filter_overlong_prompts_workers)
     if workers < 1:
         raise ValueError("AVQA_FILTER_WORKERS must be positive")
@@ -149,7 +150,7 @@ def run_filter(config):
         torch.set_num_threads(1)
         model_config = omega_conf_to_dataclass(config.actor_rollout_ref.model)
         processor = model_config.get_processor()
-        if not getattr(processor, "_huanyu_training_processor", False):
+        if architecture == "Qwen36HuanyuForTraining" and not getattr(processor, "_huanyu_training_processor", False):
             raise TypeError("Expected the real Huanyu training processor, not AutoProcessor/Whisper")
         if getattr(processor, "embedding_cache", None) is not None:
             raise ValueError("Offline length filtering must not use embedding caches")
